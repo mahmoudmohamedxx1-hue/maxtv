@@ -45,7 +45,22 @@ export function TopNav({
   const [zapSpin, setZapSpin] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [prefs, setPrefs] = useState<PlayerPrefs | null>(null);
+  const [tcCap, setTcCap] = useState(true); // server transcoding capability
   const menuRef = useRef<HTMLDivElement>(null);
+
+  // probe once whether this deployment can transcode (data-saver ladder)
+  useEffect(() => {
+    let alive = true;
+    fetch('/api/transcode?height=480&mode=cap')
+      .then((r) => r.json())
+      .then((d: { cap?: boolean }) => {
+        if (alive) setTcCap(d.cap === true);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, []);
 
   // prefs arrive through the shared settings events (player ↔ settings menu)
   useEffect(() => onPrefsChange(setPrefs), []);
@@ -234,8 +249,13 @@ export function TopNav({
               ))}
 
               <p className="border-t border-zilla-line/60 px-4 py-2 text-[9px] font-black uppercase tracking-widest text-zilla-dim">
-                Quality ladder · transcoded live
+                Quality ladder · Data saver
               </p>
+              {!tcCap && (
+                <p className="px-4 pb-1.5 pt-1 text-[10px] font-medium leading-snug text-zilla-yellow/80">
+                  Not available on this deployment — the server can't re-encode streams. Picks fall back to the nearest native quality.
+                </p>
+              )}
               {SAVER_QUALITIES.map((q) => (
                 <button
                   key={q.h}
@@ -253,7 +273,7 @@ export function TopNav({
                 </button>
               ))}
               <p className="px-4 py-2 text-[10px] font-medium leading-snug text-zilla-dim">
-                Any height, re-encoded in real time — even heights the provider doesn't offer.
+                Any height, re-encoded in real time to save bandwidth — even heights the provider doesn't offer.
               </p>
 
               {/* playback behaviour */}

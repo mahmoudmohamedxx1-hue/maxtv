@@ -112,6 +112,20 @@ function fmtAgo(ts: number): string {
   return `started ${h}h ${m % 60}m ago`;
 }
 
+/** Does THIS deployment have the data-saver (transcode) ladder? Serverless
+ *  hosts (Vercel…) ship no ffmpeg → false. Cached for the page lifetime;
+ *  fail-open so a network hiccup can't needlessly hide the ladder. */
+let tcCapPromise: Promise<boolean> | null = null;
+function probeTcCap(): Promise<boolean> {
+  if (!tcCapPromise) {
+    tcCapPromise = fetch('/api/transcode?height=480&mode=cap')
+      .then((r) => r.json())
+      .then((d: { cap?: boolean }) => d.cap === true)
+      .catch(() => true);
+  }
+  return tcCapPromise;
+}
+
 /* ─── tiny icon set ────────────────────────────────────────────────────────── */
 const Icon = {
   play: (
@@ -226,6 +240,13 @@ export function PlayerOverlay() {
   /** content-mismatch banner ("this feed is showing motorsport") */
   const [mismatch, setMismatch] = useState<{ sport: string; confidence: number } | null>(null);
   const mismatchChecked = useRef<string>('');
+  /** can the server transcode at all (data-saver ladder exists)? Probed on
+   *  mount — false on serverless deployments (no ffmpeg). Fail-open until
+   *  the answer lands; the 503-bounce in attachSource covers the gap. */
+  const [tcCap, setTcCap] = useState(true);
+  const tcCapRef = useRef(true);
+  /** one "data saver unavailable" notice per page load — not per channel */
+  const tcNoticeRef = useRef(false);
 
   /* ── refs for cross-callback access (hls error handler → failover) ─────── */
   const playerRef = useRef<Playable | null>(null);
@@ -260,6 +281,19 @@ export function PlayerOverlay() {
     const p = loadPrefs();
     setVolume(p.volume);
     setMuted(p.muted);
+  }, []);
+
+  // probe the deployment's data-saver capability once (cached per page load)
+  useEffect(() => {
+    let alive = true;
+    void probeTcCap().then((ok) => {
+      if (!alive) return;
+      tcCapRef.current = ok;
+      setTcCap(ok);
+    });
+    return () => {
+      alive = false;
+    };
   }, []);
 
   useEffect(() => {
@@ -386,7 +420,7 @@ export function PlayerOverlay() {
         net.highs = 0;
       }
       const cur = playerRef.current;
-      const canTc = !!cur && (cur.kind === 'daddylive' || !!tcSrcRef.current);
+      const canTc = !!cur && (cur.kind === 'daddylive' || !!tcSrcRef.current) && tcCapRef.current;
 
       if (tcHeightRef.current !== null) {
         // inside the data-saver ladder: recover up, or drop a rung further down
@@ -576,7 +610,7 @@ export function PlayerOverlay() {
             if (knownH.length) nativeHeightRef.current = Math.max(...knownH);
 
             const prefH = loadPrefs().quality;
-            const canTc = ch.kind === 'daddylive' || !!tcSrcRef.current;
+            const canTc = (ch.kind === 'daddylive' || !!tcSrcRef.current) && tcCapRef.current;
 
             if (prefH === -1) {
               // AUTO — connectivity-chosen: start at the best rung the measured
@@ -620,12 +654,18 @@ export function PlayerOverlay() {
 
             // persisted data-saver preference the provider cannot satisfy
             // natively (single rendition above the preferred height) → switch
-            // to the real-time transcode ladder
+            // to the real-time transcode ladder. Skipped on deployments
+            // without ffmpeg — there we stay native (closest level or the
+            // single rendition) instead of hanging on a 503.
             if (prefH > 0 && (DATA_SAVER_HEIGHTS as readonly number[]).includes(prefH)) {
               const hasNative = levels.some((l) => l.height > 0 && l.height <= prefH + 60);
-              if (!hasNative) {
+              if (!hasNative && tcCapRef.current) {
                 void selectDataSaverRef.current?.(prefH);
                 return;
+              }
+              if (!hasNative && !tcCapRef.current && !tcNoticeRef.current) {
+                tcNoticeRef.current = true;
+                showToast('Data saver is unavailable on this server — playing the native feed');
               }
             }
 
@@ -1143,6 +1183,15 @@ export function PlayerOverlay() {
     (height: number, opts: { auto?: boolean } = {}) => {
       const cur = playerRef.current;
       if (!cur) return;
+      // deployments without ffmpeg have no ladder — stay native (the settings
+      // menu / connectivity engine can still ask; one notice per page load)
+      if (!tcCapRef.current) {
+        if (opts.auto !== true && !tcNoticeRef.current) {
+          tcNoticeRef.current = true;
+          showToast('Data saver is unavailable on this server — playing the native feed');
+        }
+        return;
+      }
       const h = (DATA_SAVER_HEIGHTS as readonly number[]).includes(height) ? height : 360;
       setShowQualityMenu(false);
       // never encode UP: a rung STRICTLY above the native feed's height can
@@ -1184,10 +1233,10 @@ export function PlayerOverlay() {
             ? `/api/transcode?src=${encodeURIComponent(tcSrcRef.current.src)}&r=${encodeURIComponent(tcSrcRef.current.r)}&s=${encodeURIComponent(tcSrcRef.current.s)}`
             : null;
       if (!base) {
-        showToast('Transcoded quality is unavailable for this channel');
+        showToast('Data saver is unavailable for this channel');
         return;
       }
-      showToast(`Quality: ${h}p — transcoding in real time`);
+      showToast(`Data saver: ${h}p — lighter stream, less bandwidth`);
       setPhase('loading');
       attachSource(`${base}&height=${h}&mode=m3u8`);
 
@@ -1411,7 +1460,7 @@ export function PlayerOverlay() {
 
   const qualityLabel =
     tcHeight !== null
-      ? `${autoDs ? 'Auto · ' : ''}${tcHeight}p · transcoded`
+      ? `${autoDs ? 'Auto · ' : ''}${tcHeight}p · Data saver`
       : currentQuality === -1
         ? `Auto${activeHeight ? ` · ${activeHeight}p` : ''}`
         : quality.find((q) => q.level === currentQuality)?.label || (activeHeight ? `${activeHeight}p` : 'Auto');
@@ -1419,7 +1468,7 @@ export function PlayerOverlay() {
   const serverOptions = player.kind === 'daddylive' ? servers.length ? servers : DL_SERVERS : [];
   const hasServerChoices =
     player.kind === 'daddylive' ? serverOptions.length > 0 : alternates.length > 0;
-  const canDataSaver = player.kind === 'daddylive' || !!tcSrcRef.current;
+  const canDataSaver = (player.kind === 'daddylive' || !!tcSrcRef.current) && tcCap;
 
   return (
     <div
@@ -1582,10 +1631,21 @@ export function PlayerOverlay() {
                       </p>
                     )}
 
+                    {(player.kind === 'daddylive' || !!tcSrcRef.current) && !tcCap && (
+                      <>
+                        <p className="border-t border-zilla-line/60 px-3.5 py-2 text-[9px] font-black uppercase tracking-widest text-zilla-dim">
+                          Quality ladder · Data saver
+                        </p>
+                        <p className="px-3.5 pb-2 pt-1 text-[10px] font-medium leading-snug text-zilla-dim">
+                          Not available on this deployment — the server can't re-encode streams. The native feed is playing instead.
+                        </p>
+                      </>
+                    )}
+
                     {canDataSaver && (
                       <>
                         <p className="border-t border-zilla-line/60 px-3.5 py-2 text-[9px] font-black uppercase tracking-widest text-zilla-dim">
-                          Quality ladder · transcoded live
+                          Quality ladder · Data saver
                         </p>
                         {DATA_SAVER_HEIGHTS.map((h) => (
                           <button
@@ -1615,7 +1675,7 @@ export function PlayerOverlay() {
                           </button>
                         )}
                         <p className="px-3.5 py-2 text-[10px] font-medium leading-snug text-zilla-dim">
-                          Any height, re-encoded in real time — perfect for slow connections or capping quality.
+                          Any height, re-encoded in real time to save bandwidth — perfect for slow connections or capping quality.
                         </p>
                       </>
                     )}

@@ -23,6 +23,26 @@ import { turboCachedBySn } from './turbo';
 export const TRANSCODE_HEIGHTS = [144, 244, 360, 480, 720, 1080] as const;
 export type TranscodeHeight = (typeof TRANSCODE_HEIGHTS)[number];
 
+/** Can this deployment transcode at all? Vercel/serverless runtimes have no
+ *  ffmpeg binary — every spawn dies instantly, so the ladder 503s. Probed
+ *  ONCE per process and cached: the client uses this to skip data-saver
+ *  attachments entirely on such deployments (native feed instead). */
+const capG = globalThis as { __maxtvTcCap?: Promise<boolean> };
+export function transcodeCapable(): Promise<boolean> {
+  if (!capG.__maxtvTcCap) {
+    capG.__maxtvTcCap = new Promise<boolean>((res) => {
+      try {
+        const p = spawn('ffmpeg', ['-version'], { stdio: 'ignore' });
+        p.on('error', () => res(false)); // ENOENT — no binary
+        p.on('close', (code) => res(code === 0));
+      } catch {
+        res(false);
+      }
+    });
+  }
+  return capG.__maxtvTcCap;
+}
+
 const BITRATES: Record<number, { v: number; max: number }> = {
   144: { v: 145_000, max: 180_000 },
   244: { v: 280_000, max: 340_000 },

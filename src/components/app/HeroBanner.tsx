@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { cn } from '@/lib/utils';
 import { logoSrc } from './ChannelCard';
 import type { MatchCardData } from './MatchCard';
@@ -48,28 +48,84 @@ export function HeroBanner({
 }) {
   const [idx, setIdx] = useState(0);
   const [paused, setPaused] = useState(false);
+  const [dragPx, setDragPx] = useState(0); // live finger offset while swiping
+  const [swiping, setSwiping] = useState(false);
+  const touch = useRef<{ x: number; y: number; id: number; horizontal: boolean | null; lastDx: number } | null>(null);
+  const SWIPE_THRESHOLD = 48; // px of horizontal travel before it counts as a swipe
+
+  const go = (dir: 1 | -1) => setIdx((i) => (i + dir + matches.length) % matches.length);
+
+  // ── touch swipe (mobile) — horizontal-dominant swipes flip the hero slide ──
+  const onTouchStart = (e: React.TouchEvent) => {
+    if (matches.length <= 1) return;
+    const t = e.touches[0];
+    touch.current = { x: t.clientX, y: t.clientY, id: t.identifier, horizontal: null, lastDx: 0 };
+  };
+
+  const onTouchMove = (e: React.TouchEvent) => {
+    const s = touch.current;
+    if (!s) return;
+    const t = e.touches[0];
+    if (t.identifier !== s.id) return;
+    const dx = t.clientX - s.x;
+    const dy = t.clientY - s.y;
+    // decide once whether this gesture is horizontal (swipe) or vertical (scroll)
+    if (s.horizontal === null) {
+      if (Math.abs(dx) < 8 && Math.abs(dy) < 8) return;
+      s.horizontal = Math.abs(dx) > Math.abs(dy);
+      if (s.horizontal) setSwiping(true);
+    }
+    if (s.horizontal) {
+      s.lastDx = dx; // ref-tracked — touchend always sees the latest value
+      setDragPx(dx);
+    }
+  };
+
+  const onTouchEnd = () => {
+    const s = touch.current;
+    touch.current = null;
+    setSwiping(false);
+    if (!s || s.horizontal !== true) {
+      setDragPx(0);
+      return;
+    }
+    // ⚠ read the drag from the REF, not state — React may not have re-rendered
+    // between the last touchmove and this touchend, so the state value can be
+    // stale (this was the "swipe doesn't work" bug).
+    if (s.lastDx <= -SWIPE_THRESHOLD) go(1); // swipe left → next
+    else if (s.lastDx >= SWIPE_THRESHOLD) go(-1); // swipe right → prev
+    setDragPx(0);
+  };
 
   useEffect(() => {
-    if (paused || matches.length <= 1) return;
+    if (paused || swiping || matches.length <= 1) return;
     const t = setInterval(() => setIdx((i) => (i + 1) % matches.length), 6000);
     return () => clearInterval(t);
-  }, [paused, matches.length]);
+  }, [paused, swiping, matches.length]);
 
   if (!matches.length) return null;
   const m = matches[idx % matches.length];
+  const dragShift = Math.max(-120, Math.min(120, dragPx * 0.35)); // subtle parallax while dragging
 
   const versusMatch = m.team1 && m.team2 ? m : null;
   const emblem = versusMatch ? null : m.leagueLogo || m.channelLogo;
 
   return (
     <section
-      className="relative overflow-hidden border-b border-zilla-line"
+      className="relative touch-pan-y select-none overflow-hidden border-b border-zilla-line"
       style={{ background: heroGradient(m.title) }}
       aria-label="Featured live events"
       onMouseEnter={() => setPaused(true)}
       onMouseLeave={() => setPaused(false)}
+      onTouchStart={onTouchStart}
+      onTouchMove={onTouchMove}
+      onTouchEnd={onTouchEnd}
+      onTouchCancel={onTouchEnd}
     >
-      <div className="relative mx-auto flex min-h-[19rem] max-w-7xl flex-col justify-end gap-4 px-4 py-8 sm:min-h-[22rem] sm:px-6 lg:px-10 lg:py-12">
+      <div
+        className="relative mx-auto flex min-h-[19rem] max-w-7xl flex-col justify-end gap-4 px-4 py-8 transition-transform duration-200 ease-out sm:min-h-[22rem] sm:px-6 lg:px-10 lg:py-12"
+        style={swiping ? { transform: `translateX(${dragShift}px)`, transition: 'none' } : undefined}
+      >
         {/* crest art — right side on desktop, top-right on mobile */}
         <div key={`art-${m.id}`} className="pointer-events-none absolute right-4 top-6 flex items-center gap-3 sm:right-6 sm:top-8 lg:right-10">
           {versusMatch ? (
@@ -129,22 +185,45 @@ export function HeroBanner({
           </div>
         </div>
 
-        {/* dots */}
+        {/* dots + swipe arrows */}
         {matches.length > 1 && (
-          <div className="flex gap-1.5" role="tablist" aria-label="Featured events">
-            {matches.slice(0, 8).map((mm, i) => (
-              <button
-                key={mm.id}
-                role="tab"
-                aria-selected={i === idx % matches.length}
-                onClick={() => setIdx(i)}
-                aria-label={`Show event ${i + 1}`}
-                className={cn(
-                  'h-1.5 rounded-full transition-all',
-                  i === idx % matches.length ? 'w-7 bg-zilla-yellow' : 'w-3 bg-white/25 hover:bg-white/40'
-                )}
-              />
-            ))}
+          <div className="flex items-center gap-3">
+            <button
+              onClick={() => go(-1)}
+              aria-label="Previous featured event"
+              className="flex h-8 w-8 items-center justify-center rounded-full border border-white/15 bg-black/40 text-white/70 backdrop-blur transition-colors hover:bg-white/15 hover:text-white"
+            >
+              <svg viewBox="0 0 24 24" className="h-4 w-4 fill-current" aria-hidden>
+                <path d="M15.4 4.6 8 12l7.4 7.4 1.4-1.4-6-6 6-6z" />
+              </svg>
+            </button>
+            <div className="flex gap-1.5" role="tablist" aria-label="Featured events">
+              {matches.slice(0, 8).map((mm, i) => (
+                <button
+                  key={mm.id}
+                  role="tab"
+                  aria-selected={i === idx % matches.length}
+                  onClick={() => setIdx(i)}
+                  aria-label={`Show event ${i + 1}`}
+                  className={cn(
+                    'h-1.5 rounded-full transition-all',
+                    i === idx % matches.length ? 'w-7 bg-zilla-yellow' : 'w-3 bg-white/25 hover:bg-white/40'
+                  )}
+                />
+              ))}
+            </div>
+            <button
+              onClick={() => go(1)}
+              aria-label="Next featured event"
+              className="flex h-8 w-8 items-center justify-center rounded-full border border-white/15 bg-black/40 text-white/70 backdrop-blur transition-colors hover:bg-white/15 hover:text-white"
+            >
+              <svg viewBox="0 0 24 24" className="h-4 w-4 fill-current" aria-hidden>
+                <path d="M8.6 4.6 7.2 6l6 6-6 6 1.4 1.4L16 12z" />
+              </svg>
+            </button>
+            <span className="ml-1 text-[10px] font-bold uppercase tracking-widest text-white/35 sm:hidden">
+              swipe
+            </span>
           </div>
         )}
       </div>

@@ -75,7 +75,11 @@ export async function GET(req: Request) {
       // direct + edge: proxy the resolved manifest through /api/hls. The
       // edge pin makes resolveDaddyLiveStream return the deterministic
       // edge URL (premium{id}/index.m3u8) — same transport, faster resolve.
-      url = proxyUrlFor(resolved.url, resolved.referer || '');
+      // &ch/&srv give /api/hls session-affinity recovery context: when the
+      // CDN 403s a refresh (serverless IP rotation) it re-resolves fresh.
+      url =
+        proxyUrlFor(resolved.url, resolved.referer || '') +
+        `&ch=${encodeURIComponent(channel)}&srv=${encodeURIComponent(server)}`;
     }
 
     const defaultId = isTurbo ? 'turbo' : isRelay ? 'relay' : isEdge ? 'edge' : 'direct';

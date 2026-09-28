@@ -5,6 +5,7 @@ import {
   findChannelSession,
   findSourceSession,
   decodeSource,
+  transcodeCapable,
   TRANSCODE_HEIGHTS,
   type TranscodeHeight,
 } from '@/lib/streaming/transcode';
@@ -30,10 +31,28 @@ export async function GET(req: Request) {
   const channel = searchParams.get('channel');
   const src = searchParams.get('src');
 
+  // capability probe — lets the client know whether the data-saver ladder
+  // exists on this deployment (serverless hosts ship no ffmpeg → false)
+  if (mode === 'cap') {
+    return NextResponse.json(
+      { cap: await transcodeCapable() },
+      { headers: { 'cache-control': 'no-store' } }
+    );
+  }
+
   if (!TRANSCODE_HEIGHTS.includes(heightRaw as TranscodeHeight)) {
     return NextResponse.json({ error: 'bad_height', allowed: TRANSCODE_HEIGHTS }, { status: 400 });
   }
   const height = heightRaw as TranscodeHeight;
+
+  // no ffmpeg on this host → fail FAST (no session spawn, no 20s wait) so a
+  // fail-open client bounces back to the native feed in milliseconds
+  if (mode !== 'probe' && !(await transcodeCapable())) {
+    return new NextResponse('transcoding unavailable on this deployment', {
+      status: 503,
+      headers: { 'x-offair': '1', 'content-type': 'text/plain' },
+    });
+  }
 
   // probe mode — report the upstream source's real height WITHOUT creating a
   // session (the player uses it to never request a rung above the source).
