@@ -1,0 +1,201 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-rubik);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+
+  /* ── ZILLA TV (Pluto-style) palette ── */
+  --color-zilla-yellow: #ffd200;
+  --color-zilla-yellow-soft: #ffe45c;
+  --color-zilla-red: #ff3b30;
+  --color-zilla-bg: #0b0c0f;
+  --color-zilla-panel: #14161b;
+  --color-zilla-card: #1b1e24;
+  --color-zilla-line: #262a32;
+  --color-zilla-text: #f4f5f7;
+  --color-zilla-dim: #9aa0ab;
+}
+
+:root {
+  --radius: 0.75rem;
+  --background: #0b0c0f;
+  --foreground: #f4f5f7;
+  --card: #1b1e24;
+  --card-foreground: #f4f5f7;
+  --popover: #14161b;
+  --popover-foreground: #f4f5f7;
+  --primary: #ffd200;
+  --primary-foreground: #0b0c0f;
+  --secondary: #1b1e24;
+  --secondary-foreground: #f4f5f7;
+  --muted: #14161b;
+  --muted-foreground: #9aa0ab;
+  --accent: #1b1e24;
+  --accent-foreground: #ffd200;
+  --destructive: #ff3b30;
+  --border: #262a32;
+  --input: #262a32;
+  --ring: #ffd200;
+}
+
+html {
+  color-scheme: dark;
+  /* the whole site renders as if the browser zoom were set to 80% —
+   * everything on-screen (fonts, cards, paddings) shrinks to 80% exactly
+   * like Ctrl+Minus twice, but keeps full resolution assets (crisp, not
+   * blurry). Supported by every evergreen browser (Chrome/Safari/Firefox). */
+  zoom: 0.8;
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-rubik), system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ── Pluto-style utilities ── */
+
+.hide-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+.hide-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
+.styled-scrollbar {
+  scrollbar-width: thin;
+  scrollbar-color: #2c313b transparent;
+}
+.styled-scrollbar::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+.styled-scrollbar::-webkit-scrollbar-thumb {
+  background: #2c313b;
+  border-radius: 8px;
+}
+.styled-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+@keyframes pulse-live {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
+.live-dot {
+  animation: pulse-live 1.6s ease-in-out infinite;
+}
+
+@keyframes marquee-up {
+  from {
+    transform: translateY(8px);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+.rise-in {
+  animation: marquee-up 0.45s cubic-bezier(0.2, 0.7, 0.3, 1) both;
+}
+
+@keyframes shimmer {
+  0% {
+    background-position: -400px 0;
+  }
+  100% {
+    background-position: 400px 0;
+  }
+}
+.skeleton-shimmer {
+  background: linear-gradient(90deg, #14161b 25%, #1e2127 50%, #14161b 75%);
+  background-size: 800px 100%;
+  animation: shimmer 1.4s linear infinite;
+}
+
+.text-glow-yellow {
+  text-shadow: 0 0 24px rgba(255, 210, 0, 0.35);
+}
+
+.hero-gradient {
+  background:
+    radial-gradient(120% 140% at 85% 20%, rgba(255, 210, 0, 0.16) 0%, transparent 55%),
+    radial-gradient(90% 120% at 10% 90%, rgba(255, 59, 48, 0.12) 0%, transparent 50%),
+    linear-gradient(160deg, #161922 0%, #0b0c0f 70%);
+}
+
+.card-hover-pop {
+  transition:
+    transform 0.22s cubic-bezier(0.2, 0.7, 0.3, 1),
+    box-shadow 0.22s ease,
+    border-color 0.22s ease;
+}
+.card-hover-pop:hover {
+  transform: translateY(-4px) scale(1.02);
+  box-shadow: 0 14px 34px rgba(0, 0, 0, 0.55);
+}
+
+/* ── Pluto TV-style volume slider ─────────────────────────────────────────── */
+.slider-zilla {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 4px;
+  border-radius: 999px;
+  background: linear-gradient(to right, #ffd200 var(--fill, 50%), rgba(255, 255, 255, 0.18) var(--fill, 50%));
+  outline: none;
+  cursor: pointer;
+}
+.slider-zilla::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 13px;
+  height: 13px;
+  border-radius: 999px;
+  background: #fff;
+  border: 2.5px solid #ffd200;
+  box-shadow: 0 1px 6px rgba(0, 0, 0, 0.6);
+  transition: transform 0.15s ease;
+}
+.slider-zilla::-webkit-slider-thumb:hover {
+  transform: scale(1.25);
+}
+.slider-zilla::-moz-range-thumb {
+  width: 13px;
+  height: 13px;
+  border-radius: 999px;
+  background: #fff;
+  border: 2.5px solid #ffd200;
+  box-shadow: 0 1px 6px rgba(0, 0, 0, 0.6);
+}

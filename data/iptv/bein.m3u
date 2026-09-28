@@ -1,0 +1,18 @@
+#EXTM3U
+# Curated beIN Sports networks — discovered via the iptv-org streams index and
+# verified playable. Football-first sports coverage (XTRA = beIN's free FAST
+# tier, officially distributed via Amagi/CloudFront/Xumo/Tubi CDNs).
+#EXTINF:-1 tvg-id="beINSportsXTRA.us" tvg-logo="https://raw.githubusercontent.com/danielpersson1985/tv-logos/refs/heads/main/tv-logos-main/bein-us.png" group-title="Sports",beIN Sports XTRA
+https://bein-xtra-bein.amagi.tv/playlist.m3u8
+#EXTINF:-1 tvg-id="beINSportsXTRA2.us" tvg-logo="https://raw.githubusercontent.com/danielpersson1985/tv-logos/refs/heads/main/tv-logos-main/bein-us.png" group-title="Sports",beIN Sports XTRA (FireTV)
+https://bein-beinxtrasports-firetv.amagi.tv/playlist.m3u8
+#EXTINF:-1 tvg-id="beINSportsXTRA3.us" tvg-logo="https://raw.githubusercontent.com/danielpersson1985/tv-logos/refs/heads/main/tv-logos-main/bein-us.png" group-title="Sports",beIN Sports XTRA (Xumo)
+https://bein-xtra-xumo.amagi.tv/playlist.m3u8
+#EXTINF:-1 tvg-id="beINSportsXTRA4.us" tvg-logo="https://raw.githubusercontent.com/danielpersson1985/tv-logos/refs/heads/main/tv-logos-main/bein-us.png" group-title="Sports",beIN Sports XTRA (Tubi)
+https://aegis-cloudfront-1.tubi.video/651ee7d3-e75b-4748-be86-422d43ff24b6/playlist.m3u8
+#EXTINF:-1 tvg-id="beINSportsCloud.us" tvg-logo="https://raw.githubusercontent.com/danielpersson1985/tv-logos/refs/heads/main/tv-logos-main/bein-us.png" group-title="Sports",beIN Sports
+https://d9ssxzmclhfo4.cloudfront.net/bein_sports.m3u8
+#EXTINF:-1 tvg-id="beINSportsXtraEspanol.us" tvg-logo="https://raw.githubusercontent.com/danielpersson1985/tv-logos/refs/heads/main/tv-logos-main/bein-es.png" group-title="Sports",beIN Sports XTRA en Español
+https://dc1644a9jazgj.cloudfront.net/beIN_Sports_Xtra_Espanol.m3u8
+#EXTINF:-1 tvg-id="beINSportsXtraEspanol2.us" tvg-logo="https://raw.githubusercontent.com/danielpersson1985/tv-logos/refs/heads/main/tv-logos-main/bein-es.png" group-title="Sports",beIN Sports XTRA en Español (Xumo)
+https://bein-esp-xumo.amagi.tv/playlist.m3u8
