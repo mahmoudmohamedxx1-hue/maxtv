@@ -87,6 +87,15 @@ interface AltServer {
   health?: string;
 }
 
+/** build the playable for hopping to an alternate (multi-quality) source —
+ *  a DaddyLive channel flips to the iptv resolve path, KEEPING its id so
+ *  the servers-menu state and the failover chain survive the hop. */
+function altPlayable(cur: Playable, alt: AltServer): Playable {
+  return cur.kind === 'daddylive'
+    ? { ...cur, kind: 'iptv', ref: alt.url, name: alt.name, source: alt.sourceName, logo: alt.logo || cur.logo }
+    : { ...cur, ref: alt.url, source: alt.sourceName, logo: alt.logo || cur.logo };
+}
+
 /** encode/decode a playable as a shareable ?ch= deep link */
 function encodePlayable(p: Playable): string {
   try {
@@ -230,6 +239,9 @@ export function PlayerOverlay() {
   const [showServersMenu, setShowServersMenu] = useState(false);
   const [surfOpen, setSurfOpen] = useState(false);
   const [surf, setSurf] = useState<SurfItem[]>([]);
+  /** url of the alternate (multi-quality) source currently playing — null = a
+   *  native DaddyLive transport. Drives the servers-menu active highlight. */
+  const [altUrl, setAltUrl] = useState<string | null>(null);
   const [controlsVisible, setControlsVisible] = useState(true);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [toast, setToast] = useState('');
@@ -259,7 +271,7 @@ export function PlayerOverlay() {
   /** the NATIVE feed's real height (0 unknown) — the transcode ladder never
    *  encodes UP: a request at/above it stays on the untouched native feed */
   const nativeHeightRef = useRef(0);
-  const loadRef = useRef<(ch: Playable, opts?: { server?: string }) => Promise<void>>(async () => {});
+  const loadRef = useRef<(ch: Playable, opts?: { server?: string; isAlternate?: boolean }) => Promise<void>>(async () => {});
   /** servers/alternate urls already tried for the current channel */
   const triedRef = useRef<{ chId: string; tried: Set<string> }>({ chId: '', tried: new Set() });
   /** cancel hook for the auto-advance countdown (any interaction stops it) */
@@ -456,7 +468,7 @@ export function PlayerOverlay() {
 
   /* ── resolve → attach hls → play ───────────────────────────────────────── */
   const load = useCallback(
-    async (ch: Playable, opts: { server?: string } = {}) => {
+    async (ch: Playable, opts: { server?: string; isAlternate?: boolean } = {}) => {
       if (!ch) return;
       const gen = ++loadGenRef.current;
       setPhase('resolving');
@@ -467,8 +479,11 @@ export function PlayerOverlay() {
       setActiveHeight(0);
       setTcHeight(null);
       nativeHeightRef.current = 0; // learned again from the native manifest
+      if (!opts.isAlternate) setAltUrl(null); // playing a DL server / fresh channel
 
-      // fresh channel → reset the per-channel server-switching state
+      // fresh channel → reset the per-channel server-switching state.
+      // ⚠ alternate playables keep the ORIGINAL channel id, so hopping to a
+      // multi-quality source never wipes the servers menu mid-session.
       if (triedRef.current.chId !== ch.id) {
         triedRef.current = { chId: ch.id, tried: new Set() };
         setServers([]);
@@ -489,7 +504,7 @@ export function PlayerOverlay() {
       try {
         const endpoint =
           ch.kind === 'daddylive'
-            ? `/api/sports/stream?channel=${encodeURIComponent(ch.ref)}${opts.server ? `&server=${encodeURIComponent(opts.server)}` : ''}`
+            ? `/api/sports/stream?channel=${encodeURIComponent(ch.ref)}${opts.server ? `&server=${encodeURIComponent(opts.server)}` : ''}${ch.name ? `&name=${encodeURIComponent(ch.name.slice(0, 80))}` : ''}`
             : `/api/iptv/stream?url=${encodeURIComponent(ch.ref)}${ch.name ? `&name=${encodeURIComponent(ch.name)}` : ''}`;
         // 25s cap — some embed chains crawl; fail fast so auto-advance can surf on
         const ctrl = new AbortController();
@@ -541,7 +556,8 @@ export function PlayerOverlay() {
           if (ch.kind === 'daddylive') {
             for (const s of serversRef.current) triedRef.current.tried.add(s.id);
           }
-          // per-stream failover before giving up (original-repo mirror hopping)
+          // per-stream failover before giving up (original-repo mirror hopping):
+          // DL transports first, then multi-quality alternates, then honest error
           const cur = playerRef.current || ch;
           if (cur.kind === 'daddylive') {
             const next = serversRef.current.find((s) => !triedRef.current.tried.has(s.id));
@@ -550,11 +566,12 @@ export function PlayerOverlay() {
               await loadRef.current(cur, { server: next.id });
               return;
             }
-          } else if (alternatesRef.current.length) {
+          }
+          {
             const next = alternatesRef.current.find((a) => !triedRef.current.tried.has(a.url));
             if (next) {
               showToast(`Trying ${next.sourceName}…`);
-              await loadRef.current({ ...cur, ref: next.url, source: next.sourceName, logo: next.logo || cur.logo });
+              await loadRef.current(altPlayable(cur, next), { isAlternate: true });
               return;
             }
           }
@@ -582,6 +599,9 @@ export function PlayerOverlay() {
             // bug. These CDNs are not LL-HLS anyway.
             lowLatencyMode: false,
             enableWorker: true,
+            // start the first fragment download while the manifest is still
+            // parsing — shaves ~1-2s off channel changes (freestream-tv trick)
+            startFragPrefetch: true,
             ...hlsPerfConfig(loadPrefs().perfMode),
             ...RESILIENT_LOAD_POLICIES,
             ...(budget > 0 ? { abrEwmaDefaultEstimate: budget } : {}),
@@ -645,6 +665,17 @@ export function PlayerOverlay() {
               if (idx >= 0) {
                 hls.currentLevel = idx;
                 setCurrentQuality(idx);
+              } else if (!tcCapRef.current) {
+                // no native rung at/below the preference and no transcode
+                // ladder (serverless) — pin the LOWEST rung instead of full
+                // auto, so a 480p preference never plays 1080p by accident
+                const lowest = levels.filter((l) => l.height > 0).sort((a, b) => a.height - b.height)[0];
+                if (lowest) {
+                  hls.currentLevel = lowest.level;
+                  setCurrentQuality(lowest.level);
+                } else {
+                  setCurrentQuality(-1);
+                }
               } else {
                 setCurrentQuality(-1);
               }
@@ -736,11 +767,12 @@ export function PlayerOverlay() {
                   void loadRef.current(cur, { server: next.id });
                   return;
                 }
-              } else if (alternatesRef.current.length) {
+              }
+              {
                 const next = alternatesRef.current.find((a) => !triedRef.current.tried.has(a.url));
                 if (next) {
                   showToast(`Trying ${next.sourceName}…`);
-                  void loadRef.current({ ...cur, ref: next.url, source: next.sourceName, logo: next.logo || cur.logo });
+                  void loadRef.current(altPlayable(cur, next), { isAlternate: true });
                   return;
                 }
               }
@@ -769,11 +801,12 @@ export function PlayerOverlay() {
                   void loadRef.current(cur, { server: next.id });
                   return;
                 }
-              } else if (alternatesRef.current.length) {
+              }
+              {
                 const next = alternatesRef.current.find((a) => !triedRef.current.tried.has(a.url));
                 if (next) {
                   showToast(`Trying ${next.sourceName}…`);
-                  void loadRef.current({ ...cur, ref: next.url, source: next.sourceName, logo: next.logo || cur.logo });
+                  void loadRef.current(altPlayable(cur, next), { isAlternate: true });
                   return;
                 }
               }
@@ -1345,11 +1378,24 @@ export function PlayerOverlay() {
       const cur = playerRef.current;
       if (!cur) return;
       setShowServersMenu(false);
+      setAltUrl(alt.url);
+      if (cur.kind === 'daddylive') setActiveServer('');
       showToast(`Switching to ${alt.sourceName}…`);
-      void loadRef.current({ ...cur, ref: alt.url, source: alt.sourceName, logo: alt.logo || cur.logo });
+      void loadRef.current(altPlayable(cur, alt), { isAlternate: true });
     },
     [showToast]
   );
+
+  /** leave an alternate source — back to the channel's live servers */
+  const backToLiveServers = useCallback(() => {
+    const cur = playerRef.current;
+    if (!cur || cur.kind !== 'daddylive') return;
+    setShowServersMenu(false);
+    setAltUrl(null);
+    // fresh walk of the transport ladder, starting at the default server
+    triedRef.current = { chId: cur.id, tried: new Set() };
+    void loadRef.current(cur);
+  }, []);
 
   const share = useCallback(async () => {
     if (!player) return;
@@ -1628,6 +1674,8 @@ export function PlayerOverlay() {
                     {singleQuality && (
                       <p className="px-3.5 py-1.5 text-[10px] font-medium leading-snug text-zilla-dim">
                         This channel serves a single quality from its provider.
+                        {alternates.length > 0 &&
+                          ' Multi-quality sources are available — open “Switch server” and pick one under “More sources”.'}
                       </p>
                     )}
 
@@ -2003,8 +2051,26 @@ export function PlayerOverlay() {
                     <div className="styled-scrollbar max-h-72 overflow-y-auto">
                       {player.kind === 'daddylive' ? (
                         <>
+                          {altUrl && (
+                            <button
+                              onClick={backToLiveServers}
+                              className="flex w-full items-center gap-2 border-b border-zilla-line/60 px-4 py-2.5 text-left transition-colors hover:bg-white/5"
+                            >
+                              <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-white/10 text-[10px] font-black text-zilla-dim">
+                                ↩
+                              </span>
+                              <span className="min-w-0 flex-1">
+                                <span className="block truncate text-xs font-bold text-zilla-yellow">
+                                  Back to live servers
+                                </span>
+                                <span className="block truncate text-[10px] font-medium text-zilla-dim">
+                                  {player.name} · DaddyLive transports
+                                </span>
+                              </span>
+                            </button>
+                          )}
                           {serverOptions.map((s) => {
-                            const isActive = activeServer === s.id || (!s.id && activeServer === s.host);
+                            const isActive = (altUrl === null || altUrl === undefined) && (activeServer === s.id || (!s.id && activeServer === s.host));
                             return (
                               <button
                                 key={s.id}
@@ -2041,10 +2107,61 @@ export function PlayerOverlay() {
                               </button>
                             );
                           })}
+                          {alternates.length > 0 && (
+                            <>
+                              <p className="border-y border-zilla-line/60 bg-white/[0.03] px-4 py-2 text-[9px] font-black uppercase tracking-widest text-zilla-dim">
+                                More sources · multi-quality
+                              </p>
+                              {alternates.map((alt) => {
+                                const isActive = altUrl === alt.url;
+                                return (
+                                  <button
+                                    key={alt.id}
+                                    onClick={() => switchAlternate(alt)}
+                                    className={cn(
+                                      'flex w-full items-center gap-3 px-4 py-2.5 text-left transition-colors hover:bg-white/5',
+                                      isActive && 'bg-zilla-yellow/10'
+                                    )}
+                                  >
+                                    {alt.logo ? (
+                                      <img
+                                        src={logoSrc(alt.logo, alt.name)}
+                                        alt=""
+                                        loading="lazy"
+                                        className="h-7 w-11 shrink-0 rounded object-contain"
+                                      />
+                                    ) : (
+                                      <span className="flex h-7 w-11 shrink-0 items-center justify-center rounded bg-white/5 text-[10px] font-black text-zilla-dim">
+                                        TV
+                                      </span>
+                                    )}
+                                    <span className="min-w-0 flex-1">
+                                      <span className="block truncate text-xs font-bold text-zilla-text">
+                                        {alt.sourceName}
+                                        {isActive && <span className="ml-1.5 text-zilla-yellow">· playing</span>}
+                                      </span>
+                                      <span className="block truncate text-[10px] font-medium text-zilla-dim">
+                                        {alt.name}
+                                        {alt.source === 'worldsports' ? ' · real quality ladder' : ''}
+                                      </span>
+                                    </span>
+                                    {alt.source === 'worldsports' && (
+                                      <span className="shrink-0 rounded-full bg-zilla-yellow/15 px-2 py-0.5 text-[9px] font-black uppercase text-zilla-yellow/90">
+                                        HD↑
+                                      </span>
+                                    )}
+                                  </button>
+                                );
+                              })}
+                            </>
+                          )}
                           <p className="px-4 py-2 text-[10px] font-medium leading-snug text-zilla-dim">
                             Direct CDN (Server 2) is the default — straight from the CDN, no middle layer.
                             Edge direct skips mirror parsing for the lowest latency. Turbo and Relay are
-                            pre-buffered through MaxTV to ride out CDN hiccups. If one acts up, hop to another.
+                            pre-buffered through MaxTV to ride out CDN hiccups.
+                            {alternates.length > 0
+                              ? ' Sources under "More sources" carry the same channel with real quality ladders — pick one, then choose your quality from the badge in the top bar.'
+                              : ' DaddyLive streams ship a single quality; pick a multi-quality source when one appears here.'}
                           </p>
                         </>
                       ) : (

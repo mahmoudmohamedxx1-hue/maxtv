@@ -176,6 +176,8 @@ export function SportsTab({
   }, [liveMatches]);
 
   const ch247 = channels || [];
+  // multi-quality provider networks (World Sports source) — real ABR ladders
+  const worldChannels = useMemo(() => ch247.filter((c) => c.meta === 'worldsports'), [ch247]);
   const filtered247 = useMemo(
     () => (sportFilter === 'all' ? ch247 : ch247.filter((c) => c.category === sportFilter)),
     [ch247, sportFilter]
@@ -366,6 +368,23 @@ export function SportsTab({
                 channel={c}
                 onPlay={onPlayChannel}
                 badge="⚽"
+              />
+            ))}
+          </ContentRow>
+        )}
+
+        {/* World Sports — multi-quality networks rail (real ABR ladders) */}
+        {worldChannels.length > 0 && (
+          <ContentRow
+            title="World Sports"
+            subtitle={`${worldChannels.length} multi-quality networks — pick any quality from 360p to 1080p in the player · every stream verified`}
+          >
+            {worldChannels.slice(0, 40).map((c) => (
+              <ChannelCard
+                key={`ws-${c.id}`}
+                channel={c}
+                onPlay={onPlayChannel}
+                badge="HD"
               />
             ))}
           </ContentRow>

@@ -203,6 +203,18 @@ export const PLAYLIST_SOURCES: PlaylistSource[] = [
     forceCategory: 'sports',
     blurb: 'beIN Sports networks — football first',
   },
+  {
+    id: 'worldsports',
+    name: 'World Sports',
+    file: 'WorldSports.m3u',
+    // curated snapshot (no upstream refresh — every entry VERIFIED to ship a
+    // real ABR ladder: 3-7 quality variants per manifest, checked through the
+    // production proxy chain. Regenerate with scripts/build-worldsports.py)
+    upstream: '',
+    sports: true,
+    forceCategory: 'sports',
+    blurb: 'Multi-quality sports networks — real ladders from 360p to 1080p',
+  },
 ];
 
 export function dataDir(): string {

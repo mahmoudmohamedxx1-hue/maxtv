@@ -1,12 +1,13 @@
 import { NextResponse } from 'next/server';
 import { resolveDaddyLiveStream, DADDYLIVE_SERVERS } from '@/lib/sports/daddylive';
 import { proxyUrlFor } from '@/lib/streaming/proxy';
+import { findAlternates } from '@/lib/iptv/catalog';
 
 export const dynamic = 'force-dynamic';
 
 /**
  * Resolve a DaddyLive channel id to a playable (proxied) HLS manifest.
- * GET /api/sports/stream?channel=100[&server=direct|edge|turbo|relay|direct-dlive|…]
+ * GET /api/sports/stream?channel=100[&server=direct|edge|turbo|relay|direct-dlive|…][&name=…]
  *
  * Per-stream server switching — transport-based (see daddylive.ts):
  *   • direct (DEFAULT, "Server 2") — user-verified best: the browser proxies
@@ -18,11 +19,17 @@ export const dynamic = 'force-dynamic';
  * Each transport can be pinned to a mirror for (re-)resolution. The response
  * carries the full server list so the player can offer manual switching (and
  * auto-failover) between genuinely different transports.
+ *
+ * &name= (optional, the channel's display name) additionally resolves
+ * `alternates` — the SAME channel carried by other providers (World Sports,
+ * beIN, Pluto …). Those sources ship real ABR ladders (multiple qualities),
+ * so the player offers them in the servers menu as multi-quality servers.
  */
 export async function GET(req: Request) {
   const { searchParams } = new URL(req.url);
   const channel = searchParams.get('channel');
   const server = searchParams.get('server') || 'direct';
+  const chName = (searchParams.get('name') || '').slice(0, 80);
   if (!channel || !/^\d+$/.test(channel)) {
     return NextResponse.json({ error: 'bad_channel' }, { status: 400 });
   }
@@ -48,14 +55,20 @@ export async function GET(req: Request) {
 
   try {
     // resolve even for relay mode — verifies the channel exists (fast 404 for
-    // dead ids) AND warms the resolve cache so the relay's first pass is instant
-    const resolved = await resolveDaddyLiveStream(channel, { server });
+    // dead ids) AND warms the resolve cache so the relay's first pass is instant.
+    // Alternates (same channel on ladder-bearing providers) resolve in
+    // parallel — they're independent of the primary transport.
+    const [resolved, alternates] = await Promise.all([
+      resolveDaddyLiveStream(channel, { server }),
+      chName ? findAlternates(chName, '') : Promise.resolve([]),
+    ]);
     if (!resolved || !resolved.url) {
       return NextResponse.json(
         {
           error: 'resolve_failed',
           message: 'No stream found for this channel right now.',
           servers: serverList,
+          alternates,
         },
         { status: 404 }
       );
@@ -93,6 +106,7 @@ export async function GET(req: Request) {
       server: resolved.server,
       serverId: serverDef?.id || defaultId,
       servers: serverList.map((s) => ({ ...s, active: s.id === (serverDef?.id || defaultId) })),
+      alternates,
     });
   } catch (e) {
     return NextResponse.json({ error: 'resolve_error', message: (e as Error).message }, { status: 500 });

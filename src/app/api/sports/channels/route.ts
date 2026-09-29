@@ -107,7 +107,7 @@ export async function GET() {
       ref: c.url,
       source: catalog.sources.find((s) => s.id === c.source)?.name || c.source,
       category:
-        c.id.startsWith('tvpass') || c.id.startsWith('bein')
+        c.id.startsWith('tvpass') || c.id.startsWith('bein') || c.id.startsWith('worldsports')
           ? classifyChannel(c.name)
           : 'more',
       logo: c.logo || getChannelLogo(c.name) || undefined,
@@ -126,7 +126,7 @@ export async function GET() {
 function classifyChannel(name: string): string {
   const n = name.toLowerCase();
   const rules: Array<[string, string[]]> = [
-    ['football', ['soccer', 'football', 'futbol', 'fútbol', 'gol tv', 'willow']],
+    ['football', ['soccer', 'football', 'futbol', 'fútbol', 'gol tv', 'willow', 'fifa']],
     ['cricket', ['cricket', 'willow', 'star sports', 'ten sports', 'ptv sports', 'ghazi hd', 'a sports']],
     ['basketball', ['nba', 'basketball', 'nbatv']],
     ['american_football', ['nfl', 'nfl network']],

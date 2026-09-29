@@ -260,6 +260,18 @@ function coreChannelName(n: string): string {
   return normalizeChannelName(n).replace(/^[0-9]+/, '');
 }
 
+/** regional/edition qualifiers — the same network sold under localized names
+ *  ("beIN Sports MENA English 1" ≡ "beIN Sports 1"). Stripped for matching
+ *  only; menu labels keep the full name. */
+const REGION_QUALIFIERS =
+  /\b(arabic|english|mena|usa|us|uk|ksa|qatar|egypt|france|french|germany|german|spain|espanol|español|hispanic|portugal|asia|pacific|america|american|international|premium)\b/gi;
+
+function regionalCoreName(n: string): string {
+  // strip qualifiers from the RAW name (word boundaries need the spaces),
+  // then normalize — "beIN Sports 1 Arabic" → "beinsports1"
+  return normalizeChannelName(n.replace(REGION_QUALIFIERS, ' '));
+}
+
 /**
  * Find the same channel served by other sources — the IPTV counterpart of the
  * original repo's per-stream server switching. Same channel on a different
@@ -269,7 +281,7 @@ function coreChannelName(n: string): string {
 export async function findAlternates(
   name: string,
   excludeUrl: string,
-  limit = 8
+  limit = 10
 ): Promise<AlternateChannel[]> {
   if (!name) return [];
   const cat = await getCatalog();
@@ -280,14 +292,29 @@ export async function findAlternates(
   const out: AlternateChannel[] = [];
   const seenUrls = new Set<string>([excludeUrl]);
   const seenKeys = new Set<string>();
+  const regional = regionalCoreName(name);
   for (const ch of cat.channels) {
     if (seenUrls.has(ch.url)) continue;
-    // tier 1: exact normalized name; tier 2: channel-number-stripped core name
+    // tier 1: exact normalized name
+    // tier 2: channel-number-stripped core name
+    // tier 3: region-stripped ("beIN Sports MENA English 1" ≡ "beIN Sports 1")
+    // tier 4: family prefix ("beIN SPORTS XTRA 1" ≡ "beIN SPORTS XTRA") —
+    //          same network brand, edition/number variant of it
     const n = normalizeChannelName(ch.name);
-    if (n !== want && !(core.length >= 5 && coreChannelName(ch.name) === core && n !== want)) continue;
+    const rc = regionalCoreName(ch.name);
+    const t1 = n === want;
+    const t2 = core.length >= 5 && coreChannelName(ch.name) === core;
+    const t3 = regional.length >= 6 && rc === regional && n !== want;
+    const t4 =
+      regional.length >= 8 &&
+      rc.length >= 8 &&
+      rc !== regional &&
+      (rc.startsWith(regional) || regional.startsWith(rc));
+    if (!t1 && !t2 && !t3 && !t4) continue;
     seenUrls.add(ch.url);
-    // one menu entry per (source, channel) pair — skip "108 X" + "129 X" clones
-    const key = `${ch.source}|${n}`;
+    // one menu entry per (source, matched-name) pair — skips "108 X" + "129 X"
+    // clones AND regional twins from the same source
+    const key = `${ch.source}|${t1 ? n : t2 ? coreChannelName(ch.name) : rc}`;
     if (seenKeys.has(key)) continue;
     seenKeys.add(key);
     const src = cat.sources.find((s) => s.id === ch.source);
@@ -304,7 +331,12 @@ export async function findAlternates(
     if (out.length >= limit) break;
   }
 
-  // healthy sources first, then alphabetical
+  // ladder-bearing sources first (real multi-quality), then healthy, then name
   const tier = (h?: SourceHealth) => (h === 'ok' ? 0 : h === 'geo' ? 1 : 2);
-  return out.sort((a, b) => tier(a.health) - tier(b.health) || a.sourceName.localeCompare(b.sourceName));
+  return out.sort(
+    (a, b) =>
+      Number(b.source === 'worldsports') - Number(a.source === 'worldsports') ||
+      tier(a.health) - tier(b.health) ||
+      a.sourceName.localeCompare(b.sourceName)
+  );
 }
