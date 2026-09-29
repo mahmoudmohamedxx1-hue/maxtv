@@ -18,6 +18,7 @@ import path from 'path';
 import { resolveDaddyLiveStream } from '@/lib/sports/daddylive';
 import { unwrapSegment } from './uncloak';
 import { UA, signUrl, verifySignature } from './resolve';
+import { fetchTolerant } from './tls-fetch';
 import { turboCachedBySn } from './turbo';
 
 export const TRANSCODE_HEIGHTS = [144, 244, 360, 480, 720, 1080] as const;
@@ -327,10 +328,10 @@ export class TranscodeSession {
 
   private async fetchAndUnwrap(url: string, referer: string): Promise<Uint8Array | null> {
     try {
-      const res = await fetch(url, {
+      // cert-tolerant (expired-cert IPTV CDNs keep feeding the relay window)
+      const res = await fetchTolerant(url, {
         headers: { 'User-Agent': UA, Accept: '*/*', ...(referer ? { Referer: referer } : {}) },
-        signal: AbortSignal.timeout(15000),
-        redirect: 'follow',
+        timeoutMs: 15000,
       });
       if (!res.ok) return null;
       const buf = new Uint8Array(await res.arrayBuffer());
@@ -655,10 +656,9 @@ function probeHeight(file: string): Promise<number | null> {
 
 async function fetchText(url: string, referer: string): Promise<string | null> {
   try {
-    const res = await fetch(url, {
+    const res = await fetchTolerant(url, {
       headers: { 'User-Agent': UA, Accept: '*/*', ...(referer ? { Referer: referer } : {}) },
-      signal: AbortSignal.timeout(12000),
-      redirect: 'follow',
+      timeoutMs: 12000,
     });
     if (!res.ok) return null;
     return await res.text();

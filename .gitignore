@@ -54,3 +54,6 @@ yarn-error.log*
 worklog.md
 Caddyfile
 db/
+
+# local-only test harness
+/scripts/

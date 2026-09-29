@@ -7,6 +7,7 @@
 
 import { UA, isBlockedHost, signUrl } from './resolve';
 import { unwrapSegment } from './uncloak';
+import { fetchTolerant } from './tls-fetch';
 
 const SEGMENT_EXT = /\.(ts|m4s|mp4|aac|mp3|vtt|srt|webvtt|cmfa|cmfv|cmaf|jpg|jpeg|png)(\?|$)/i;
 
@@ -97,10 +98,11 @@ async function warmPrefetch(url: string, referer: string): Promise<void> {
   if (warmInflight.has(url)) return;
   warmInflight.add(url);
   try {
-    const res = await fetch(url, {
+    // cert-tolerant: many free-IPTV CDNs ship expired certificates — strict
+    // fetch 502s them on serverless (no ffmpeg to mask it). See tls-fetch.ts.
+    const res = await fetchTolerant(url, {
       headers: { 'User-Agent': UA, Accept: '*/*', ...(referer ? { Referer: referer } : {}) },
-      redirect: 'follow',
-      signal: AbortSignal.timeout(15000),
+      timeoutMs: 15000,
     });
     if (!res.ok) return;
     const raw = new Uint8Array(await res.arrayBuffer());
@@ -114,17 +116,19 @@ async function warmPrefetch(url: string, referer: string): Promise<void> {
 }
 
 async function upstreamFetch(url: string, referer: string, range?: string, method: 'GET' | 'HEAD' = 'GET') {
-  return fetch(url, {
-    method,
-    headers: {
-      'User-Agent': UA,
-      Accept: '*/*',
-      ...(referer ? { Referer: referer } : {}),
-      ...(range ? { Range: range } : {}),
-    },
-    redirect: 'follow',
-    signal: AbortSignal.timeout(20000),
-  });
+  const headers = {
+    'User-Agent': UA,
+    Accept: '*/*',
+    ...(referer ? { Referer: referer } : {}),
+    ...(range ? { Range: range } : {}),
+  };
+  // GETs go through the cert-tolerant path (expired-cert CDNs keep playing,
+  // matching what the ffmpeg relay and VLC do); HEAD stays plain fetch —
+  // nothing HEADs an IPTV CDN in this app today.
+  if (method === 'GET') {
+    return fetchTolerant(url, { headers, timeoutMs: 20000 });
+  }
+  return fetch(url, { method, headers, redirect: 'follow', signal: AbortSignal.timeout(20000) });
 }
 
 /** Make a line absolute against the playlist URL */

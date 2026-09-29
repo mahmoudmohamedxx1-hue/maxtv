@@ -10,6 +10,7 @@
 // Results are cached for 15 minutes.
 
 import { UA, resolveRedirects, isBlockedHost } from '@/lib/streaming/resolve';
+import { fetchTolerant } from '@/lib/streaming/tls-fetch';
 import type { IPTVChannel } from '@/lib/types';
 
 export type SourceHealth = 'ok' | 'geo' | 'dead' | 'unknown';
@@ -41,10 +42,9 @@ async function probeChannel(ch: IPTVChannel): Promise<SourceHealth> {
     const target = await resolveRedirects(ch.url);
     const u = new URL(target);
     if (isBlockedHost(u.hostname)) return 'dead';
-    const res = await fetch(target, {
+    const res = await fetchTolerant(target, {
       headers: { 'User-Agent': UA, Accept: '*/*' },
-      redirect: 'follow',
-      signal: AbortSignal.timeout(9000),
+      timeoutMs: 9000,
     });
     if (!res.ok) return classify(res.status, false);
 
@@ -59,10 +59,9 @@ async function probeChannel(ch: IPTVChannel): Promise<SourceHealth> {
       if (!variant) return 'dead';
       const vUrl = new URL(variant, target).toString();
       if (isBlockedHost(new URL(vUrl).hostname)) return 'dead';
-      const vr = await fetch(vUrl, {
+      const vr = await fetchTolerant(vUrl, {
         headers: { 'User-Agent': UA, Accept: '*/*' },
-        redirect: 'follow',
-        signal: AbortSignal.timeout(9000),
+        timeoutMs: 9000,
       });
       if (!vr.ok) return classify(vr.status, false);
       const vt = await vr.text();

@@ -48,53 +48,80 @@ export function HeroBanner({
 }) {
   const [idx, setIdx] = useState(0);
   const [paused, setPaused] = useState(false);
-  const [dragPx, setDragPx] = useState(0); // live finger offset while swiping
+  const [dragPx, setDragPx] = useState(0); // live finger/cursor offset while swiping
   const [swiping, setSwiping] = useState(false);
-  const touch = useRef<{ x: number; y: number; id: number; horizontal: boolean | null; lastDx: number } | null>(null);
+  /** unified pointer gesture (mouse drag + touch swipe + pen) — one code path */
+  const ptr = useRef<{
+    x0: number;
+    y0: number;
+    id: number;
+    type: string;
+    horizontal: boolean | null;
+    lastDx: number;
+  } | null>(null);
+  /** timestamp of the last completed swipe — suppresses the trailing click so a
+   *  drag that ends on top of "Watch live" doesn't also trigger playback */
+  const lastSwipeAt = useRef(0);
   const SWIPE_THRESHOLD = 48; // px of horizontal travel before it counts as a swipe
 
   const go = (dir: 1 | -1) => setIdx((i) => (i + dir + matches.length) % matches.length);
 
-  // ── touch swipe (mobile) — horizontal-dominant swipes flip the hero slide ──
-  const onTouchStart = (e: React.TouchEvent) => {
+  // ── swipe via Pointer Events — works with finger, pen AND mouse drag ──
+  const onPointerDown = (e: React.PointerEvent) => {
     if (matches.length <= 1) return;
-    const t = e.touches[0];
-    touch.current = { x: t.clientX, y: t.clientY, id: t.identifier, horizontal: null, lastDx: 0 };
+    if (e.pointerType === 'mouse' && e.button !== 0) return; // primary button only
+    // don't hijack gestures that start on interactive controls (arrows/dots)
+    if ((e.target as HTMLElement).closest('button, a, input')) return;
+    ptr.current = { x0: e.clientX, y0: e.clientY, id: e.pointerId, type: e.pointerType, horizontal: null, lastDx: 0 };
   };
 
-  const onTouchMove = (e: React.TouchEvent) => {
-    const s = touch.current;
-    if (!s) return;
-    const t = e.touches[0];
-    if (t.identifier !== s.id) return;
-    const dx = t.clientX - s.x;
-    const dy = t.clientY - s.y;
+  const onPointerMove = (e: React.PointerEvent) => {
+    const s = ptr.current;
+    if (!s || e.pointerId !== s.id) return;
+    const dx = e.clientX - s.x0;
+    const dy = e.clientY - s.y0;
     // decide once whether this gesture is horizontal (swipe) or vertical (scroll)
     if (s.horizontal === null) {
       if (Math.abs(dx) < 8 && Math.abs(dy) < 8) return;
       s.horizontal = Math.abs(dx) > Math.abs(dy);
-      if (s.horizontal) setSwiping(true);
+      if (s.horizontal) {
+        setSwiping(true);
+        // mouse: capture so we keep tracking even outside the hero bounds
+        if (s.type === 'mouse') {
+          try { (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId); } catch {}
+        }
+      }
     }
     if (s.horizontal) {
-      s.lastDx = dx; // ref-tracked — touchend always sees the latest value
+      s.lastDx = dx; // ref-tracked — pointerup always sees the latest value
       setDragPx(dx);
     }
   };
 
-  const onTouchEnd = () => {
-    const s = touch.current;
-    touch.current = null;
+  const onPointerUp = (e: React.PointerEvent) => {
+    const s = ptr.current;
+    if (!s || e.pointerId !== s.id) return;
+    ptr.current = null;
     setSwiping(false);
-    if (!s || s.horizontal !== true) {
+    if (s.horizontal !== true) {
       setDragPx(0);
       return;
     }
     // ⚠ read the drag from the REF, not state — React may not have re-rendered
-    // between the last touchmove and this touchend, so the state value can be
-    // stale (this was the "swipe doesn't work" bug).
+    // between the last pointermove and this pointerup, so the state value can
+    // be stale (this was the "swipe doesn't work" bug).
     if (s.lastDx <= -SWIPE_THRESHOLD) go(1); // swipe left → next
     else if (s.lastDx >= SWIPE_THRESHOLD) go(-1); // swipe right → prev
+    if (Math.abs(s.lastDx) >= 8) lastSwipeAt.current = Date.now(); // ate the click
     setDragPx(0);
+  };
+
+  /** a finished swipe must not also fire the click it landed on */
+  const onClickCapture = (e: React.SyntheticEvent) => {
+    if (Date.now() - lastSwipeAt.current < 400) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
   };
 
   useEffect(() => {
@@ -105,22 +132,27 @@ export function HeroBanner({
 
   if (!matches.length) return null;
   const m = matches[idx % matches.length];
-  const dragShift = Math.max(-120, Math.min(120, dragPx * 0.35)); // subtle parallax while dragging
+  const dragShift = Math.max(-170, Math.min(170, dragPx * 0.45)); // live drag feedback
 
   const versusMatch = m.team1 && m.team2 ? m : null;
   const emblem = versusMatch ? null : m.leagueLogo || m.channelLogo;
 
   return (
     <section
-      className="relative touch-pan-y select-none overflow-hidden border-b border-zilla-line"
+      className={cn(
+        'relative touch-pan-y select-none overflow-hidden border-b border-zilla-line',
+        matches.length > 1 && 'cursor-grab active:cursor-grabbing'
+      )}
       style={{ background: heroGradient(m.title) }}
       aria-label="Featured live events"
       onMouseEnter={() => setPaused(true)}
       onMouseLeave={() => setPaused(false)}
-      onTouchStart={onTouchStart}
-      onTouchMove={onTouchMove}
-      onTouchEnd={onTouchEnd}
-      onTouchCancel={onTouchEnd}
+      onPointerDown={onPointerDown}
+      onPointerMove={onPointerMove}
+      onPointerUp={onPointerUp}
+      onPointerCancel={onPointerUp}
+      onDragStart={(e) => e.preventDefault()} // keep native image drag from stealing swipes
+      onClickCapture={onClickCapture}
     >
       <div
         className="relative mx-auto flex min-h-[19rem] max-w-7xl flex-col justify-end gap-4 px-4 py-8 transition-transform duration-200 ease-out sm:min-h-[22rem] sm:px-6 lg:px-10 lg:py-12"
@@ -167,7 +199,7 @@ export function HeroBanner({
           <div className="mt-5 flex flex-wrap items-center gap-2.5">
             <button
               onClick={() => m.channels[0] && onPlay(m.channels[0].id, m.channels[0].name, m.channels)}
-              className="flex items-center gap-2 rounded-full bg-zilla-yellow px-6 py-3 text-sm font-black uppercase tracking-wide text-black shadow-[0_8px_30px_rgba(255,210,0,0.35)] transition-transform hover:scale-[1.03]"
+              className="flex cursor-pointer items-center gap-2 rounded-full bg-zilla-yellow px-6 py-3 text-sm font-black uppercase tracking-wide text-black shadow-[0_8px_30px_rgba(255,210,0,0.35)] transition-transform hover:scale-[1.03]"
             >
               <svg viewBox="0 0 24 24" className="h-5 w-5 fill-current" aria-hidden>
                 <path d="M8 5.14v13.72L19 12 8 5.14z" />
@@ -177,7 +209,7 @@ export function HeroBanner({
             {onSeeAll && (
               <button
                 onClick={onSeeAll}
-                className="rounded-full border border-white/20 bg-white/5 px-6 py-3 text-sm font-black uppercase tracking-wide text-zilla-text backdrop-blur-sm transition-colors hover:bg-white/10"
+                className="cursor-pointer rounded-full border border-white/20 bg-white/5 px-6 py-3 text-sm font-black uppercase tracking-wide text-zilla-text backdrop-blur-sm transition-colors hover:bg-white/10"
               >
                 All live events
               </button>
@@ -191,7 +223,7 @@ export function HeroBanner({
             <button
               onClick={() => go(-1)}
               aria-label="Previous featured event"
-              className="flex h-8 w-8 items-center justify-center rounded-full border border-white/15 bg-black/40 text-white/70 backdrop-blur transition-colors hover:bg-white/15 hover:text-white"
+              className="flex h-8 w-8 cursor-pointer items-center justify-center rounded-full border border-white/15 bg-black/40 text-white/70 backdrop-blur transition-colors hover:bg-white/15 hover:text-white"
             >
               <svg viewBox="0 0 24 24" className="h-4 w-4 fill-current" aria-hidden>
                 <path d="M15.4 4.6 8 12l7.4 7.4 1.4-1.4-6-6 6-6z" />
@@ -215,7 +247,7 @@ export function HeroBanner({
             <button
               onClick={() => go(1)}
               aria-label="Next featured event"
-              className="flex h-8 w-8 items-center justify-center rounded-full border border-white/15 bg-black/40 text-white/70 backdrop-blur transition-colors hover:bg-white/15 hover:text-white"
+              className="flex h-8 w-8 cursor-pointer items-center justify-center rounded-full border border-white/15 bg-black/40 text-white/70 backdrop-blur transition-colors hover:bg-white/15 hover:text-white"
             >
               <svg viewBox="0 0 24 24" className="h-4 w-4 fill-current" aria-hidden>
                 <path d="M8.6 4.6 7.2 6l6 6-6 6 1.4 1.4L16 12z" />
