@@ -56,4 +56,3 @@ Caddyfile
 db/
 
 # local-only test harness
-/scripts/
