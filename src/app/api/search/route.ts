@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
-import { getSchedule } from '@/lib/sports/daddylive';
-import { get247Channels } from '@/lib/sports/daddylive';
+import { getSchedule, get247Channels, freshAliveIds } from '@/lib/sports/daddylive';
+import { DEAD_DL_CHANNEL_IDS } from '@/lib/sports/categories';
 import { getCatalog } from '@/lib/iptv/catalog';
 import { getChannelLogo } from '@/lib/media/logos';
 
@@ -33,8 +33,12 @@ export async function GET(req: Request) {
       kind: 'match' as const,
     }));
 
+  // dead-id filter (scan seed + runtime verdicts) — search must never offer
+  // a channel that won't play; ids the runtime probe resurrected stay visible
+  const runtimeAlive = freshAliveIds();
   const sportChHits = ch247
     .filter((c) => c.name.toLowerCase().includes(q))
+    .filter((c) => runtimeAlive.has(c.id) || !DEAD_DL_CHANNEL_IDS.has(c.id))
     .slice(0, 15)
     .map((c) => ({
       id: `dl247:${c.id}`,

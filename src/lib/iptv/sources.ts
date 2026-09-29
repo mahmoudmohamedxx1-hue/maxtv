@@ -22,6 +22,10 @@ export interface PlaylistSource {
   sports?: boolean;
   /** Short blurb for tooltips */
   blurb?: string;
+  /** Temporarily out of service — channels 403/404 upstream. Skipped by
+   *  the catalog builder so dead streams never reach the UI. Clear the flag
+   *  to re-enable once the provider's tokens/URLs come back. */
+  disabled?: boolean;
 }
 
 const GH_RAW = 'https://raw.githubusercontent.com/abusaeeidx/IPTV-Scraper-Zilla/main';
@@ -184,6 +188,10 @@ export const PLAYLIST_SOURCES: PlaylistSource[] = [
     sports: true,
     forceCategory: 'sports',
     blurb: 'Pixelsports 24/7',
+    // DISABLED 2026-09-29: every stream in the playlist serves 403 — the
+    // provider's signed CDN tokens (pixelstream-cdn.b-cdn.net) expired and
+    // the upstream playlist hasn't refreshed them. Re-enable when it does.
+    disabled: true,
   },
   {
     id: 'bein',
@@ -262,7 +270,10 @@ export function refreshPlaylist(source: PlaylistSource): void {
     .finally(() => refreshing.delete(source.id));
 }
 
-/** Kick off refreshes for all sources (called on catalog build). */
+/** Kick off refreshes for all sources (called on catalog build).
+ *  Disabled (dead-provider) sources are skipped — no wasted upstream calls. */
 export function refreshAllPlaylists(): void {
-  for (const src of PLAYLIST_SOURCES) refreshPlaylist(src);
+  for (const src of PLAYLIST_SOURCES) {
+    if (!src.disabled) refreshPlaylist(src);
+  }
 }

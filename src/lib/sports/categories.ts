@@ -36,12 +36,20 @@ export function isEventStream(name: string | undefined | null): boolean {
   return /^event\s*[-_]?\s*(sd\s*[-_]?\s*)?stream/i.test(name) || /\bevent\s*(sd\s*)?stream\b/i.test(name);
 }
 
-/** DaddyLive premium-CDN channel ids that have been dead (manifest 404) for
- *  days — a static snapshot kept in sync with daddylive.ts. Shared here so
- *  the feed ranker can push them to the back without import cycles.
- *  The beIN rail additionally probes at runtime, so ids that resurrect
- *  reappear there automatically. */
-export const DEAD_DL_CHANNEL_IDS = new Set(['92', '99', '597', '1010', '491', '492']);
+/** DaddyLive premium-CDN channel ids that are dead (manifest 404) — a full
+ *  scan snapshot (scripts/scan-dead-channels.js → src/data/daddylive-dead.ts)
+ *  of the whole 24/7 index, refreshed whenever drift is reported. The CDN's
+ *  dead set drifts over time, so this seed is combined with a runtime probe
+ *  (probeDaddyLiveChannels, 5-min cache + rolling background refresh) that
+ *  resurrects ids on their own. Shared here so the feed ranker can push dead
+ *  ids to the back without import cycles.
+ *  NOTE: the seed is a TS module, NOT a .json import — JSON modules don't
+ *  reliably survive the standalone-server bundle (they resolve to an empty
+ *  module, silently disabling the filter). */
+import { DEAD_DL_SCAN } from '@/data/daddylive-dead';
+
+const HAND_CURATED_DEAD = ['92', '99', '597', '1010', '491', '492']; // kept: long-dead, known
+export const DEAD_DL_CHANNEL_IDS = new Set<string>([...HAND_CURATED_DEAD, ...DEAD_DL_SCAN]);
 
 interface SportDef {
   id: string;

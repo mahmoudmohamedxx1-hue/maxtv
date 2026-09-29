@@ -50,6 +50,7 @@ export function HeroBanner({
   const [paused, setPaused] = useState(false);
   const [dragPx, setDragPx] = useState(0); // live finger/cursor offset while swiping
   const [swiping, setSwiping] = useState(false);
+  const heroRef = useRef<HTMLElement | null>(null);
   /** unified pointer gesture (mouse drag + touch swipe + pen) — one code path */
   const ptr = useRef<{
     x0: number;
@@ -124,6 +125,49 @@ export function HeroBanner({
     }
   };
 
+  // ── touchpad two-finger horizontal swipe (wheel events, no click needed) ──
+  // Laptop trackpads emit `wheel` with a deltaX when the user swipes sideways
+  // with two fingers. React's synthetic onWheel is passive at the root, so we
+  // attach a native non-passive listener to preventDefault (this also blocks
+  // the browser's two-finger back/forward navigation while over the hero).
+  useEffect(() => {
+    const el = heroRef.current;
+    if (!el || matches.length <= 1) return;
+    const STEP = 32; // accumulated px of horizontal travel before changing slide
+    let sum = 0;
+    let locked = false; // cooldown — one flick fires dozens of inertial wheel events
+    let unlockT: number | undefined;
+    const onWheel = (e: WheelEvent) => {
+      // normalise line/page deltaMode (older Firefox) to pixels
+      const k = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? 100 : 1;
+      const dx = e.deltaX * k;
+      const dy = e.deltaY * k;
+      // only take over CLEARLY horizontal gestures — vertical page scroll must pass through
+      if (!(Math.abs(dx) > 4 && Math.abs(dx) > Math.abs(dy))) {
+        sum = 0; // gesture turned vertical → reset accumulation
+        return;
+      }
+      e.preventDefault();
+      if (locked) return;
+      sum += dx;
+      if (Math.abs(sum) >= STEP) {
+        const dir = sum > 0 ? 1 : -1; // fingers left → deltaX>0 → next
+        setIdx((i) => (i + dir + matches.length) % matches.length);
+        lastSwipeAt.current = Date.now();
+        sum = 0;
+        locked = true;
+        unlockT = window.setTimeout(() => {
+          locked = false;
+        }, 500);
+      }
+    };
+    el.addEventListener('wheel', onWheel, { passive: false });
+    return () => {
+      el.removeEventListener('wheel', onWheel);
+      if (unlockT) window.clearTimeout(unlockT);
+    };
+  }, [matches.length]);
+
   useEffect(() => {
     if (paused || swiping || matches.length <= 1) return;
     const t = setInterval(() => setIdx((i) => (i + 1) % matches.length), 6000);
@@ -139,11 +183,12 @@ export function HeroBanner({
 
   return (
     <section
+      ref={heroRef}
       className={cn(
         'relative touch-pan-y select-none overflow-hidden border-b border-zilla-line',
         matches.length > 1 && 'cursor-grab active:cursor-grabbing'
       )}
-      style={{ background: heroGradient(m.title) }}
+      style={{ background: heroGradient(m.title), overscrollBehaviorX: 'contain' }}
       aria-label="Featured live events"
       onMouseEnter={() => setPaused(true)}
       onMouseLeave={() => setPaused(false)}
@@ -253,6 +298,9 @@ export function HeroBanner({
                 <path d="M8.6 4.6 7.2 6l6 6-6 6 1.4 1.4L16 12z" />
               </svg>
             </button>
+            <span className="ml-1 hidden text-[10px] font-bold uppercase tracking-widest text-white/35 sm:inline">
+              swipe / scroll
+            </span>
             <span className="ml-1 text-[10px] font-bold uppercase tracking-widest text-white/35 sm:hidden">
               swipe
             </span>

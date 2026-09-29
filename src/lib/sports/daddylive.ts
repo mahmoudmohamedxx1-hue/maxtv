@@ -8,7 +8,7 @@
 
 import * as cheerio from 'cheerio';
 import type { SportsMatch, SportsChannelRef, ResolvedStream } from '../types';
-import { normalizeSport, splitLeague, stripEmojis, decodeEntities, isEventStream, DEAD_DL_CHANNEL_IDS } from './categories';
+import { normalizeSport, splitLeague, stripEmojis, decodeEntities, isEventStream } from './categories';
 import { rankScheduleFeeds } from './feeds';
 
 const UA =
@@ -310,15 +310,6 @@ export interface DaddyLiveChannel {
   country?: string;
 }
 
-/** Channel ids whose premium CDN manifests have been 404 for days — a
- *  live snapshot (2026-09) of what the CDN actually serves. Shared with the
- *  feed ranker via ./categories (DEAD_DL_CHANNEL_IDS) so the Watch button
- *  never opens a dead channel. The beIN rail additionally probes at runtime
- *  (probeDaddyLiveChannels) so channels that come back reappear there
- *  automatically. Currently dead: beIN 2/9 Arabic, beIN Max AR,
- *  beIN 5 Turkey, beIN Australia 1/2. */
-const DEAD_CHANNEL_IDS = DEAD_DL_CHANNEL_IDS;
-
 /** Repair common Shift-JIS mojibake left by the channel pages ("Espa単ol" → "Español"). */
 function fixMojibake(name: string): string {
   return name.replace(/Espa単ol/g, 'Español');
@@ -336,12 +327,15 @@ async function fetch247Uncached(): Promise<DaddyLiveChannel[]> {
   const $ = cheerio.load(html);
   const out: DaddyLiveChannel[] = [];
   const seen = new Set<string>();
+  // NOTE: dead ids are NOT dropped here — consumers filter with the scan seed
+  // (DEAD_DL_CHANNEL_IDS) + runtime verdicts, so channels that resurrect on
+  // the CDN come back automatically instead of being hidden until a re-scan.
   $('a.card').each((_, el) => {
     const href = $(el).attr('href') || '';
     const idm = href.match(/id=(\d+)/);
     if (!idm) return;
     const id = idm[1];
-    if (seen.has(id) || DEAD_CHANNEL_IDS.has(id)) return;
+    if (seen.has(id)) return;
     seen.add(id);
     const name = ($(el).find('.card__title').first().text() || $(el).attr('data-title') || `Channel ${id}`).trim();
     if (!name || isEventStream(name)) return;
@@ -693,16 +687,17 @@ async function tryEdgeDirect(
 // ─── runtime channel health probe ────────────────────────────────────────────
 // The premium CDN serves some channel ids as permanent 404s and that set
 // drifts over time (a hard-coded dead list goes stale). A cheap ranged GET
-// on the manifest — raced in parallel, cached 5 min — keeps channel rails
-// free of dead entries AND resurrects ids that come back on their own.
+// on the manifest — raced in parallel, cached 5 min per id — keeps channel
+// rails free of dead entries AND resurrects ids that come back on their own.
+// Verdicts accumulate per-id (append-only maps with a TTL), so the rolling
+// background refresh in the channels route builds up full-catalog knowledge
+// across requests instead of being wiped on every cache cycle.
 
 const cdnEdge = { host: 'edge.cowedd4855ws.sbs' };
-interface ProbeEntry {
-  ok: Set<string>;
-  dead: Set<string>;
-  until: number;
-}
-const probeState: { entry: ProbeEntry | null } = { entry: null };
+/** id → timestamp of last clean verdict */
+const probeOk = new Map<string, number>();
+const probeDead = new Map<string, number>();
+const PROBE_TTL = 5 * 60_000;
 
 async function probeOne(id: string): Promise<boolean> {
   // three strikes — the CDN edges flap (round-robin nodes + connection
@@ -725,25 +720,44 @@ async function probeOne(id: string): Promise<boolean> {
 
 /** Probe DaddyLive channel ids against the premium CDN manifests.
  *  Returns the set of ids that are ALIVE (manifest reachable right now).
+ *  Verdicts are cached per id for 5 min — fresh ones answer instantly,
+ *  stale/unknown ones get re-probed — so resurrected ids come back and
+ *  newly-dead ones drop out without ever resetting the whole cache.
  *  Probes run in small chunks — the CDN throttles large connection bursts. */
 export async function probeDaddyLiveChannels(ids: string[]): Promise<Set<string>> {
   const unique = [...new Set(ids)].filter(Boolean);
   if (!unique.length) return new Set();
   const now = Date.now();
-  const e = probeState.entry;
-  if (e && now < e.until) {
-    const unknown = unique.filter((id) => !e.ok.has(id) && !e.dead.has(id));
-    if (!unknown.length) return new Set(unique.filter((id) => e.ok.has(id)));
+  const fresh = (m: Map<string, number>, id: string) => {
+    const t = m.get(id);
+    return t !== undefined && now - t < PROBE_TTL;
+  };
+  const alive = unique.filter((id) => fresh(probeOk, id));
+  const unknown = unique.filter((id) => !fresh(probeOk, id) && !fresh(probeDead, id));
+  if (unknown.length) {
     const verdicts = await probeAll(unknown);
-    unknown.forEach((id, i) => (verdicts[i] ? e.ok.add(id) : e.dead.add(id)));
-    return new Set(unique.filter((id) => e.ok.has(id)));
+    const verifiedAt = Date.now();
+    unknown.forEach((id, i) => {
+      if (verdicts[i]) {
+        probeOk.set(id, verifiedAt);
+        alive.push(id);
+      } else {
+        probeDead.set(id, verifiedAt);
+      }
+    });
   }
-  const verdicts = await probeAll(unique);
-  const ok = new Set<string>();
-  const dead = new Set<string>();
-  unique.forEach((id, i) => (verdicts[i] ? ok.add(id) : dead.add(id)));
-  probeState.entry = { ok, dead, until: now + 5 * 60_000 };
-  return ok;
+  return new Set(alive);
+}
+
+/** ids with a fresh (≤ 5 min) ALIVE verdict — lets callers filter responses
+ *  by runtime knowledge WITHOUT triggering new probes. */
+export function freshAliveIds(): Set<string> {
+  const now = Date.now();
+  const out = new Set<string>();
+  for (const [id, t] of probeOk) {
+    if (now - t < PROBE_TTL) out.add(id);
+  }
+  return out;
 }
 
 async function probeAll(ids: string[]): Promise<boolean[]> {

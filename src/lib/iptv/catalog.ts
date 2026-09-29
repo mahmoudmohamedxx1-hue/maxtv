@@ -91,6 +91,8 @@ async function build(): Promise<Catalog> {
   const bySource = new Map<string, IPTVChannel[]>();
 
   for (const src of PLAYLIST_SOURCES) {
+    // disabled sources (provider dead — 403/404 upstream) never reach the UI
+    if (src.disabled) continue;
     const content = readPlaylistFile(src);
     if (!content) continue;
     const entries = parseM3U(content);
