@@ -188,6 +188,10 @@ async function fetchScheduleUncached(): Promise<SportsMatch[]> {
   return rankScheduleFeeds(matches);
 }
 
+/** last non-empty scrape — survives cache expiry so an upstream blip never
+ *  blanks the home page (hero) with an empty schedule */
+let lastGoodSchedule: SportsMatch[] | null = null;
+
 export async function getSchedule(): Promise<SportsMatch[]> {
   const key = 'dl:schedule';
   const hit = getCached<SportsMatch[]>(key);
@@ -196,17 +200,32 @@ export async function getSchedule(): Promise<SportsMatch[]> {
     if (isStale(key)) {
       revalidateInBackground(key, async () => {
         const fresh = await fetchScheduleUncached();
-        if (fresh.length) setCached(key, fresh, 60_000, 3 * 60_000);
+        if (fresh.length) {
+          setCached(key, fresh, 60_000, 3 * 60_000);
+          lastGoodSchedule = fresh;
+        }
       });
     }
     return hit;
   }
 
-  const fresh = await fetchScheduleUncached();
-  // 1 min fresh · 3 min stale-serve (SWR) — the homepage scrape takes seconds,
-  // nobody should wait for it twice
-  setCached(key, fresh, 60_000, 3 * 60_000);
-  return fresh;
+  let fresh = await fetchScheduleUncached();
+  if (!fresh.length) {
+    // transient upstream flap (timeout / 403 on both mirrors) — one retry
+    // before giving up; an empty DaddyLive day-page is never legitimate
+    await new Promise((r) => setTimeout(r, 900));
+    fresh = await fetchScheduleUncached();
+  }
+  if (fresh.length) {
+    // 1 min fresh · 3 min stale-serve (SWR) — the homepage scrape takes
+    // seconds, nobody should wait for it twice
+    setCached(key, fresh, 60_000, 3 * 60_000);
+    lastGoodSchedule = fresh;
+    return fresh;
+  }
+  // never cache — and never serve — an empty scrape as success: fall back to
+  // the last good lineup so the hero + rows survive the blip
+  return lastGoodSchedule ?? [];
 }
 
 export function parseScheduleHtml(html: string): SportsMatch[] {

@@ -100,8 +100,13 @@ export function SportsTab({
       try {
         const s = (await fetchJson('/api/sports/schedule')) as ScheduleResponse;
         if (!alive) return;
-        setSchedule(s);
-        setError('');
+        if (s && s.total > 0) {
+          setSchedule(s);
+          setError('');
+        } else {
+          // empty lineup = upstream scrape failed — retry, never blank the hero
+          setError('Live sports engine is warming up — retrying automatically…');
+        }
       } catch {
         if (alive && !scheduleTried.current) {
           scheduleTried.current = true;
@@ -128,8 +133,11 @@ export function SportsTab({
     const t = setInterval(async () => {
       try {
         const s = (await fetchJson('/api/sports/schedule', 20_000, 0)) as ScheduleResponse;
-        setSchedule(s);
-        setError('');
+        // only a real lineup clears the retry loop — empty keeps retrying
+        if (s && s.total > 0) {
+          setSchedule(s);
+          setError('');
+        }
       } catch {
         /* keep retrying */
       }
@@ -142,8 +150,11 @@ export function SportsTab({
     const t = setInterval(async () => {
       try {
         const s = (await fetchJson('/api/sports/schedule', 20_000, 0)) as ScheduleResponse;
-        setSchedule(s);
-        setError('');
+        // an empty refresh must never wipe a loaded home (hero) mid-session
+        if (s && s.total > 0) {
+          setSchedule(s);
+          setError('');
+        }
       } catch { /* keep old */ }
     }, 60_000);
     return () => clearInterval(t);
