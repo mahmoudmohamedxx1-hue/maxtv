@@ -1,20 +1,35 @@
 import { NextResponse } from 'next/server';
 import { resolveDaddyLiveStream, DADDYLIVE_SERVERS } from '@/lib/sports/daddylive';
 import { proxyUrlFor } from '@/lib/streaming/proxy';
-import { findAlternates } from '@/lib/iptv/catalog';
+import { findAlternates, type AlternateChannel } from '@/lib/iptv/catalog';
+import { probeLadder, peekLadder } from '@/lib/streaming/ladder';
+import { getTurboSession } from '@/lib/streaming/turbo';
 
 export const dynamic = 'force-dynamic';
+
+/** serverless hosts freeze between requests — the turbo prefetch relay is the
+ *  smooth transport there (inline kick per poll). Self-hosted keeps direct. */
+const SERVERLESS = process.env.VERCEL === '1' || !!process.env.VERCEL_ENV;
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** how many of the best alternates get their quality ladder probed (the
+ *  multi-quality rungs shown in the player's quality menu) */
+const LADDER_PROBE_COUNT = 2;
+const LADDER_PROBE_WAIT_MS = 1_800;
 
 /**
  * Resolve a DaddyLive channel id to a playable (proxied) HLS manifest.
  * GET /api/sports/stream?channel=100[&server=direct|edge|turbo|relay|direct-dlive|…][&name=…]
  *
  * Per-stream server switching — transport-based (see daddylive.ts):
- *   • direct (DEFAULT, "Server 2") — user-verified best: the browser proxies
- *     the CDN manifest via /api/hls (no ffmpeg, no relay hop)
+ *   • direct (self-hosted default; "Server 2") — the browser proxies the CDN
+ *     manifest via /api/hls (no ffmpeg, no relay hop)
+ *   • turbo (SERVERLESS default; "Server 1") — /api/turbo prefetch playlist
+ *     with the v2 inline kick; the player reads warm bytes and rides out CDN
+ *     flaps on a 12-segment runway. Pre-warmed below so it fills while the
+ *     player is still setting up hls.js.
  *   • edge — deterministic CDN-edge manifest, lowest resolution latency
- *   • turbo — /api/turbo prefetch playlist; server-side cache keeps the
- *     player off the CDN's critical path
  *   • relay — /api/live ffmpeg remux/transcode (bulletproof fallback)
  * Each transport can be pinned to a mirror for (re-)resolution. The response
  * carries the full server list so the player can offer manual switching (and
@@ -22,13 +37,16 @@ export const dynamic = 'force-dynamic';
  *
  * &name= (optional, the channel's display name) additionally resolves
  * `alternates` — the SAME channel carried by other providers (World Sports,
- * beIN, Pluto …). Those sources ship real ABR ladders (multiple qualities),
- * so the player offers them in the servers menu as multi-quality servers.
+ * beIN, Pluto …). Those sources ship real ABR ladders (multiple qualities:
+ * amagi alone serves 240p→1080p), so the top ones are ladder-probed here and
+ * their rungs surface in the player's QUALITY menu (the ffmpeg data-saver
+ * ladder is dead on serverless — this is the multi-quality engine now).
  */
 export async function GET(req: Request) {
   const { searchParams } = new URL(req.url);
   const channel = searchParams.get('channel');
-  const server = searchParams.get('server') || 'direct';
+  const serverParam = searchParams.get('server');
+  const server = serverParam || (SERVERLESS ? 'turbo' : 'direct');
   const chName = (searchParams.get('name') || '').slice(0, 80);
   if (!channel || !/^\d+$/.test(channel)) {
     return NextResponse.json({ error: 'bad_channel' }, { status: 400 });
@@ -60,15 +78,43 @@ export async function GET(req: Request) {
     // parallel — they're independent of the primary transport.
     const [resolved, alternates] = await Promise.all([
       resolveDaddyLiveStream(channel, { server }),
-      chName ? findAlternates(chName, '') : Promise.resolve([]),
+      chName ? findAlternates(chName, '') : Promise.resolve([] as AlternateChannel[]),
     ]);
+
+    // ── pre-warm the turbo session ──────────────────────────────────────────
+    // The poller starts filling the prefetch cache NOW, while the player is
+    // still setting up hls.js — by its first /api/turbo poll the window is
+    // already seeded (kicks the "7s cold warmup" down to ~1-2s).
+    const mirrorPin = serverDef?.mirror || (isTurbo && server.includes('-') ? server.slice('turbo-'.length) : undefined);
+    if (isTurbo || SERVERLESS) {
+      void getTurboSession(channel, mirrorPin).kick(1_200);
+    }
+
+    // ── ladder-probe the best alternates (multi-quality rungs) ─────────────
+    // Bounded: resolve must not crawl when an alternate CDN is slow. Probes
+    // continue in the background and land in the cache for the next open.
+    const origin = new URL(req.url).origin;
+    const altTyped = alternates as (AlternateChannel & { ladder?: number[]; cors?: boolean })[];
+    const topAlts = altTyped.slice(0, LADDER_PROBE_COUNT).filter((a) => /^https?:\/\//i.test(a.url || ''));
+    if (topAlts.length) {
+      const probes = Promise.allSettled(topAlts.map((a) => probeLadder(a.url, '', origin)));
+      await Promise.race([probes, sleep(LADDER_PROBE_WAIT_MS)]);
+      for (const a of topAlts) {
+        const info = peekLadder(a.url, '');
+        if (info && info.heights.length) {
+          a.ladder = info.heights;
+          a.cors = info.cors;
+        }
+      }
+    }
+
     if (!resolved || !resolved.url) {
       return NextResponse.json(
         {
           error: 'resolve_failed',
           message: 'No stream found for this channel right now.',
           servers: serverList,
-          alternates,
+          alternates: altTyped,
         },
         { status: 404 }
       );
@@ -106,7 +152,7 @@ export async function GET(req: Request) {
       server: resolved.server,
       serverId: serverDef?.id || defaultId,
       servers: serverList.map((s) => ({ ...s, active: s.id === (serverDef?.id || defaultId) })),
-      alternates,
+      alternates: altTyped,
     });
   } catch (e) {
     return NextResponse.json({ error: 'resolve_error', message: (e as Error).message }, { status: 500 });

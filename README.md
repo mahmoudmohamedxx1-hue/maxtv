@@ -30,15 +30,15 @@ It is built around one core idea: **free CDN streams are unreliable, so reliabil
 - 🏟 **Live sports first** — fixtures schedule, "big matches ahead" rails, per-event multi-feed cycling and beIN Sports Arabic priority for football
 - 📺 **8,000+ free channels** across 20+ aggregated IPTV playlists, auto-repaired (dead URLs pruned, formats normalized) and searchable
 - 🌍 **World Sports rail** — 75+ curated sports networks (F1, FIFA+, NFL, NHL, PGA, Red Bull TV, beIN XTRA…) where *every* stream is verified to ship a real ABR ladder, so the quality menu always offers 3–7 genuine rungs
-- 🎛 **Real quality control** — native provider ladders *plus* a server-side **Data saver** ladder at **144p → 1080p**, with **480p as the tuned default** and per-height bitrate caps
-- 🔀 **Multi-quality sources per channel** — DaddyLive channels list "More sources · multi-quality" in the servers menu: the same network carried by ladder-bearing providers (World Sports, beIN, Plex, Samsung TV+…) with smart name matching ("beIN Sports MENA English 1" ≡ "beIN Sports 1" ≡ "beIN SPORTS XTRA")
+- 🎛 **Real quality control** — native provider ladders rendered right in the quality menu as "via `<source>`" rungs (240p→1080p on beIN XTRA, 144p→1080p on Samsung TV+ …) *plus* a server-side **Data saver** ladder at **144p → 1080p** where ffmpeg exists, with **480p as the tuned default** and per-height bitrate caps
+- 🔀 **Multi-quality sources per channel** — single-rendition DaddyLive channels get their rungs from ladder-bearing carriers: the top alternates are manifest-probed at resolve time and their native quality ladders appear in the **quality menu** (one tap = hop + pin that height) and as range badges in the servers menu
 - 📶 **Network-adaptive playback** — the connectivity engine watches live fragment throughput and moves you between rungs; `Auto` mode seeds from the browser's own estimate
 - 🖥 **Pluto TV–style UX** — channel-surfing remote with number keys, mini guide, recently-watched, PiP, fullscreen, keyboard shortcuts, live-edge indicator
 
 **Resilience (the interesting part)**
 - 🔀 **11 genuinely different transports** per stream — direct CDN, edge-direct, mirror-routed direct, an in-memory prefetching cache ("Turbo"), and bulletproof transcode relays — with automatic failover that walks the list
 - 🩹 **Honest error states** — dead channels fail fast to an actionable screen (retry / switch server / browse / close) instead of infinite spinners, then auto-advance to the next live channel
-- 🛡 **Serverless-aware** — deployments without ffmpeg (e.g. Vercel) detect it via a capability probe, gracefully stay on the native feed, point users at multi-quality sources instead, and say so in the quality menu; DaddyLive playlist refreshes that the edge CDN 403s (rotating serverless egress IPs) are recovered by a transparent server-side re-resolve
+- 🛡 **Serverless-aware** — deployments without ffmpeg (e.g. Vercel) detect it via a capability probe, gracefully stay on the native feed and source ladders instead, and say so in the quality menu; CORS-open CDNs play **directly from the provider** (zero proxy latency, native ABR) with an automatic proxy fallback; DaddyLive playlist refreshes that the edge CDN 403s (rotating serverless egress IPs) are recovered by a transparent server-side re-resolve
 - 👁 **Vision mismatch guard** — a frame from the feed is checked against the sport you opened; if the network preempted your match, the player offers a one-click hop to the event's next feed
 
 **Polish**
@@ -71,7 +71,7 @@ flowchart LR
 | Transport | What it does | When it wins |
 |---|---|---|
 | **Direct / Edge** | Proxied pass-through with speculative prefetch of the 3 newest segments into an LRU cache | Lowest latency, CDN healthy |
-| **Turbo cache** | Poller + parallel prefetch, de-steganographed segments, own clean playlist window | Flappy CDNs — segments serve locally in ~12–30 ms |
+| **Turbo cache** | Poller + parallel prefetch, de-steganographed segments, own clean playlist window. **v2 is serverless-proof**: every playlist poll inline-kicks the prefetch (no background timer needed), segments are numbered in the upstream media-sequence space (any warm instance serves identical playlist coordinates), and segment misses trigger on-demand upstream fetches | Flappy CDNs — segments serve locally in ~12–30 ms; the default transport on cloud hosting |
 | **Relay** | ffmpeg re-encode to uniform H.264 | Provider flips codecs/timestamps mid-stream |
 | **Transcode ladder** | Real-time 144p–1080p rungs with ffprobe-based no-upscale clamping | Quality control & data saving |
 

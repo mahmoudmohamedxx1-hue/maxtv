@@ -44,9 +44,9 @@ const PLAYER_CDN = 'https://daddyliveplayer.st';
  *     upstream pathology (codec flips, timestamp chaos)
  */
 export const DADDYLIVE_SERVERS = [
-  { id: 'direct', label: 'Server 2', host: 'Direct CDN · default (most reliable)', path: 'direct' },
+  { id: 'direct', label: 'Server 2', host: 'Direct CDN · straight through', path: 'direct' },
   { id: 'edge', label: 'Server 9', host: 'Edge direct · lowest latency', path: 'direct' },
-  { id: 'turbo', label: 'Server 1', host: 'Turbo cache · fastest start', path: 'turbo' },
+  { id: 'turbo', label: 'Server 1', host: 'Smart cache · pre-buffered, smoothest', path: 'turbo' },
   { id: 'direct-cdn', label: 'Server 5', host: 'Direct via daddyliveplayer.st', path: 'direct', mirror: 'cdn' },
   { id: 'direct-dlive', label: 'Server 3', host: 'Direct via dlive.sx', path: 'direct', mirror: 'dlive' },
   { id: 'direct-dlstreams', label: 'Server 4', host: 'Direct via dlstreams.st', path: 'direct', mirror: 'dlstreams' },

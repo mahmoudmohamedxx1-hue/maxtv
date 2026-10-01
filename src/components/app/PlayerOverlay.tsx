@@ -31,9 +31,9 @@ interface SurfItem extends Playable {
  *  user-verified best of the bunch (no ffmpeg warmup, no extra hop, the
  *  browser reads the CDN manifest straight through /api/hls). */
 const DL_SERVERS = [
-  { id: 'direct', label: 'Server 2', host: 'Direct CDN · default (most reliable)' },
+  { id: 'direct', label: 'Server 2', host: 'Direct CDN · straight through' },
   { id: 'edge', label: 'Server 9', host: 'Edge direct · lowest latency' },
-  { id: 'turbo', label: 'Server 1', host: 'Turbo cache · fastest start' },
+  { id: 'turbo', label: 'Server 1', host: 'Smart cache · pre-buffered, smoothest' },
   { id: 'direct-cdn', label: 'Server 5', host: 'Direct via daddyliveplayer.st' },
   { id: 'direct-dlive', label: 'Server 3', host: 'Direct via dlive.sx' },
   { id: 'direct-dlstreams', label: 'Server 4', host: 'Direct via dlstreams.st' },
@@ -85,6 +85,11 @@ interface AltServer {
   url: string;
   logo?: string;
   health?: string;
+  /** probed native quality rungs (e.g. [240,360,480,720,1080] on amagi) —
+   *  rendered in the quality menu as "via <source>" entries */
+  ladder?: number[];
+  /** CDN answers CORS → the alternate can play straight from the CDN */
+  cors?: boolean;
 }
 
 /** build the playable for hopping to an alternate (multi-quality) source —
@@ -285,6 +290,14 @@ export function PlayerOverlay() {
    *  "close while loading" truly instant and keeps stale failover hops from
    *  fighting a freshly opened channel. */
   const loadGenRef = useRef(0);
+  /** one-shot height pin for alternate-rung hops (quality-menu "via <source>") */
+  const pinHeightRef = useRef<number | null>(null);
+  /** proxy URL for the current stream — the fallback when direct-CDN play fails */
+  const proxiedSrcRef = useRef<string | null>(null);
+  /** current attachment plays the CDN directly (CORS-open source) */
+  const directPlayRef = useRef(false);
+  /** the direct→proxy swap fired for this attachment (once) */
+  const usedProxyFallbackRef = useRef(false);
 
   const isFav = player ? favorites.some((f) => f.id === player.id) : false;
 
@@ -480,6 +493,10 @@ export function PlayerOverlay() {
       setTcHeight(null);
       nativeHeightRef.current = 0; // learned again from the native manifest
       if (!opts.isAlternate) setAltUrl(null); // playing a DL server / fresh channel
+      pinHeightRef.current = null; // one-shot alternate-rung pin
+      proxiedSrcRef.current = null;
+      directPlayRef.current = false;
+      usedProxyFallbackRef.current = false;
 
       // fresh channel → reset the per-channel server-switching state.
       // ⚠ alternate playables keep the ORIGINAL channel id, so hopping to a
@@ -525,6 +542,8 @@ export function PlayerOverlay() {
           servers?: { id: string; label: string; host: string }[];
           alternates?: AltServer[];
           tc?: { src: string; r: string; s: string };
+          proxied?: string;
+          cors?: boolean;
         };
 
         // capture the server lists (available even on failures for failover)
@@ -549,6 +568,11 @@ export function PlayerOverlay() {
         }
         // signed source so data-saver transcodes target this exact stream
         if (data.tc) tcSrcRef.current = data.tc;
+        // direct-CDN play posture: CORS-open sources play straight from the
+        // CDN (native ABR, zero proxy latency); proxied is the fallback
+        if (data.proxied) proxiedSrcRef.current = data.proxied;
+        directPlayRef.current = data.cors === true;
+        usedProxyFallbackRef.current = false;
 
         if (!res.ok || !data.url) {
           // a failed resolve already burned through every mirror server-side —
@@ -700,6 +724,25 @@ export function PlayerOverlay() {
               }
             }
 
+            // explicit alternate-rung pick (quality-menu "via <source>" hop) —
+            // pin the closest rung at/below the chosen height, one shot
+            const pin = pinHeightRef.current;
+            pinHeightRef.current = null;
+            if (pin && levels.length) {
+              let bestLevel = -1;
+              let bestH = 0;
+              levels.forEach((l) => {
+                if (l.height > 0 && l.height <= pin + 60 && l.height > bestH) {
+                  bestH = l.height;
+                  bestLevel = l.level;
+                }
+              });
+              if (bestLevel >= 0) {
+                hls.currentLevel = bestLevel;
+                setCurrentQuality(bestLevel);
+              }
+            }
+
             video.muted = prefs.muted;
             video.play().catch(() => {
               /* autoplay may need a gesture — show tap-to-unmute */
@@ -758,6 +801,17 @@ export function PlayerOverlay() {
                 setPhase('offair');
                 return;
               }
+              // direct-CDN play failed (CORS misdetected / CDN cold) — swap to
+              // the proxy route for the SAME source before any server walking
+              if (directPlayRef.current && proxiedSrcRef.current && !usedProxyFallbackRef.current) {
+                usedProxyFallbackRef.current = true;
+                directPlayRef.current = false;
+                showToast('Routing this stream through MaxTV…');
+                setPhase('loading');
+                const pin = loadPrefs().quality;
+                attachSource(proxiedSrcRef.current, undefined, pin > 0 ? pin : undefined);
+                return;
+              }
               // per-stream server failover before declaring the stream dead
               const cur = playerRef.current || ch;
               if (cur.kind === 'daddylive') {
@@ -786,6 +840,17 @@ export function PlayerOverlay() {
               // our proxy returns 503 for off-air placeholder segments
               setPhase('offair');
             } else if (d.type === Hls.ErrorTypes.NETWORK_ERROR) {
+              // direct-CDN segments failing (CORS only covered the manifest) —
+              // swap to the proxy route for the same source, once
+              if (directPlayRef.current && proxiedSrcRef.current && !usedProxyFallbackRef.current) {
+                usedProxyFallbackRef.current = true;
+                directPlayRef.current = false;
+                showToast('Routing this stream through MaxTV…');
+                setPhase('loading');
+                const pin = loadPrefs().quality;
+                attachSource(proxiedSrcRef.current, undefined, pin > 0 ? pin : undefined);
+                return;
+              }
               // transient network trouble — one reconnect attempt, then failover
               const cur = playerRef.current || ch;
               const recon = (hlsRef.current as unknown as { _zillaRecon?: boolean }) || null;
@@ -1157,8 +1222,11 @@ export function PlayerOverlay() {
   /* ── data-saver ladder (real-time transcode) ────────────────────────── */
 
   /** attach a fresh hls instance to a source URL without re-resolving.
-   *  `level` pins a native quality once the manifest parses. */
-  const attachSource = useCallback((src: string, level?: number) => {
+   *  `level` pins a native quality once the manifest parses; `pinHeight` pins
+   *  native quality once the manifest parses; `pinHeight` pins the closest
+   *  rung at/below a HEIGHT (used by alternate-rung hops and the direct→proxy
+   * fallback, where level indices aren't known until the manifest parses). */
+  const attachSource = useCallback((src: string, level?: number, pinHeight?: number) => {
     const video = videoRef.current;
     if (!video) return;
     if (hlsRef.current) {
@@ -1190,6 +1258,20 @@ export function PlayerOverlay() {
       hls.on(Hls.Events.MANIFEST_PARSED, () => {
         if (typeof level === 'number' && level >= 0 && hls.levels?.[level]) {
           hls.currentLevel = level;
+        } else if (pinHeight && hls.levels?.length) {
+          let best = -1;
+          let bestH = 0;
+          hls.levels.forEach((l, i) => {
+            const h = l.height || 0;
+            if (h > 0 && h <= pinHeight + 60 && h > bestH) {
+              bestH = h;
+              best = i;
+            }
+          });
+          if (best >= 0) {
+            hls.currentLevel = best;
+            setCurrentQuality(best);
+          }
         }
         video.play().catch(() => {});
       });
@@ -1386,6 +1468,24 @@ export function PlayerOverlay() {
     [showToast]
   );
 
+  /** quality-menu pick of an alternate-source rung ("1080p · via beIN XTRA"):
+   *  hop to that source and pin the chosen height once its manifest parses —
+   *  the multi-quality engine for single-rendition DaddyLive channels. */
+  const pickAltRung = useCallback(
+    (alt: AltServer, h: number) => {
+      const cur = playerRef.current;
+      if (!cur) return;
+      setShowQualityMenu(false);
+      updatePrefs({ quality: h, autoPicked: false });
+      pinHeightRef.current = h;
+      setAltUrl(alt.url);
+      if (cur.kind === 'daddylive') setActiveServer('');
+      showToast(`Switching to ${alt.sourceName} — ${h}p`);
+      void loadRef.current(altPlayable(cur, alt), { isAlternate: true });
+    },
+    [showToast]
+  );
+
   /** leave an alternate source — back to the channel's live servers */
   const backToLiveServers = useCallback(() => {
     const cur = playerRef.current;
@@ -1501,6 +1601,18 @@ export function PlayerOverlay() {
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   }, [playerOpen, surfOpen, showQualityMenu, showServersMenu, closePlayer, togglePlay, toggleMute, toggleFullscreen, togglePip, zapPrev, zapNext, poke, player, openPlayer]);
+
+  /** best multi-quality alternate (tallest probed ladder) — its rungs render
+   *  directly in the quality menu as "via <source>" entries. ⚠ must live
+   *  BEFORE the playerOpen early-return — hooks may not sit behind it. */
+  const ladderAlt = useMemo(() => {
+    const withL = alternates.filter((a) => a.ladder && a.ladder.length);
+    if (!withL.length) return null;
+    return withL.reduce((best, a) =>
+      (a.ladder![a.ladder!.length - 1] || 0) > (best.ladder![best.ladder!.length - 1] || 0) ? a : best
+    );
+  }, [alternates]);
+  const ladderRungs: number[] = ladderAlt?.ladder || [];
 
   if (!playerOpen || !player) return null;
 
@@ -1671,21 +1783,54 @@ export function PlayerOverlay() {
                         {q.label} {currentQuality === q.level && tcHeight === null && <span>✓</span>}
                       </button>
                     ))}
-                    {singleQuality && (
+                    {singleQuality && ladderRungs.length === 0 && (
                       <p className="px-3.5 py-1.5 text-[10px] font-medium leading-snug text-zilla-dim">
-                        This channel serves a single quality from its provider.
-                        {alternates.length > 0 &&
-                          ' Multi-quality sources are available — open “Switch server” and pick one under “More sources”.'}
+                        This channel's provider serves a single quality. When another source carries it
+                        with a real ladder, its rungs appear here automatically.
                       </p>
                     )}
 
-                    {(player.kind === 'daddylive' || !!tcSrcRef.current) && !tcCap && (
+                    {ladderAlt && ladderRungs.length > 0 && (
+                      <>
+                        <p className="border-t border-zilla-line/60 px-3.5 py-2 text-[9px] font-black uppercase tracking-widest text-zilla-dim">
+                          More qualities · via {ladderAlt.sourceName}
+                        </p>
+                        {ladderRungs
+                          .slice()
+                          .reverse()
+                          .map((h) => (
+                            <button
+                              key={`${ladderAlt.id}-${h}`}
+                              onClick={() => pickAltRung(ladderAlt, h)}
+                              className="flex w-full items-center justify-between px-3.5 py-2.5 text-xs font-bold text-zilla-text transition-colors hover:bg-white/10"
+                            >
+                              <span>
+                                {h}p
+                                {RUNG_HINTS[h] && (
+                                  <span className="ml-1.5 text-[9px] font-bold text-zilla-dim">{RUNG_HINTS[h]}</span>
+                                )}
+                                {h === 480 && (
+                                  <span className="ml-1.5 text-[9px] font-bold text-zilla-dim">default</span>
+                                )}
+                              </span>
+                              <span className="text-[9px] font-bold text-zilla-dim">{ladderAlt.sourceName}</span>
+                            </button>
+                          ))}
+                        <p className="px-3.5 py-2 text-[10px] font-medium leading-snug text-zilla-dim">
+                          Same channel on {ladderAlt.sourceName}, with a real quality ladder — picking a
+                          rung switches there and pins your choice.
+                        </p>
+                      </>
+                    )}
+
+                    {(player.kind === 'daddylive' || !!tcSrcRef.current) && !tcCap && ladderRungs.length === 0 && (
                       <>
                         <p className="border-t border-zilla-line/60 px-3.5 py-2 text-[9px] font-black uppercase tracking-widest text-zilla-dim">
                           Quality ladder · Data saver
                         </p>
                         <p className="px-3.5 pb-2 pt-1 text-[10px] font-medium leading-snug text-zilla-dim">
-                          Not available on this deployment — the server can't re-encode streams. The native feed is playing instead.
+                          Real-time re-encoding isn't available on this hosting — multi-quality comes from
+                          the source ladders above instead.
                         </p>
                       </>
                     )}
@@ -2142,12 +2287,18 @@ export function PlayerOverlay() {
                                       </span>
                                       <span className="block truncate text-[10px] font-medium text-zilla-dim">
                                         {alt.name}
-                                        {alt.source === 'worldsports' ? ' · real quality ladder' : ''}
+                                        {alt.ladder?.length
+                                          ? ` · ${alt.ladder[0]}–${alt.ladder[alt.ladder.length - 1]}p ladder`
+                                          : alt.source === 'worldsports'
+                                            ? ' · real quality ladder'
+                                            : ''}
                                       </span>
                                     </span>
-                                    {alt.source === 'worldsports' && (
+                                    {(alt.ladder?.length || alt.source === 'worldsports') && (
                                       <span className="shrink-0 rounded-full bg-zilla-yellow/15 px-2 py-0.5 text-[9px] font-black uppercase text-zilla-yellow/90">
-                                        HD↑
+                                        {alt.ladder?.length
+                                          ? `${alt.ladder[0]}–${alt.ladder[alt.ladder.length - 1]}p`
+                                          : 'HD↑'}
                                       </span>
                                     )}
                                   </button>
@@ -2156,11 +2307,12 @@ export function PlayerOverlay() {
                             </>
                           )}
                           <p className="px-4 py-2 text-[10px] font-medium leading-snug text-zilla-dim">
-                            Direct CDN (Server 2) is the default — straight from the CDN, no middle layer.
-                            Edge direct skips mirror parsing for the lowest latency. Turbo and Relay are
-                            pre-buffered through MaxTV to ride out CDN hiccups.
+                            Server 1 (Smart cache) pre-buffers the stream through MaxTV — the smoothest
+                            ride, and the default on cloud hosting. Server 2 (Direct CDN) streams
+                            straight through with no middle layer; Edge direct skips mirror parsing for
+                            the lowest latency.
                             {alternates.length > 0
-                              ? ' Sources under "More sources" carry the same channel with real quality ladders — pick one, then choose your quality from the badge in the top bar.'
+                              ? ' Sources under “More sources” carry the same channel with real quality ladders — their rungs also appear in the quality menu.'
                               : ' DaddyLive streams ship a single quality; pick a multi-quality source when one appears here.'}
                           </p>
                         </>

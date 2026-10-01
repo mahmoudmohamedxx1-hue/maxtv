@@ -1,4 +1,4 @@
-// ─── Turbo transport — prefetch passthrough relay ─────────────────────────────
+// ─── Turbo transport v2 — serverless-proof prefetch relay ─────────────────────
 // The benchmark verdict (scripts/bench-transports.mjs, 2026-09-28):
 //   • direct  — starts in ~0.4s but every segment fetch pays the CDN latency
 //               (p95 3.1s) → the player's critical path IS the flaky edge
@@ -8,9 +8,28 @@
 // rolling prefetch that stays ahead of the client, so the browser only ever
 // reads warm local bytes.
 //
-//   upstream m3u8 ──poll 1.5s──▶ sn-dedup ──▶ parallel prefetch (3 ahead)
-//        ──▶ unwrap cloaked TS ──▶ memory cache ──▶ /api/turbo serves a clean
-//        local playlist (own monotonic sn, discontinuity markers preserved)
+// v2 (2026-10-01) — the Vercel field report: "servers are the same slow and
+// lag". Root cause: serverless isolates FREEZE between HTTP requests, so the
+// 1.5s polling interval never fired — the served media-sequence sat frozen at
+// its startup value (measured: mseq=1 across 5 polls) and playback stalled
+// out ~20s in. Three structural fixes:
+//
+//   1. INLINE KICK — every playlist request awaits one pass (bounded) before
+//      serving, so the session advances on the player's own poll cadence
+//      (~6s) even when the isolate froze in between. No timer required.
+//   2. UPSTREAM-SN IDENTITY — segments are numbered by the UPSTREAM
+//      media-sequence, not a per-session counter. Any instance serving the
+//      same channel now produces IDENTICAL playlist coordinates (same mseq,
+//      same sn space), so a Vercel load-balance hop between instances is a
+//      no-op for the player instead of a fatal session reset.
+//   3. CROSS-INSTANCE ON-DEMAND — a segment request landing on an instance
+//      that doesn't have those bytes (cache miss by instance flap) triggers
+//      an inline refresh + direct upstream fetch instead of a 404.
+//
+//   upstream m3u8 ──kick on every playlist poll──▶ sn-dedup ──▶ parallel
+//        prefetch (3 ahead) ──▶ unwrap cloaked TS ──▶ memory cache ──▶
+//        /api/turbo serves a clean local playlist (upstream sn, up to 12
+//        segments ≈ 60-72s of runway, discontinuity markers preserved)
 //
 // Codec safety: browsers can only decode h264(+AAC/MP3) in MSE. The first
 // cached segment's TS PMT is parsed in pure JS; a hevc/AC3/anything-else
@@ -25,8 +44,10 @@ import { UA } from './resolve';
 const MAX_SESSIONS = 6;
 const IDLE_KILL_MS = 45_000;
 const MAX_AGE_MS = 2 * 60 * 60_000;
+/** only used on hosts where the isolate stays warm (dev / self-hosted) —
+ *  on serverless the inline kick does the advancing */
 const POLL_MS = 1500;
-const MAX_PARALLEL = 3;
+const MAX_PARALLEL = 4;
 const STARTUP_BURST = 4;
 /** segments listed in the served live window — 12 × ~5s = 60s of runway.
  *  Playback never speeds up anymore (maxLiveSyncPlaybackRate pinned to 1
@@ -41,6 +62,8 @@ const KEEP = 24;
 const STALL_KILL_MS = 60_000;
 const SEG_FETCH_TIMEOUT_MS = 12_000;
 const MAX_SN_TRIES = 10;
+/** bound for the inline kick a playlist/segment request waits on */
+const KICK_MS = 2_500;
 
 /** sessions survive dev-server hot reloads */
 const g = globalThis as {
@@ -66,13 +89,6 @@ interface SegData {
   safe: boolean;
 }
 
-interface Entry {
-  abs: string;
-  dur: number;
-  sn: number;
-  disc: boolean;
-}
-
 export type TurboVerdict = 'ready' | 'relay' | 'dead';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -86,13 +102,16 @@ export class TurboSession {
   private upstreamAt = 0;
   private polling = false;
   private dead = false;
-  /** local, always-monotonic segment numbers — the served playlist's identity */
-  private nextN = 1;
-  /** upstream sn → local n (dedup anchor; urls rotate, sn is stable) */
-  private readonly byUpSn = new Map<number, number>();
-  /** local n → bytes */
+  /** ⤴ v2: identity = the UPSTREAM sn. `segs` is keyed by it, so any
+   *  instance serving this channel computes identical playlist coordinates. */
   private readonly segs = new Map<number, SegData>();
-  private lastSn = -1;
+  /** ascending cached sns (append-order = sn-order; commits are sorted) */
+  private windowSns: number[] = [];
+  /** newest sn committed (window tip) */
+  private newestSn = 0;
+  /** upstream sn → segment URL (for cross-instance on-demand fetches) */
+  private readonly urlBySn = new Map<number, string>();
+  private lastSn = 0;
   private lastUpMseq: number | null = null;
   private readonly snTries = new Map<number, number>();
   private readonly pending = new Set<number>();
@@ -108,6 +127,9 @@ export class TurboSession {
     this.sid = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
     this.resolveUpstream = resolveUpstream;
     void this.pass();
+    // on serverless the isolate usually freezes between requests and this
+    // timer only fires in bursts — harmless (the inline kick is the real
+    // engine). On warm hosts it keeps the prefetch rolling.
     this.timer = setInterval(() => void this.pass(), POLL_MS);
   }
 
@@ -122,6 +144,21 @@ export class TurboSession {
   /** Has the source been sniffed and is it safe for direct browser playback? */
   get needsRelay(): boolean {
     return this.codecSafe === false;
+  }
+
+  /**
+   * v2 INLINE KICK — run (or join) one polling pass NOW, bounded. This is what
+   * makes turbo work on serverless: the player's playlist poll itself drives
+   * the prefetch forward, no background timer required.
+   */
+  async kick(timeoutMs: number = KICK_MS): Promise<void> {
+    if (this.dead) return;
+    if (this.polling) {
+      const t0 = Date.now();
+      while (this.polling && !this.dead && Date.now() - t0 < timeoutMs) await sleep(60);
+      return;
+    }
+    await Promise.race([this.pass(), sleep(timeoutMs)]);
   }
 
   /** Wait (bounded) until the session can serve a playlist. Re-enterable —
@@ -144,26 +181,27 @@ export class TurboSession {
 
   /** contiguous window ending at the newest cached segment (hole-free,
    *  safe-codec only) */
-  private windowRange(): { base: number; list: { n: number; seg: SegData }[] } | null {
-    let newest = this.nextN - 1;
-    if (newest < 1) return null;
-    while (newest >= 1 && !this.segs.has(newest)) newest--; // pruned tip — shouldn't happen
-    if (newest < 1) return null;
-    const list: { n: number; seg: SegData }[] = [];
-    let n = newest;
-    while (n >= 1 && list.length < WINDOW) {
-      const seg = this.segs.get(n);
-      // hole OR unsafe codec below — the served window stops here (the route
-      // redirects to the transcode relay once the session is marked unsafe)
-      if (!seg || !seg.safe) break;
-      list.unshift({ n, seg });
-      n--;
+  private windowRange(): { base: number; list: { sn: number; seg: SegData }[] } | null {
+    const n = this.windowSns.length;
+    if (!n) return null;
+    const list: { sn: number; seg: SegData }[] = [];
+    let i = n - 1;
+    let expect = this.windowSns[i];
+    while (i >= 0 && list.length < WINDOW) {
+      const sn = this.windowSns[i];
+      if (sn !== expect) break; // hole — the window stops here
+      const seg = this.segs.get(sn);
+      if (!seg || !seg.safe) break; // pruned / codec-unsafe boundary
+      list.unshift({ sn, seg });
+      expect = sn - 1;
+      i--;
     }
-    return list.length ? { base: n + 1, list } : null;
+    return list.length ? { base: list[0].sn, list } : null;
   }
 
-  /** Build the served playlist. Segment lines are `t<n>.ts`; the route
-   *  rewrites them to sid-stamped /api/turbo URLs. */
+  /** Build the served playlist. Segment lines are `t<upSn>.ts`; the route
+   *  rewrites them to /api/turbo URLs. MEDIA-SEQUENCE = oldest served sn —
+   *  derived purely from upstream state, so every instance agrees on it. */
   readPlaylist(): string | null {
     const w = this.windowRange();
     if (!w) return null;
@@ -174,26 +212,33 @@ export class TurboSession {
       `#EXT-X-TARGETDURATION:${Math.ceil(maxDur)}`,
       `#EXT-X-MEDIA-SEQUENCE:${w.base}`,
     ];
-    for (const { n, seg } of w.list) {
+    for (const { sn, seg } of w.list) {
       if (seg.disc) out.push('#EXT-X-DISCONTINUITY');
       out.push(`#EXTINF:${seg.dur.toFixed(3)},`);
-      out.push(`t${n}.ts`);
+      out.push(`t${sn}.ts`);
     }
     return out.join('\n') + '\n';
   }
 
-  /** Serve one segment. The next-expected n may still be mid-fetch — wait for
-   *  it briefly (the prefetcher is ahead, this only bites at startup). */
+  /** Serve one segment by UPSTREAM sn. Cache miss (instance flap / eviction)
+   *  → inline refresh + direct upstream fetch instead of a 404, so a segment
+   *  URL minted by instance A still resolves on instance B. */
   async getSegment(n: number): Promise<Uint8Array | null> {
     const direct = this.segs.get(n);
     if (direct) return direct.ts;
-    if (n === this.nextN) {
-      // in flight — poll for its landing
-      for (let i = 0; i < 60; i++) {
-        await sleep(100);
-        if (this.dead) return null;
-        const s = this.segs.get(n);
-        if (s) return s.ts;
+    // refresh our view of the upstream window, then re-check
+    await this.kick(Math.min(KICK_MS, 1_800));
+    const second = this.segs.get(n);
+    if (second) return second.ts;
+    // last resort: we (or a sibling instance) listed this sn — its URL may
+    // still be known; fetch it on demand
+    const url = this.urlBySn.get(n);
+    const referer = this.upstream?.referer || '';
+    if (url) {
+      const ts = await this.fetchSeg(url, referer);
+      if (ts && ts.length >= 188) {
+        this.commit(n, ts, this.urlDur.get(n) || 6, false);
+        return ts;
       }
     }
     return null;
@@ -236,20 +281,27 @@ export class TurboSession {
         if (!text || !text.includes('#EXTM3U')) return;
       }
 
-      // upstream restart detection — backward mseq jump = provider restarted
+      // upstream restart detection — backward mseq jump = provider restarted.
+      // ⤴ v2: PURGE the cache (sn values would collide with new content) and
+      // let the next commits build a fresh window at the new upstream mseq.
       const m = text.match(/#EXT-X-MEDIA-SEQUENCE:(\d+)/);
       const upMseq = m ? parseInt(m[1], 10) : null;
       let restarted = false;
       if (upMseq !== null && this.lastUpMseq !== null && upMseq < this.lastUpMseq) {
         restarted = true;
-        this.lastSn = -1;
-        this.byUpSn.clear();
+        this.lastSn = 0;
+        this.segs.clear();
+        this.windowSns = [];
+        this.newestSn = 0;
+        this.urlBySn.clear();
+        this.urlDur.clear();
         this.snTries.clear();
       }
       if (upMseq !== null) this.lastUpMseq = upMseq;
 
-      // parse entries with stable sn identity + discontinuity flags
-      const entries: Entry[] = [];
+      // parse entries — sn identity = upstream mseq + index (stable across
+      // polls AND across instances; that's the whole v2 trick)
+      const entries: { abs: string; dur: number; sn: number; disc: boolean }[] = [];
       let dur = 6;
       let disc = false;
       let idx = 0;
@@ -260,14 +312,23 @@ export class TurboSession {
         } else if (line.startsWith('#EXTINF:')) {
           dur = parseFloat(line.slice(8)) || 6;
         } else if (line && !line.startsWith('#')) {
-          entries.push({
-            abs: new URL(line, this.upstream!.url).toString(),
-            dur,
-            sn: (upMseq ?? 0) + idx,
-            disc,
-          });
+          const sn = (upMseq ?? 0) + idx;
+          entries.push({ abs: new URL(line, this.upstream!.url).toString(), dur, sn, disc });
+          // remember URL + duration for on-demand (cross-instance) fetches
+          this.urlBySn.set(sn, entries[entries.length - 1].abs);
+          this.urlDur.set(sn, dur);
           disc = false;
           idx++;
+        }
+      }
+      // bound the URL maps (insertion order ≈ age)
+      if (this.urlBySn.size > 60) {
+        const it = this.urlBySn.keys();
+        for (let i = 0; i < 20; i++) {
+          const v = it.next();
+          if (v.done) break;
+          this.urlBySn.delete(v.value);
+          this.urlDur.delete(v.value);
         }
       }
 
@@ -275,7 +336,7 @@ export class TurboSession {
         (e) =>
           e.sn > this.lastSn &&
           !this.pending.has(e.sn) &&
-          !this.byUpSn.has(e.sn) &&
+          !this.segs.has(e.sn) &&
           (this.snTries.get(e.sn) ?? 0) < MAX_SN_TRIES
       );
       // startup: burst the NEWEST segments (live edge, fastest first frame);
@@ -295,40 +356,13 @@ export class TurboSession {
       );
       for (const r of results) this.pending.delete(r.e.sn);
 
-      // commit in sn order — the local timeline must be monotonic even when
-      // parallel downloads complete out of order
+      // commit in sn order — the window array must stay ascending
       const commits = results.filter((r) => r.ts && r.ts.length >= 188).sort((a, b) => a.e.sn - b.e.sn);
-      let first = true;
       for (const r of commits) {
-        if (this.byUpSn.has(r.e.sn)) continue; // lost a race (shouldn't — mutex)
-        const n = this.nextN++;
-        const codec = sniffCodecs(r.ts!);
-        const codecFlip =
-          !!codec && !!this.lastCodec && !sameCodec(this.lastCodec, codec);
-        if (codec) this.lastCodec = codec;
-        const safe = codec ? codecSafe(codec) : true;
-        this.segs.set(n, {
-          ts: r.ts!,
-          dur: r.e.dur,
-          disc: r.e.disc || restarted || codecFlip,
-          safe,
-        });
-        this.byUpSn.set(r.e.sn, n);
+        if (this.segs.has(r.e.sn)) continue; // lost a race (shouldn't — mutex)
+        this.commit(r.e.sn, r.ts!, r.e.dur, r.e.disc || restarted);
         this.lastSn = Math.max(this.lastSn, r.e.sn);
-        if (codec) {
-          if (this.codecSafe === null) this.codecSafe = safe;
-          else if (!safe) {
-            // mid-stream flip to a codec the browser cannot decode — mark the
-            // session unsafe: the window tip freezes on the last safe segment
-            // and the route redirects playlist polls to the transcode relay
-            // (seamless hand-off instead of a fatal MSE error)
-            this.codecSafe = false;
-          }
-        }
-        if (first) {
-          this.startup = false;
-          first = false;
-        }
+        this.startup = false;
         this.lastNewAt = Date.now();
       }
 
@@ -355,7 +389,36 @@ export class TurboSession {
     }
   }
 
+  /** insert a fetched segment into the cache + window */
+  private commit(sn: number, ts: Uint8Array, dur: number, disc: boolean): void {
+    const codec = sniffCodecs(ts);
+    const codecFlip = !!codec && !!this.lastCodec && !sameCodec(this.lastCodec, codec);
+    if (codec) this.lastCodec = codec;
+    const safe = codec ? codecSafe(codec) : true;
+    this.segs.set(sn, { ts, dur, disc: disc || codecFlip, safe });
+    if (sn > this.newestSn) {
+      this.windowSns.push(sn);
+      this.newestSn = sn;
+    } else {
+      // out-of-order commit (on-demand fetch of an older sn) — keep ascending
+      const at = this.windowSns.findIndex((s) => s > sn);
+      if (at === -1) this.windowSns.push(sn);
+      else if (this.windowSns[at - 1] !== sn) this.windowSns.splice(at, 0, sn);
+    }
+    if (codec) {
+      if (this.codecSafe === null) this.codecSafe = safe;
+      else if (!safe) {
+        // mid-stream flip to a codec the browser cannot decode — mark the
+        // session unsafe: the window tip freezes on the last safe segment
+        // and the route redirects playlist polls to the transcode relay
+        // (seamless hand-off instead of a fatal MSE error)
+        this.codecSafe = false;
+      }
+    }
+  }
+
   private lastCodec: { video: number; audio: number } | null = null;
+  private readonly urlDur = new Map<number, number>();
 
   private async fetchSeg(url: string, referer: string): Promise<Uint8Array | null> {
     try {
@@ -388,19 +451,20 @@ export class TurboSession {
 
   /** drop segments that fell out of the absorb window */
   private prune(): void {
-    const floor = this.nextN - 1 - KEEP;
-    if (floor < 1) return;
-    for (const n of this.segs.keys()) {
-      if (n <= floor) this.segs.delete(n);
+    const floor = this.newestSn - KEEP;
+    if (this.newestSn === 0) return;
+    for (const sn of this.segs.keys()) {
+      if (sn <= floor) this.segs.delete(sn);
+    }
+    if (this.windowSns.length && this.windowSns[0] <= floor) {
+      this.windowSns = this.windowSns.filter((s) => s > floor);
     }
   }
 
   /** expose a cached segment by its UPSTREAM sn — shared input cache for the
    *  transcode data-saver sessions (see turboCachedBySn) */
   cachedBySn(sn: number): { ts: Uint8Array; dur: number } | null {
-    const n = this.byUpSn.get(sn);
-    if (n === undefined) return null;
-    const seg = this.segs.get(n);
+    const seg = this.segs.get(sn);
     return seg ? { ts: seg.ts, dur: seg.dur } : null;
   }
 
@@ -455,7 +519,9 @@ function pinForServer(serverId: string | undefined): string | undefined {
   }
 }
 
-/** get-or-create a channel turbo session */
+/** get-or-create a channel turbo session (also used to PRE-WARM during
+ *  /api/sports/stream resolve — the poller starts filling while the player
+ *  is still setting up hls.js) */
 export function getTurboSession(channelId: string, serverPin?: string): TurboSession {
   const pin = pinForServer(serverPin);
   const key = `ch${channelId}${pin ? `m${pin}` : ''}`;

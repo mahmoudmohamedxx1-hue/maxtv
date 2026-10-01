@@ -15,13 +15,18 @@ export const dynamic = 'force-dynamic';
  * stalling the player. When the source's codec is not browser-safe (hevc /
  * AC3 …) the playlist request 302-redirects to the transcode relay
  * (/api/live), which re-encodes to uniform h264.
+ *
+ * v2 (serverless-proof): every playlist request awaits one inline polling
+ * pass (the "kick") before serving, so the session advances on the player's
+ * own poll cadence even when the isolate froze between requests. Segments
+ * are numbered in the UPSTREAM media-sequence space, so instance hops don't
+ * reset the playlist identity.
  */
 export async function GET(req: Request) {
   const { searchParams } = new URL(req.url);
   const mode = searchParams.get('mode') || 'm3u8';
   const channel = searchParams.get('channel');
   const mirror = searchParams.get('m') || undefined;
-  const reqSid = searchParams.get('sid') || '';
 
   if (!channel || !/^\d+$/.test(channel)) {
     return NextResponse.json({ error: 'bad_channel' }, { status: 400 });
@@ -36,18 +41,14 @@ export async function GET(req: Request) {
         headers: { 'content-type': 'text/plain', 'cache-control': 'no-store' },
       });
     }
-    // stale session — the turbo cache was replaced while the player still
-    // holds old URLs; fail fast so the player hops instead of retrying
-    if (reqSid && reqSid !== session.sid) {
-      return new NextResponse('stale session', {
-        status: 503,
-        headers: { 'x-offair': '1', 'content-type': 'text/plain', 'cache-control': 'no-store' },
-      });
-    }
+    session.touch();
     const n = parseInt(searchParams.get('n') || '', 10);
     if (!Number.isFinite(n) || n < 1) {
       return NextResponse.json({ error: 'bad_segment' }, { status: 400 });
     }
+    // ⤴ v2: n is the UPSTREAM sn — any warm instance can serve it, and a
+    // cache miss triggers an on-demand upstream fetch inside getSegment
+    // (cross-instance tolerance) instead of a stale-session 503.
     const bytes = await session.getSegment(n);
     if (!bytes) {
       // 404 → hls.js treats it as a recoverable fragment error and reloads
@@ -60,7 +61,7 @@ export async function GET(req: Request) {
       status: 200,
       headers: {
         'content-type': 'video/mp2t',
-        // segment ns recycle across sessions — never let a browser cache them
+        // segment ns recycle across restarts — never let a browser cache them
         'cache-control': 'no-store',
         'access-control-allow-origin': '*',
       },
@@ -70,7 +71,11 @@ export async function GET(req: Request) {
   // playlist mode
   const session = getTurboSession(channel, mirror);
   session.touch();
-  const verdict = await session.waitReady(7_000);
+  // ⤴ v2 INLINE KICK — advance the prefetch NOW (bounded), then wait for a
+  // servable window. On serverless this is what keeps the session alive and
+  // moving: the playlist poll itself drives the work.
+  await session.kick(2_500);
+  const verdict = await session.waitReady(6_000);
 
   if (verdict === 'relay') {
     // codec not browser-safe → hand off to the transcode relay (hls.js
@@ -79,13 +84,22 @@ export async function GET(req: Request) {
     return NextResponse.redirect(new URL(`/api/live?channel=${channel}${m}&mode=m3u8`, req.url), 302);
   }
   if (verdict === 'dead') {
-    return new NextResponse('turbo unavailable — channel may be off-air', {
-      status: 503,
-      headers: { 'x-offair': '1', 'content-type': 'text/plain', 'cache-control': 'no-store' },
+    // honest death (upstream stalled / resolve failed) → the reserved 503
+    // x-offair so the player skips straight to the off-air screen. A mere
+    // warm-up timeout → 502 retryable: hls.js re-polls, each poll KICKS the
+    // session again, and a slow-starting channel recovers on a retry instead
+    // of being wrongly declared dead.
+    const dead = session.isDead;
+    return new NextResponse(dead ? 'turbo unavailable — channel may be off-air' : 'turbo warming up', {
+      status: dead ? 503 : 502,
+      headers: {
+        ...(dead ? { 'x-offair': '1' } : {}),
+        'content-type': 'text/plain',
+        'cache-control': 'no-store',
+      },
     });
   }
 
-  const sid = session.sid;
   const raw = session.readPlaylist();
   if (!raw) {
     return new NextResponse('playlist gone', {
@@ -93,12 +107,12 @@ export async function GET(req: Request) {
       headers: { 'x-offair': '1', 'content-type': 'text/plain', 'cache-control': 'no-store' },
     });
   }
-  // rewrite tN.ts lines → sid-stamped segment URLs through this endpoint
+  // rewrite t<sn>.ts lines → /api/turbo segment URLs (n = upstream sn —
+  // instance-independent, so any warm instance can serve the bytes)
   const segUrlFor = (n: number) => {
     const p = new URLSearchParams(searchParams);
     p.set('mode', 'seg');
     p.set('n', String(n));
-    p.set('sid', sid);
     return `/api/turbo?${p.toString()}`;
   };
   const text = raw

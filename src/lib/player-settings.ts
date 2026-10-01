@@ -154,8 +154,12 @@ export function dataSaverForBudget(bps: number): number | null {
  *  falls behind the live-sync target ("when it loads it plays like 2x").
  *  These CDNs flap constantly, so that speed-up fired after every stall —
  *  playback MUST always run at natural 1× speed.
- *  fast:   join 3 segments behind live, keep ~36s buffered → quick start
- *  steady: join 4 segments behind, buffer ~60s → rides out flaky links */
+ *  fast:   join 2 segments behind live, keep ~48s buffered → quick start.
+ *          (sync 2 — the direct-transport CDN window is only 4 segments
+ *          deep; joining 3 back left a single segment of runway and every
+ *          CDN flap drained it straight into a stall. 2 keeps the window's
+ *          tail as absorb room instead.)
+ *  steady: join 3 segments behind, buffer ~60s → rides out flaky links */
 export function hlsPerfConfig(perf: 'fast' | 'steady'): {
   liveSyncDurationCount: number;
   maxBufferLength: number;
@@ -165,7 +169,7 @@ export function hlsPerfConfig(perf: 'fast' | 'steady'): {
 } {
   if (perf === 'steady') {
     return {
-      liveSyncDurationCount: 4,
+      liveSyncDurationCount: 3,
       maxBufferLength: 60,
       maxMaxBufferLength: 120,
       maxLiveSyncPlaybackRate: 1,
@@ -173,8 +177,8 @@ export function hlsPerfConfig(perf: 'fast' | 'steady'): {
     };
   }
   return {
-    liveSyncDurationCount: 3,
-    maxBufferLength: 36,
+    liveSyncDurationCount: 2,
+    maxBufferLength: 48,
     maxMaxBufferLength: 90,
     maxLiveSyncPlaybackRate: 1,
     backBufferLength: 90,
