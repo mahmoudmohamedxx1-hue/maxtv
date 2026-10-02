@@ -3,7 +3,7 @@ import { resolveDaddyLiveStream, DADDYLIVE_SERVERS } from '@/lib/sports/daddyliv
 import { proxyUrlFor } from '@/lib/streaming/proxy';
 import { findAlternates, type AlternateChannel } from '@/lib/iptv/catalog';
 import { probeLadder, peekLadder } from '@/lib/streaming/ladder';
-import { getTurboSession } from '@/lib/streaming/turbo';
+import { getTurboSession, peekTurboSession } from '@/lib/streaming/turbo';
 
 export const dynamic = 'force-dynamic';
 
@@ -73,22 +73,43 @@ export async function GET(req: Request) {
   }));
 
   try {
+    // ── start the turbo pre-warm FIRST — it runs in parallel with the resolve
+    // and alternates work, and its bounded kick (playlist + first segment)
+    // yields the CODEC sniff that tells HEVC-incapable browsers to expect an
+    // HEVC phase before they buffer into a codec error (beIN 5 → XTRA bug).
+    const mirrorPin = serverDef?.mirror || (isTurbo && server.includes('-') ? server.slice('turbo-'.length) : undefined);
+    const turboPrewarm =
+      isTurbo || SERVERLESS
+        ? getTurboSession(channel, mirrorPin).kick(2_200)
+        : null;
+
     // resolve even for relay mode — verifies the channel exists (fast 404 for
     // dead ids) AND warms the resolve cache so the relay's first pass is instant.
     // Alternates (same channel on ladder-bearing providers) resolve in
     // parallel — they're independent of the primary transport.
-    const [resolved, alternates] = await Promise.all([
+    const [resolvedIn, alternates] = await Promise.all([
       resolveDaddyLiveStream(channel, { server }),
       chName ? findAlternates(chName, '') : Promise.resolve([] as AlternateChannel[]),
     ]);
+    let resolved = resolvedIn;
 
-    // ── pre-warm the turbo session ──────────────────────────────────────────
-    // The poller starts filling the prefetch cache NOW, while the player is
-    // still setting up hls.js — by its first /api/turbo poll the window is
-    // already seeded (kicks the "7s cold warmup" down to ~1-2s).
-    const mirrorPin = serverDef?.mirror || (isTurbo && server.includes('-') ? server.slice('turbo-'.length) : undefined);
-    if (isTurbo || SERVERLESS) {
-      void getTurboSession(channel, mirrorPin).kick(1_200);
+    // ── await the pre-warm (usually finished by now — it raced the resolve) ──
+    // The session's first cached segment carries the codec verdict, surfaced
+    // to the player as `hevc: true` so HEVC-incapable browsers get the
+    // explicit choice panel instead of a silent walk onto another channel.
+    // ⚠ .catch — a prewarm rejection must NEVER fail the resolve itself.
+    let hevcFeed = false;
+    if (turboPrewarm) {
+      await turboPrewarm.catch(() => {});
+      hevcFeed = peekTurboSession(channel, mirrorPin)?.unsafeCodec === true;
+    }
+
+    // cold-start mirror flap rescue: every parallel resolve task can fail in
+    // the same rate-limit window and return null; one FRESH retry a moment
+    // later succeeds. Without it the player surfaces "offline/geo-blocked".
+    if (!resolved || !resolved.url) {
+      await sleep(600);
+      resolved = await resolveDaddyLiveStream(channel, { server, fresh: true });
     }
 
     // ── ladder-probe the best alternates (multi-quality rungs) ─────────────
@@ -158,6 +179,10 @@ export async function GET(req: Request) {
       serverId: serverDef?.id || defaultId,
       servers: serverList.map((s) => ({ ...s, active: s.id === (serverDef?.id || defaultId) })),
       alternates: altTyped,
+      // the sniffed feed is in an HEVC (browser-unsafe codec) phase — the
+      // player checks this against its own decode capability and shows the
+      // explicit HEVC panel instead of silently walking onto another channel
+      ...(hevcFeed ? { hevc: true } : {}),
     });
   } catch (e) {
     return NextResponse.json({ error: 'resolve_error', message: (e as Error).message }, { status: 500 });

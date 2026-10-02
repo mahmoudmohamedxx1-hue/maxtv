@@ -164,6 +164,14 @@ export class TurboSession {
     return this.codecSafe === false && !this.serveUnsafe;
   }
 
+  /** the sniffed feed uses a browser-UNSAFE codec (HEVC phase) — exposed so
+   *  /api/sports/stream can warn HEVC-incapable browsers BEFORE they buffer
+   *  into a codec error and the failover engine silently walks them onto a
+   *  different channel's feed (the beIN 5 → beIN XTRA field report). */
+  get unsafeCodec(): boolean {
+    return this.codecSafe === false;
+  }
+
   /** serve browser-unsafe segments through to capable browsers (no relay) */
   private get serveUnsafe(): boolean {
     return this.hevcFromStart && ffmpegAbsent() === true;

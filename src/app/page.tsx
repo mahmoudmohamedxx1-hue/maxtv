@@ -104,7 +104,9 @@ export default function Home() {
     if (!ch) return;
     try {
       const p = JSON.parse(decodeURIComponent(escape(atob(ch)))) as Playable;
-      if (p && p.kind && p.ref) openPlayer(p);
+      // strict kind check — a corrupted/typo'd kind must not fall through to
+      // the IPTV branch (url=<channel-id> → guaranteed 400 "offline")
+      if (p && (p.kind === 'daddylive' || p.kind === 'iptv') && p.ref) openPlayer(p);
       // clean the URL so refreshes don't force the same channel forever
       window.history.replaceState({}, '', window.location.pathname);
     } catch { /* ignore malformed links */ }

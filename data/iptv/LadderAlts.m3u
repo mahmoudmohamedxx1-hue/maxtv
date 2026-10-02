@@ -6,6 +6,8 @@
 # Consumed by findAlternates() as an invisible pool — never a UI rail.
 #EXTINF:-1 tvg-logo="https://i.imgur.com/jOKA735.png" group-title="Ladder Alternates" x-ladder="240/360/480/720/1080",Court TV (1080p)
 https://cdn-uw2-prod.tsv2.amagi.tv/linear/amg01438-ewscrippscompan-courttv-tablo/playlist.m3u8
+#EXTINF:-1 tvg-logo="https://i.imgur.com/5IxIFJ0.png" group-title="Ladder Alternates" x-ladder="360/550/720/1080",Discovery Channel
+https://streaming.aurora.enhanced.live/live/mpc/enl0eG1mLmVncmVzcy5mZDJ2eHI=/out/v1/IT_SIMULCAST/DISCOVERYCHANNEL/CMAF/index.m3u8
 #EXTINF:-1 tvg-logo="https://upload.wikimedia.org/wikipedia/commons/thumb/7/7a/Fashion_TV_logo.svg/960px-Fashion_TV_logo.svg.png" group-title="Ladder Alternates" x-ladder="270/360/576/720/1080",FashionTV (Russia) (1080p)
 http://fashionlive.mediacdn.ru/cdn/fashiontv/playlist.m3u8
 #EXTINF:-1 tvg-logo="https://provider-static.plex.tv/f/epg/channels/logos/gracenote/f6e88714b4dae6026720d36ad9de611f.png" group-title="Ladder Alternates" x-ladder="216/360/480/720/1080",Fight Network
@@ -16,10 +18,12 @@ https://freem3u.xyz/api/live/play.m3u8?vid=9856
 https://jmp2.uk/stvp-FR200016Y5
 #EXTINF:-1 tvg-logo="https://i.imgur.com/UNZ8bef.png" group-title="Ladder Alternates" x-ladder="240/360/480/720/1080",NHL Network (1080p)
 https://nhl-firetv.amagi.tv/playlist.m3u8
-#EXTINF:-1 tvg-logo="https://i.imgur.com/6p3eFgf.png" group-title="Ladder Alternates" x-ladder="432/576/720",Nick Jr. (Italy) (720p)
-http://102.129.186.182:81/nick/index.m3u8
+#EXTINF:-1 tvg-logo="https://upload.wikimedia.org/wikipedia/commons/thumb/f/fc/Natgeologo.svg/960px-Natgeologo.svg.png" group-title="Ladder Alternates" x-ladder="360/576/720/1080",National Geographic (Croatia) (1080p)
+http://176.61.157.250/NationalGeographic/index.m3u8
 #EXTINF:-1 tvg-logo="https://dtil.tmsimg.com/assets/s143596_ld_h15_aa.png?lock=720x540" group-title="Ladder Alternates" x-ladder="216/360/504/720/1080",News Nation (1080p)
 https://d3qs3d2rkhfqrt.cloudfront.net/out/v1/6cd2f649739a45ca9de1daf81cc7d0f2/index.m3u8
+#EXTINF:-1 tvg-logo="https://i.ibb.co/jZ2NVqN/outdoorch.png" group-title="Ladder Alternates" x-ladder="240/360/480/720/1080",OUTDOOR CHANNEL 🇺🇸
+https://cdn-apse1-prod.tsv2.amagi.tv/linear/amg00718-outdoorchannela-outdoortvnz-samsungnz/playlist.m3u8
 #EXTINF:-1 tvg-logo="https://i.imgur.com/5pMo7dL.png" group-title="Ladder Alternates" x-ladder="180/360/720",Real Madrid TV (726p)
 https://rmtv.akamaized.net/hls/live/2043153/rmtv-es-web/master.m3u8
 #EXTINF:-1 tvg-logo="https://i.ibb.co/0jxLdjnY/TDP.png" group-title="Ladder Alternates" x-ladder="360/576/720",Teledeporte

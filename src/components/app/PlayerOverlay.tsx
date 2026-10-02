@@ -14,7 +14,25 @@ import {
   hlsPerfConfig,
 } from '@/lib/player-settings';
 
-type Phase = 'resolving' | 'loading' | 'playing' | 'paused' | 'error' | 'offair';
+type Phase = 'resolving' | 'loading' | 'playing' | 'paused' | 'error' | 'offair' | 'hevc';
+
+/** Can THIS browser decode HEVC through MSE (Safari, Edge, Chrome with
+ *  hardware decode)? Cached for the page lifetime — the provider flips
+ *  channels into HEVC phases dynamically and an incapable browser used to
+ *  buffer into a codec error that silently hopped onto beIN XTRA (a
+ *  different channel) — now it gets the explicit HEVC choice panel. */
+const canHevc = (() => {
+  let cached: boolean | null = null;
+  return () => {
+    if (cached !== null) return cached;
+    if (typeof window === 'undefined') return (cached = true);
+    const probe = (cs: string) =>
+      (typeof MediaSource !== 'undefined' &&
+        MediaSource.isTypeSupported(`video/mp4; codecs="${cs}"`)) ||
+      document.createElement('video').canPlayType(`video/mp4; codecs="${cs}"`) === 'probably';
+    return (cached = probe('hvc1.1.6.L93.B0') || probe('hev1.1.6.L93.B0'));
+  };
+})();
 
 /** one entry in the channel-surf sidebar */
 interface SurfItem extends Playable {
@@ -116,7 +134,9 @@ function encodePlayable(p: Playable): string {
 function decodePlayable(s: string): Playable | null {
   try {
     const p = JSON.parse(decodeURIComponent(escape(atob(s)))) as Playable;
-    return p && p.kind && p.ref ? p : null;
+    // strict kind check — a typo'd kind ("daddylyve") is truthy but must not
+    // fall through to the IPTV branch (url=<channel-id> → guaranteed 400)
+    return p && (p.kind === 'daddylive' || p.kind === 'iptv') && p.ref ? p : null;
   } catch {
     return null;
   }
@@ -302,6 +322,16 @@ export function PlayerOverlay() {
   const directPlayRef = useRef(false);
   /** the direct→proxy swap fired for this attachment (once) */
   const usedProxyFallbackRef = useRef(false);
+  /** the user explicitly chose "play the HEVC feed anyway" for this channel —
+   *  suppresses the HEVC panel so the serve-through attempt runs */
+  const forceHevcRef = useRef(false);
+  /** codec-reconnect attempts for the CURRENT channel — the reconnect is
+   *  one-shot PER CHANNEL, not per hls instance (a fresh instance has a fresh
+   *  flag, so HEVC feeds in incapable browsers reconnected forever instead
+   *  of ever reaching the HEVC panel) */
+  const codecRecovRef = useRef<{ chId: string; count: number }>({ chId: '', count: 0 });
+  /** the HEVC-phase choice panel ({family} = the related free feed, if any) */
+  const [hevcBlock, setHevcBlock] = useState<{ family?: AltServer } | null>(null);
 
   const isFav = player ? favorites.some((f) => f.id === player.id) : false;
 
@@ -501,6 +531,7 @@ export function PlayerOverlay() {
       proxiedSrcRef.current = null;
       directPlayRef.current = false;
       usedProxyFallbackRef.current = false;
+      if (!opts.isAlternate) setHevcBlock(null); // a fresh channel clears the panel
 
       // fresh channel → reset the per-channel server-switching state.
       // ⚠ alternate playables keep the ORIGINAL channel id, so hopping to a
@@ -513,6 +544,8 @@ export function PlayerOverlay() {
         serversRef.current = DL_SERVERS;
         alternatesRef.current = [];
         tcSrcRef.current = null;
+        forceHevcRef.current = false; // a NEW channel re-evaluates its codec phase
+        codecRecovRef.current = { chId: ch.id, count: 0 }; // fresh codec-reconnect budget
       }
       if (opts.server) triedRef.current.tried.add(opts.server);
       if (ch.kind === 'iptv') triedRef.current.tried.add(ch.ref);
@@ -548,6 +581,7 @@ export function PlayerOverlay() {
           tc?: { src: string; r: string; s: string };
           proxied?: string;
           cors?: boolean;
+          hevc?: boolean;
         };
 
         // capture the server lists (available even on failures for failover)
@@ -615,7 +649,9 @@ export function PlayerOverlay() {
             for (const s of serversRef.current) triedRef.current.tried.add(s.id);
           }
           // per-stream failover before giving up (original-repo mirror hopping):
-          // DL transports first, then multi-quality alternates, then honest error
+          // DL transports first, then SAME-CHANNEL alternates, then the honest
+          // error screen (family feeds are offered there as an explicit button
+          // — never auto-hopped: a silent channel swap was the beIN complaint)
           const cur = playerRef.current || ch;
           if (cur.kind === 'daddylive') {
             const next = serversRef.current.find((s) => !triedRef.current.tried.has(s.id));
@@ -626,22 +662,29 @@ export function PlayerOverlay() {
             }
           }
           {
-            // same-channel alternates first — a family feed (beIN 1 → XTRA)
-            // only enters the chain when the real channel is dead everywhere
-            const next =
-              alternatesRef.current.find((a) => a.sameChannel !== false && !triedRef.current.tried.has(a.url)) ||
-              alternatesRef.current.find((a) => !triedRef.current.tried.has(a.url));
+            const next = alternatesRef.current.find((a) => a.sameChannel !== false && !triedRef.current.tried.has(a.url));
             if (next) {
-              showToast(
-                next.sameChannel === false
-                  ? `Trying related feed on ${next.sourceName}…`
-                  : `Trying ${next.sourceName}…`
-              );
+              showToast(`Trying ${next.sourceName}…`);
               await loadRef.current(altPlayable(cur, next), { isAlternate: true });
               return;
             }
           }
           throw new Error(data.message || 'Stream is offline or geo-blocked right now.');
+        }
+
+        // ── HEVC-phase gate ────────────────────────────────────────────────
+        // The resolve sniffed the feed in a browser-UNSAFE codec phase (HEVC)
+        // and THIS browser can't decode it (Firefox / Chrome without hw
+        // decode). Playing it is a guaranteed ~10s stall into a codec error,
+        // and the old failover walk landed on beIN XTRA — a DIFFERENT channel
+        // the user never asked for. Show the explicit choice panel instead.
+        if (data.hevc && !canHevc() && !forceHevcRef.current && !opts.isAlternate) {
+          const family =
+            alternatesRef.current.find((a) => a.sameChannel === false && a.ladder?.length) ||
+            alternatesRef.current.find((a) => a.sameChannel === false);
+          setHevcBlock({ family });
+          setPhase('hevc');
+          return;
         }
 
         const src = data.url as string;
@@ -786,9 +829,7 @@ export function PlayerOverlay() {
             }
 
             video.muted = prefs.muted;
-            video.play().catch(() => {
-              /* autoplay may need a gesture — show tap-to-unmute */
-            });
+            playWithFallback(video);
           });
 
           // connectivity engine — Auto keeps following the measured bandwidth
@@ -812,7 +853,18 @@ export function PlayerOverlay() {
               setCurrentQuality(hls.autoLevelEnabled ? -1 : d.level);
             }
           });
-          hls.on(Hls.Events.ERROR, (_e, d) => {
+          hls.on(Hls.Events.ERROR, (_e, dRaw) => {
+            // deterministic codec rejections arrive NON-FATAL first — the MSE
+            // refused the codec when hls.js appended the init segment, and
+            // hls.js retries it forever (endless "Buffering…" on HEVC feeds
+            // in incapable browsers). Promote them so the codec-shaped
+            // handling below takes over immediately.
+            const d =
+              !dRaw.fatal &&
+              dRaw.type === Hls.ErrorTypes.MEDIA_ERROR &&
+              (dRaw.details === 'bufferAddCodecError' || dRaw.details === 'bufferIncompatibleCodecsError')
+                ? { ...dRaw, fatal: true }
+                : dRaw;
             if (!d.fatal) {
               // our relay/turbo endpoints mark off-air channels with 503 +
               // x-offair. hls.js retries 5xx responses internally, which used
@@ -865,7 +917,10 @@ export function PlayerOverlay() {
                 }
               }
               {
-                const next = alternatesRef.current.find((a) => !triedRef.current.tried.has(a.url));
+                // SAME-CHANNEL alternates only — a family feed never auto-enters
+                // the failover chain (silent channel swaps were the complaint);
+                // it's offered on the error screen as an explicit button
+                const next = alternatesRef.current.find((a) => a.sameChannel !== false && !triedRef.current.tried.has(a.url));
                 if (next) {
                   showToast(`Trying ${next.sourceName}…`);
                   void loadRef.current(altPlayable(cur, next), { isAlternate: true });
@@ -910,7 +965,9 @@ export function PlayerOverlay() {
                 }
               }
               {
-                const next = alternatesRef.current.find((a) => !triedRef.current.tried.has(a.url));
+                // same-channel alternates only — family feeds are an explicit
+                // choice on the error screen, never a silent hop
+                const next = alternatesRef.current.find((a) => a.sameChannel !== false && !triedRef.current.tried.has(a.url));
                 if (next) {
                   showToast(`Trying ${next.sourceName}…`);
                   void loadRef.current(altPlayable(cur, next), { isAlternate: true });
@@ -924,9 +981,9 @@ export function PlayerOverlay() {
               // cannot decode this feed's codec (the DaddyLive HEVC flip:
               // server-side we serve such feeds through so capable browsers
               // play them, and incapable ones land here). recoverMediaError
-              // can never fix MSE support, so skip the recovery ladder and
-              // walk the alternate feeds (same channel first, then
-              // brand-family) before the honest error.
+              // can never fix MSE support. Same-channel alternates auto-hop;
+              // with none left, the explicit HEVC choice panel takes over —
+              // NEVER a silent swap onto a brand-family feed (beIN 5 → XTRA).
               const codecShaped =
                 d.details === 'bufferAppendError' ||
                 d.details === 'bufferAddCodecError' ||
@@ -936,11 +993,21 @@ export function PlayerOverlay() {
               if (codecShaped) {
                 const cur = playerRef.current;
                 const h = hlsRef.current as unknown as { _zillaAppendRecov?: boolean } | null;
-                // one plain reconnect first — append races can mimic codec
-                // errors (holes from discontinuity flushes); a fresh MSE
-                // usually clears those
-                if (cur && h && !h._zillaAppendRecov && d.details === 'bufferAppendError') {
+                // one plain reconnect PER CHANNEL first — append races can
+                // mimic codec errors (holes from discontinuity flushes); a
+                // fresh MSE usually clears those. A SECOND codec-shaped error
+                // on the same channel is deterministic (HEVC) → the panel.
+                const recov = codecRecovRef.current;
+                if (
+                  cur &&
+                  h &&
+                  !h._zillaAppendRecov &&
+                  d.details === 'bufferAppendError' &&
+                  recov.chId === cur.id &&
+                  recov.count < 1
+                ) {
                   h._zillaAppendRecov = true;
+                  recov.count += 1;
                   showToast('Stream hiccup — reconnecting');
                   triedRef.current = { chId: cur.id, tried: new Set() };
                   void loadRef.current(cur);
@@ -948,21 +1015,19 @@ export function PlayerOverlay() {
                 }
                 if (cur) {
                   if (cur.kind === 'iptv') triedRef.current.tried.add(cur.ref);
-                  const next =
-                    alternatesRef.current.find((a) => a.sameChannel !== false && !triedRef.current.tried.has(a.url)) ||
-                    alternatesRef.current.find((a) => !triedRef.current.tried.has(a.url));
+                  const next = alternatesRef.current.find((a) => a.sameChannel !== false && !triedRef.current.tried.has(a.url));
                   if (next) {
-                    showToast(
-                      next.sameChannel === false
-                        ? `This feed's codec isn't supported here — trying ${next.sourceName}…`
-                        : `Codec not supported here — trying ${next.sourceName}…`
-                    );
+                    showToast(`Codec not supported here — trying ${next.sourceName}…`);
                     void loadRef.current(altPlayable(cur, next), { isAlternate: true });
                     return;
                   }
                 }
-                setPhase('error');
-                setErrorMsg("This channel's current feed uses a codec your browser can't decode.");
+                // no same-channel escape → the explicit choice panel
+                const family =
+                  alternatesRef.current.find((a) => a.sameChannel === false && a.ladder?.length) ||
+                  alternatesRef.current.find((a) => a.sameChannel === false);
+                setHevcBlock({ family });
+                setPhase('hevc');
                 return;
               }
               // append/codec buffer errors mean the SourceBuffer state itself
@@ -976,8 +1041,10 @@ export function PlayerOverlay() {
                 d.details === 'bufferAppendingError' && d.fatal;
               if (appendBroken) {
                 const cur = playerRef.current;
-                if (cur && h && !h._zillaAppendRecov) {
+                const recov = codecRecovRef.current;
+                if (cur && h && !h._zillaAppendRecov && recov.chId === cur.id && recov.count < 1) {
                   h._zillaAppendRecov = true;
+                  recov.count += 1;
                   showToast('Stream hiccup — reconnecting');
                   triedRef.current = { chId: cur.id, tried: new Set() };
                   void loadRef.current(cur);
@@ -1027,7 +1094,7 @@ export function PlayerOverlay() {
           // Safari native HLS
           video.src = src;
           video.muted = prefs.muted;
-          video.play().catch(() => {});
+          playWithFallback(video);
         }
       } catch (e) {
         if (gen !== loadGenRef.current) return; // closed/superseded — stay quiet
@@ -1046,9 +1113,18 @@ export function PlayerOverlay() {
     playerRef.current = player;
   }, [player]);
 
-  // reload the stream only when the channel changes (load is stable enough)
+  // reload the stream only when the channel ACTUALLY changes. The store's
+  // enrichPlayable patches the open player (logo backfill for Recently
+  // watched) — a new object identity with the SAME channel. Treating those
+  // as channel changes re-resolved and re-attached the stream in a loop
+  // (visible as endless Resolving/Buffering flashes mid-playback).
+  const loadKeyRef = useRef('');
   useEffect(() => {
-    if (playerOpen && player) void load(player);
+    if (!playerOpen || !player) return;
+    const key = `${player.kind}:${player.ref}`;
+    if (loadKeyRef.current === key) return; // logo/enrich patch — never reload
+    loadKeyRef.current = key;
+    void load(player);
   }, [playerOpen, player]);
 
   // cleanup on close — destroy hls AND invalidate any in-flight resolve so
@@ -1057,6 +1133,7 @@ export function PlayerOverlay() {
   useEffect(() => {
     if (!playerOpen) {
       loadGenRef.current++;
+      loadKeyRef.current = ''; // a reopen of the same channel must load again
       if (hlsRef.current) {
         hlsRef.current.destroy();
         hlsRef.current = null;
@@ -1246,25 +1323,54 @@ export function PlayerOverlay() {
   }, [nextChannel, player, openPlayer]);
 
   /* ── video actions ──────────────────────────────────────────────────────── */
+  /** Unmute helper — the #1 tap-for-sound pitfall is a ZERO volume: unmuting
+   *  a silent-volume video still produces silence, so the button looks dead.
+   *  Every unmute path funnels through here and lifts a 0 volume back to an
+   *  audible default (0.75). */
+  const soundOn = useCallback((v: HTMLVideoElement) => {
+    if (v.volume === 0 || Number.isNaN(v.volume)) {
+      v.volume = 0.75;
+      setVolume(0.75);
+    }
+    v.muted = false;
+    setMuted(false);
+  }, []);
+
+  /** play() with the browser-autoplay fallback (freestream-tv pattern): when
+   *  unmuted autoplay is blocked the stream would sit paused forever ("stuck
+   *  buffering" → off-air watchdog). Fall back to MUTED playback and surface
+   *  the tap-for-sound button — the standard YouTube-style behavior. */
+  const playWithFallback = useCallback((v: HTMLVideoElement) => {
+    v.play().catch(() => {
+      v.muted = true;
+      setMuted(true);
+      v.play().catch(() => {
+        /* still blocked — the play button / tap overlay remain */
+      });
+    });
+  }, []);
+
   const togglePlay = useCallback(() => {
     const v = videoRef.current;
     if (!v) return;
     if (v.paused) {
-      v.muted = false;
-      setMuted(false);
+      soundOn(v);
       v.play().catch(() => {});
     } else {
       v.pause();
       setPhase('paused');
     }
-  }, []);
+  }, [soundOn]);
 
   const toggleMute = useCallback(() => {
     const v = videoRef.current;
     if (!v) return;
-    v.muted = !v.muted;
-    setMuted(v.muted);
-  }, []);
+    if (v.muted) soundOn(v);
+    else {
+      v.muted = true;
+      setMuted(true);
+    }
+  }, [soundOn]);
 
   const goLive = useCallback(() => {
     const v = videoRef.current;
@@ -1360,7 +1466,7 @@ export function PlayerOverlay() {
             setCurrentQuality(best);
           }
         }
-        video.play().catch(() => {});
+        playWithFallback(video);
       });
       hls.on(Hls.Events.ERROR, (_e, d) => {
         if (!d.fatal) return;
@@ -1555,6 +1661,16 @@ export function PlayerOverlay() {
     [showToast]
   );
 
+  /** the HEVC panel's "play the HEVC feed anyway" — suppresses the gate for
+   *  this channel and reloads it (browsers with partial support may still
+   *  play; a true failure lands on the codec error path honestly) */
+  const playHevcAnyway = useCallback(() => {
+    forceHevcRef.current = true;
+    setHevcBlock(null);
+    const cur = playerRef.current;
+    if (cur) void loadRef.current(cur);
+  }, []);
+
   /** quality-menu pick of an alternate-source rung ("1080p · via beIN XTRA"):
    *  hop to that source and pin the chosen height once its manifest parses —
    *  the multi-quality engine for single-rendition DaddyLive channels. */
@@ -1644,7 +1760,7 @@ export function PlayerOverlay() {
           e.preventDefault();
           const v = videoRef.current;
           if (v) {
-            const nv = Math.min(1, v.volume + 0.1);
+            const nv = Math.min(1, Math.max(0.1, v.volume + 0.1));
             v.volume = nv;
             v.muted = false;
             setVolume(nv);
@@ -2048,6 +2164,22 @@ export function PlayerOverlay() {
               >
                 Retry
               </button>
+              {/* related family feed — an EXPLICIT choice (labeled as a different
+                  channel), never an automatic hop that silently swaps channels */}
+              {(() => {
+                const fam =
+                  alternates.find((a) => a.sameChannel === false && a.ladder?.length) ||
+                  alternates.find((a) => a.sameChannel === false);
+                return fam ? (
+                  <button
+                    onClick={() => switchAlternate(fam)}
+                    className="rounded-full border border-zilla-yellow/50 bg-zilla-yellow/10 px-5 py-2.5 text-xs font-black uppercase tracking-wide text-zilla-yellow hover:bg-zilla-yellow/20"
+                    title={`A related channel from the same network — not ${player.name}`}
+                  >
+                    Watch {fam.name} instead
+                  </button>
+                ) : null;
+              })()}
               {hasServerChoices && (
                 <button
                   onClick={() => {
@@ -2092,26 +2224,84 @@ export function PlayerOverlay() {
           </div>
         )}
 
-        {/* tap for sound */}
+        {/* ── HEVC-phase choice panel ─────────────────────────────────────
+            The channel is LIVE but broadcasting in a codec this browser can't
+            decode. Never a silent swap onto a related feed — the user picks. */}
+        {hevcBlock && phase === 'hevc' && (
+          <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-4 bg-black/88 px-6 text-center">
+            <div className="flex h-14 w-14 items-center justify-center rounded-full bg-zilla-yellow/15 text-zilla-yellow">
+              <svg viewBox="0 0 24 24" className="h-7 w-7 fill-current" aria-hidden>
+                <path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm1 5h-2v6h2V7zm0 8h-2v2h2v-2z" />
+              </svg>
+            </div>
+            <div>
+              <p className="text-base font-extrabold text-white">
+                {player.name} is live — in a format this browser can&apos;t play
+              </p>
+              <p className="mx-auto mt-1 max-w-md text-sm font-medium text-white/60">
+                The channel is currently broadcasting in HEVC (a modern video codec). Your browser
+                can&apos;t decode it, but Safari, Edge, and most phones play it natively — or open
+                MaxTV there later.
+              </p>
+            </div>
+            <div className="flex flex-wrap items-center justify-center gap-2">
+              {hevcBlock.family && (
+                <button
+                  onClick={() => switchAlternate(hevcBlock.family!)}
+                  className="rounded-full bg-zilla-yellow px-5 py-2.5 text-xs font-black uppercase tracking-wide text-black hover:bg-zilla-yellow-soft"
+                  title={`A related free channel from the same network — not ${player.name}`}
+                >
+                  Watch {hevcBlock.family.name} instead
+                  <span className="ml-1.5 font-bold normal-case tracking-normal opacity-70">
+                    (different channel)
+                  </span>
+                </button>
+              )}
+              <button
+                onClick={playHevcAnyway}
+                className="rounded-full border border-white/25 bg-white/10 px-5 py-2.5 text-xs font-black uppercase tracking-wide text-white hover:bg-white/20"
+              >
+                Try playing anyway
+              </button>
+              <button
+                onClick={retryStream}
+                className="rounded-full border border-white/25 bg-white/10 px-5 py-2.5 text-xs font-black uppercase tracking-wide text-white hover:bg-white/20"
+              >
+                Retry
+              </button>
+              <button
+                onClick={closePlayer}
+                className="rounded-full border border-white/25 bg-white/10 px-5 py-2.5 text-xs font-black uppercase tracking-wide text-white hover:bg-white/20"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* tap for sound — z-30 sits it ABOVE the bottom control bar (whose
+            ~120px gradient box used to swallow taps on the lower half of this
+            button — “the tap for sound button doesn't work”); bottom-32 lifts
+            it fully clear of the bar so every pixel is tappable */}
         {phase === 'playing' && muted && controlsVisible && (
           <button
             onClick={() => {
               const v = videoRef.current;
               if (v) {
-                v.muted = false;
-                setMuted(false);
+                soundOn(v);
                 v.play().catch(() => {});
               }
             }}
-            className="absolute bottom-24 left-1/2 -translate-x-1/2 rounded-full bg-zilla-yellow px-5 py-2.5 text-xs font-black uppercase tracking-wide text-black shadow-2xl hover:bg-zilla-yellow-soft"
+            className="absolute bottom-32 left-1/2 z-30 -translate-x-1/2 rounded-full bg-zilla-yellow px-6 py-3 text-xs font-black uppercase tracking-wide text-black shadow-2xl transition-transform hover:scale-105 hover:bg-zilla-yellow-soft"
           >
             Tap for sound
           </button>
         )}
 
-        {/* content-mismatch banner — "this feed is showing motorsport" */}
+        {/* content-mismatch banner — “this feed is showing motorsport” (z-30:
+            the top bar's gradient box must not swallow its buttons) */}
         {mismatch && phase === 'playing' && (
-          <div className="absolute left-1/2 top-16 w-[92vw] max-w-lg -translate-x-1/2 rounded-xl border border-zilla-yellow/40 bg-black/90 p-3.5 shadow-2xl backdrop-blur">
+          <div className="absolute left-1/2 top-16 z-30 w-[92vw] max-w-lg -translate-x-1/2 rounded-xl border border-zilla-yellow/40 bg-black/90 p-3.5 shadow-2xl backdrop-blur">
             <div className="flex items-start gap-3">
               <span className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-zilla-yellow/15 text-zilla-yellow">
                 <svg viewBox="0 0 24 24" className="h-4 w-4 fill-current" aria-hidden>
@@ -2167,7 +2357,7 @@ export function PlayerOverlay() {
         {phase === 'playing' && liveBehind && (
           <button
             onClick={goLive}
-            className="absolute right-4 top-20 flex items-center gap-1.5 rounded-full bg-zilla-red px-3.5 py-2 text-[11px] font-black uppercase tracking-wide text-white shadow-xl"
+            className="absolute right-4 top-20 z-30 flex items-center gap-1.5 rounded-full bg-zilla-red px-3.5 py-2 text-[11px] font-black uppercase tracking-wide text-white shadow-xl"
           >
             <span className="live-dot h-1.5 w-1.5 rounded-full bg-white" /> Go live
           </button>
@@ -2247,6 +2437,16 @@ export function PlayerOverlay() {
                         v.muted = true;
                         setMuted(true);
                       }
+                    }
+                  }}
+                  onPointerUp={() => {
+                    // a tap on the far-left of the slider sets 0 → muted; a
+                    // SECOND tap slightly right must audibly unmute (and a
+                    // drag straight back from 0 lifts the mute live)
+                    const v = videoRef.current;
+                    if (v && v.volume > 0 && v.muted) {
+                      v.muted = false;
+                      setMuted(false);
                     }
                   }}
                   style={{ ['--fill' as string]: `${(muted ? 0 : volume) * 100}%` }}
