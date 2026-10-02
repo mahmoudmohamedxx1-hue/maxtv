@@ -90,6 +90,10 @@ interface AltServer {
   ladder?: number[];
   /** CDN answers CORS → the alternate can play straight from the CDN */
   cors?: boolean;
+  /** TRUE = verified SAME channel (quality-rung eligible). FALSE = brand-family
+   *  sibling (beIN 1 → beIN XTRA) — servers-menu only, never a quality rung:
+   *  picking a quality must never change the channel. */
+  sameChannel?: boolean;
 }
 
 /** build the playable for hopping to an alternate (multi-quality) source —
@@ -556,6 +560,36 @@ export function PlayerOverlay() {
           const alts = data.alternates as AltServer[];
           alternatesRef.current = alts;
           setAlternates(alts);
+          // alternates exist but none carries a (probed) ladder yet — the
+          // bounded probe may still be completing server-side. ONE delayed
+          // re-resolve picks up the landed ladders and fills the quality-menu
+          // rungs in place, without ever disturbing playback.
+          if (ch.kind === 'daddylive' && alts.length && !alts.some((a) => a.ladder?.length)) {
+            const reGen = gen;
+            window.setTimeout(() => {
+              if (reGen !== loadGenRef.current) return; // channel changed / closed
+              (async () => {
+                try {
+                  const ep = `/api/sports/stream?channel=${encodeURIComponent(ch.ref)}${
+                    ch.name ? `&name=${encodeURIComponent(ch.name.slice(0, 80))}` : ''
+                  }`;
+                  const r2 = await fetch(ep);
+                  if (reGen !== loadGenRef.current) return;
+                  const d2 = (await r2.json().catch(() => ({}))) as { alternates?: AltServer[] };
+                  if (Array.isArray(d2.alternates) && d2.alternates.length) {
+                    const fresh = d2.alternates;
+                    // only an upgrade (a ladder landed) is worth a re-render
+                    if (fresh.some((a) => a.ladder?.length)) {
+                      alternatesRef.current = fresh;
+                      setAlternates(fresh);
+                    }
+                  }
+                } catch {
+                  /* best-effort */
+                }
+              })();
+            }, 7_000);
+          }
         }
         if (typeof data.serverId === 'string' && data.serverId) {
           setActiveServer(data.serverId);
@@ -592,9 +626,17 @@ export function PlayerOverlay() {
             }
           }
           {
-            const next = alternatesRef.current.find((a) => !triedRef.current.tried.has(a.url));
+            // same-channel alternates first — a family feed (beIN 1 → XTRA)
+            // only enters the chain when the real channel is dead everywhere
+            const next =
+              alternatesRef.current.find((a) => a.sameChannel !== false && !triedRef.current.tried.has(a.url)) ||
+              alternatesRef.current.find((a) => !triedRef.current.tried.has(a.url));
             if (next) {
-              showToast(`Trying ${next.sourceName}…`);
+              showToast(
+                next.sameChannel === false
+                  ? `Trying related feed on ${next.sourceName}…`
+                  : `Trying ${next.sourceName}…`
+              );
               await loadRef.current(altPlayable(cur, next), { isAlternate: true });
               return;
             }
@@ -1604,9 +1646,12 @@ export function PlayerOverlay() {
 
   /** best multi-quality alternate (tallest probed ladder) — its rungs render
    *  directly in the quality menu as "via <source>" entries. ⚠ must live
-   *  BEFORE the playerOpen early-return — hooks may not sit behind it. */
+   *  BEFORE the playerOpen early-return — hooks may not sit behind it.
+   *  ⚠ SAME-CHANNEL only: a brand-family sibling (beIN 1 → beIN XTRA free
+   *  feed) must never masquerade as a quality — picking 1080p would change
+   *  the channel (2026-10-02 field report). */
   const ladderAlt = useMemo(() => {
-    const withL = alternates.filter((a) => a.ladder && a.ladder.length);
+    const withL = alternates.filter((a) => a.sameChannel !== false && a.ladder && a.ladder.length);
     if (!withL.length) return null;
     return withL.reduce((best, a) =>
       (a.ladder![a.ladder!.length - 1] || 0) > (best.ladder![best.ladder!.length - 1] || 0) ? a : best
@@ -2287,19 +2332,27 @@ export function PlayerOverlay() {
                                       </span>
                                       <span className="block truncate text-[10px] font-medium text-zilla-dim">
                                         {alt.name}
-                                        {alt.ladder?.length
-                                          ? ` · ${alt.ladder[0]}–${alt.ladder[alt.ladder.length - 1]}p ladder`
-                                          : alt.source === 'worldsports'
-                                            ? ' · real quality ladder'
-                                            : ''}
+                                        {alt.sameChannel === false
+                                          ? ' · different feed'
+                                          : alt.ladder?.length
+                                            ? ` · ${alt.ladder[0]}–${alt.ladder[alt.ladder.length - 1]}p ladder`
+                                            : alt.source === 'worldsports'
+                                              ? ' · real quality ladder'
+                                              : ''}
                                       </span>
                                     </span>
-                                    {(alt.ladder?.length || alt.source === 'worldsports') && (
-                                      <span className="shrink-0 rounded-full bg-zilla-yellow/15 px-2 py-0.5 text-[9px] font-black uppercase text-zilla-yellow/90">
-                                        {alt.ladder?.length
-                                          ? `${alt.ladder[0]}–${alt.ladder[alt.ladder.length - 1]}p`
-                                          : 'HD↑'}
+                                    {alt.sameChannel === false ? (
+                                      <span className="shrink-0 rounded-full bg-white/10 px-2 py-0.5 text-[9px] font-black uppercase text-zilla-dim">
+                                        other feed
                                       </span>
+                                    ) : (
+                                      (alt.ladder?.length || alt.source === 'worldsports') && (
+                                        <span className="shrink-0 rounded-full bg-zilla-yellow/15 px-2 py-0.5 text-[9px] font-black uppercase text-zilla-yellow/90">
+                                          {alt.ladder?.length
+                                            ? `${alt.ladder[0]}–${alt.ladder[alt.ladder.length - 1]}p`
+                                            : 'HD↑'}
+                                        </span>
+                                      )
                                     )}
                                   </button>
                                 );
@@ -2312,7 +2365,7 @@ export function PlayerOverlay() {
                             straight through with no middle layer; Edge direct skips mirror parsing for
                             the lowest latency.
                             {alternates.length > 0
-                              ? ' Sources under “More sources” carry the same channel with real quality ladders — their rungs also appear in the quality menu.'
+                              ? ' Sources under “More sources” carry this channel elsewhere — same-channel ones also lend their quality rungs to the quality menu; entries marked “other feed” are related channels.'
                               : ' DaddyLive streams ship a single quality; pick a multi-quality source when one appears here.'}
                           </p>
                         </>

@@ -51,10 +51,13 @@ export async function GET(req: Request) {
     const info = peekLadder(finalUrl, '');
     const cors = info?.cors === true;
 
+    // direct CDN playback when the CDN answers CORS (zero proxy latency,
+    // native ABR); the proxy path otherwise (Referer/anti-CORS shield).
+    // ⚠ https-only: an http:// manifest would be mixed-content-blocked on the
+    // https page — those sources always play through the same-origin proxy.
+    const canDirect = cors && finalUrl.startsWith('https://');
     return NextResponse.json({
-      // direct CDN playback when the CDN answers CORS (zero proxy latency,
-      // native ABR); the proxy path otherwise (Referer/anti-CORS shield)
-      url: cors ? finalUrl : proxied,
+      url: canDirect ? finalUrl : proxied,
       directUrl: finalUrl,
       proxied,
       cors,

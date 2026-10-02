@@ -14,8 +14,9 @@ const SERVERLESS = process.env.VERCEL === '1' || !!process.env.VERCEL_ENV;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /** how many of the best alternates get their quality ladder probed (the
- *  multi-quality rungs shown in the player's quality menu) */
-const LADDER_PROBE_COUNT = 2;
+ *  multi-quality rungs shown in the player's quality menu). Pool entries ship
+ *  pre-verified rungs and never consume a probe slot. */
+const LADDER_PROBE_COUNT = 4;
 const LADDER_PROBE_WAIT_MS = 1_800;
 
 /**
@@ -93,9 +94,13 @@ export async function GET(req: Request) {
     // ── ladder-probe the best alternates (multi-quality rungs) ─────────────
     // Bounded: resolve must not crawl when an alternate CDN is slow. Probes
     // continue in the background and land in the cache for the next open.
+    // Pool-verified alternates already carry their rungs — no probe needed.
     const origin = new URL(req.url).origin;
     const altTyped = alternates as (AlternateChannel & { ladder?: number[]; cors?: boolean })[];
-    const topAlts = altTyped.slice(0, LADDER_PROBE_COUNT).filter((a) => /^https?:\/\//i.test(a.url || ''));
+    const topAlts = altTyped
+      .slice(0, LADDER_PROBE_COUNT + 4)
+      .filter((a) => /^https?:\/\//i.test(a.url || '') && !a.ladder)
+      .slice(0, LADDER_PROBE_COUNT);
     if (topAlts.length) {
       const probes = Promise.allSettled(topAlts.map((a) => probeLadder(a.url, '', origin)));
       await Promise.race([probes, sleep(LADDER_PROBE_WAIT_MS)]);

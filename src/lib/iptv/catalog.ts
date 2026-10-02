@@ -14,6 +14,7 @@ import { normalizeCategory } from './categories';
 import { isObfuscatedName, repairChannelName } from './repair';
 import { getChannelLogo, warmLogoCache } from '@/lib/media/logos';
 import { probeSource, type SourceHealth } from './health';
+import { getLadderPool, providerLabelFromUrl } from './ladderpool';
 
 export interface Catalog {
   channels: IPTVChannel[];
@@ -244,6 +245,12 @@ export interface AlternateChannel {
   logo?: string;
   chno?: string;
   health?: SourceHealth;
+  /** TRUE only when this is the SAME channel (not a brand-family sibling
+   *  like beIN 1 → beIN XTRA). Quality-menu rungs require it — picking a
+   *  quality must never change the channel. */
+  sameChannel?: boolean;
+  /** verified native quality rungs (pool entries ship pre-attached) */
+  ladder?: number[];
 }
 
 /** Normalize a channel name for "same channel" matching */
@@ -272,11 +279,28 @@ function regionalCoreName(n: string): string {
   return normalizeChannelName(n.replace(REGION_QUALIFIERS, ' '));
 }
 
+/** standalone channel numbers of a name ("ESPN 2" → ["2"]). Same channel
+ *  requires the SAME number — ESPN 2 must never match ESPN, and a numbered
+ *  beIN must never match the un-numbered free-tier "beIN Sports" feed. */
+function channelNumbers(n: string): string[] {
+  return normalizeChannelName(n).match(/\d+/g) || [];
+}
+
 /**
  * Find the same channel served by other sources — the IPTV counterpart of the
  * original repo's per-stream server switching. Same channel on a different
  * provider (or a second stream URL on the same provider) = a different
  * "server" the user (or the failover engine) can hop to.
+ *
+ * Matching tiers (per candidate):
+ *   t1 exact normalized name · t2 channel-number-stripped core · t3
+ *   region-stripped (with a channel-number guard) → `sameChannel: true`
+ *   t4 brand-family prefix ("beIN SPORTS XTRA" under the beIN brand) →
+ *   `sameChannel: false` — listed in the servers menu as another source but
+ *   NEVER as a quality rung (picking 1080p must not change the channel).
+ *
+ * The curated LadderAlts pool (verified same-channel ABR masters, rungs
+ * pre-attached) is merged in first — its entries skip the runtime probe.
  */
 export async function findAlternates(
   name: string,
@@ -293,48 +317,91 @@ export async function findAlternates(
   const seenUrls = new Set<string>([excludeUrl]);
   const seenKeys = new Set<string>();
   const regional = regionalCoreName(name);
-  for (const ch of cat.channels) {
-    if (seenUrls.has(ch.url)) continue;
-    // tier 1: exact normalized name
-    // tier 2: channel-number-stripped core name
-    // tier 3: region-stripped ("beIN Sports MENA English 1" ≡ "beIN Sports 1")
-    // tier 4: family prefix ("beIN SPORTS XTRA 1" ≡ "beIN SPORTS XTRA") —
-    //          same network brand, edition/number variant of it
+  const nums = channelNumbers(name);
+  // catalog channels carry only a source id — resolve the display name
+  const srcLabel = (id: string) => cat.sources.find((s) => s.id === id)?.name || id;
+
+  const consider = (
+    ch: { name: string; url: string; logo?: string; source: string; sourceName?: string; id?: string; chno?: string; health?: SourceHealth },
+    opts?: { ladder?: number[]; pool?: boolean }
+  ): 'same' | 'family' | null => {
+    if (seenUrls.has(ch.url)) return null;
     const n = normalizeChannelName(ch.name);
     const rc = regionalCoreName(ch.name);
-    const t1 = n === want;
-    const t2 = core.length >= 5 && coreChannelName(ch.name) === core;
-    const t3 = regional.length >= 6 && rc === regional && n !== want;
-    const t4 =
+    let tier: 1 | 2 | 3 | 4 | null = null;
+    if (n === want) tier = 1;
+    else if (core.length >= 5 && coreChannelName(ch.name) === core) tier = 2;
+    else if (regional.length >= 6 && rc === regional && n !== want) tier = 3;
+    else if (
       regional.length >= 8 &&
       rc.length >= 8 &&
       rc !== regional &&
-      (rc.startsWith(regional) || regional.startsWith(rc));
-    if (!t1 && !t2 && !t3 && !t4) continue;
+      (rc.startsWith(regional) || regional.startsWith(rc))
+    ) tier = 4;
+    if (!tier) return null;
+
+    // same-channel rules for quality rungs: exact/core always qualify; the
+    // regional tier additionally needs matching channel numbers AND must not
+    // cross into the curated free-tier beIN feeds (beIN 1 ≠ "beIN Sports"
+    // cloud/XTRA — different channel, per the 2026-10-02 field report)
+    let sameChannel = tier <= 2;
+    if (tier === 3) {
+      sameChannel =
+        channelNumbers(ch.name).join(',') === nums.join(',') &&
+        ch.source !== 'bein';
+    }
+
     seenUrls.add(ch.url);
     // one menu entry per (source, matched-name) pair — skips "108 X" + "129 X"
     // clones AND regional twins from the same source
-    const key = `${ch.source}|${t1 ? n : t2 ? coreChannelName(ch.name) : rc}`;
-    if (seenKeys.has(key)) continue;
+    const key = `${ch.source}|${tier === 1 ? n : tier === 2 ? coreChannelName(ch.name) : rc}`;
+    if (seenKeys.has(key)) return null;
     seenKeys.add(key);
-    const src = cat.sources.find((s) => s.id === ch.source);
     out.push({
-      id: ch.id,
+      id: ch.id || `alt:${ch.source}:${n}`,
       name: ch.name,
       source: ch.source,
-      sourceName: src?.name || ch.source,
+      sourceName: ch.sourceName || srcLabel(ch.source),
       url: ch.url,
       logo: ch.logo,
       chno: ch.chno,
-      health: cat.sourceHealth[ch.source] || 'unknown',
+      health: ch.health,
+      sameChannel,
+      ...(opts?.ladder?.length ? { ladder: opts.ladder } : {}),
     });
+    return sameChannel ? 'same' : 'family';
+  };
+
+  // ── 1. curated ladder pool first (verified rungs pre-attached) ────────────
+  for (const e of getLadderPool()) {
     if (out.length >= limit) break;
+    consider(
+      {
+        name: e.name,
+        url: e.url,
+        logo: e.logo,
+        source: 'ladderalts',
+        sourceName: providerLabelFromUrl(e.url),
+      },
+      { ladder: e.ladder, pool: true }
+    );
   }
 
-  // ladder-bearing sources first (real multi-quality), then healthy, then name
+  // ── 2. the live catalog ─────────────────────────────────────────────────
+  for (const ch of cat.channels) {
+    if (out.length >= limit) break;
+    consider({
+      ...ch,
+      sourceName: srcLabel(ch.source),
+      health: cat.sourceHealth[ch.source] || 'unknown',
+    });
+  }
+
+  // verified ladder rungs first, then worldsports, then healthy, then name
   const tier = (h?: SourceHealth) => (h === 'ok' ? 0 : h === 'geo' ? 1 : 2);
   return out.sort(
     (a, b) =>
+      Number(!!b.ladder) - Number(!!a.ladder) ||
       Number(b.source === 'worldsports') - Number(a.source === 'worldsports') ||
       tier(a.health) - tier(b.health) ||
       a.sourceName.localeCompare(b.sourceName)
