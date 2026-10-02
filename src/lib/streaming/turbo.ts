@@ -114,6 +114,14 @@ export class TurboSession {
   private readonly urlBySn = new Map<number, string>();
   private lastSn = 0;
   private lastUpMseq: number | null = null;
+  /** mseq of the most recent upstream playlist parse — the floor below which
+   *  a FRESH instance (Vercel load-balance hop) cannot on-demand fetch: the
+   * upstream listing is only ~4-6 segments deep, so sns below floor+1 have
+   * scrolled out of existence everywhere but this instance's cache. */
+  private lastUpFloor = 0;
+  /** wall-clock of the last successful upstream playlist parse (drift-margin
+   *  gating — see windowRange). */
+  private lastParseAt = 0;
   private readonly snTries = new Map<number, number>();
   private readonly pending = new Set<number>();
   /** codec safety of the source (null = not sniffed yet) */
@@ -196,17 +204,28 @@ export class TurboSession {
 
   /** contiguous window ending at the newest cached segment (hole-free;
    *  codec-safe only — unless the whole feed is unsafe and we're serving it
-   *  through to HEVC-capable browsers) */
+   *  through to HEVC-capable browsers).
+   *
+   *  CROSS-INSTANCE DRIFT MARGIN: while upstream is live, the window never
+   *  reaches below the current upstream floor + 1 — those sns are still
+   *  listed upstream, so ANY instance can on-demand fetch them (a segment
+   *  request that load-balances to a cold instance must never depend on
+   *  bytes only a warm instance cached). When upstream has just flapped, the
+   *  margin lifts and the deep cache becomes servable again — that runway
+   *  is what rides out CDN flaps in the first place. */
   private windowRange(): { base: number; list: { sn: number; seg: SegData }[] } | null {
     const n = this.windowSns.length;
     if (!n) return null;
     const allowUnsafe = this.serveUnsafe;
+    const upstreamLive = this.lastParseAt > 0 && Date.now() - this.lastParseAt < 15_000;
+    const hopFloor = upstreamLive && this.lastUpFloor > 0 ? this.lastUpFloor + 1 : 0;
     const list: { sn: number; seg: SegData }[] = [];
     let i = n - 1;
     let expect = this.windowSns[i];
     while (i >= 0 && list.length < WINDOW) {
       const sn = this.windowSns[i];
       if (sn !== expect) break; // hole — the window stops here
+      if (hopFloor && sn < hopFloor) break; // below the cross-instance-safe floor
       const seg = this.segs.get(sn);
       if (!seg || (!allowUnsafe && !seg.safe)) break; // pruned / codec-unsafe boundary
       list.unshift({ sn, seg });
@@ -333,7 +352,11 @@ export class TurboSession {
         this.urlDur.clear();
         this.snTries.clear();
       }
-      if (upMseq !== null) this.lastUpMseq = upMseq;
+      if (upMseq !== null) {
+        this.lastUpMseq = upMseq;
+        this.lastUpFloor = upMseq;
+        this.lastParseAt = Date.now();
+      }
 
       // parse entries — sn identity = upstream mseq + index (stable across
       // polls AND across instances; that's the whole v2 trick)
