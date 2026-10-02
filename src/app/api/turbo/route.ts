@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server';
-import { getTurboSession, peekTurboSession } from '@/lib/streaming/turbo';
+import { getTurboSession } from '@/lib/streaming/turbo';
+import { ffmpegCapable } from '@/lib/streaming/ffmpeg-cap';
 
 export const dynamic = 'force-dynamic';
 
@@ -13,8 +14,11 @@ export const dynamic = 'force-dynamic';
  * browser only ever reads warm local bytes — no ffmpeg, no warmup wait, no
  * CPU war, and CDN flaps are absorbed by the prefetch cache instead of
  * stalling the player. When the source's codec is not browser-safe (hevc /
- * AC3 …) the playlist request 302-redirects to the transcode relay
- * (/api/live), which re-encodes to uniform h264.
+ * AC3 …) AND a transcoder exists (self-hosted), the playlist request
+ * 302-redirects to the transcode relay (/api/live), which re-encodes to
+ * uniform h264. On serverless (no ffmpeg) a from-the-start HEVC feed is
+ * served through instead — Safari/Chrome-with-HEVC play it natively and
+ * incapable browsers walk the player's alternate-feed ladder.
  *
  * v2 (serverless-proof): every playlist request awaits one inline polling
  * pass (the "kick") before serving, so the session advances on the player's
@@ -33,14 +37,15 @@ export async function GET(req: Request) {
   }
 
   if (mode === 'seg') {
-    // never spawn sessions on segment hits
-    const session = peekTurboSession(channel, mirror);
-    if (!session) {
-      return new NextResponse('session gone', {
-        status: 404,
-        headers: { 'content-type': 'text/plain', 'cache-control': 'no-store' },
-      });
-    }
+    // ⤴ v3: segment hits CREATE the session when this instance doesn't have
+    // it (Vercel load-balances /api/turbo requests across instances — a
+    // segment URL minted by instance A used to hard-404 as 'session gone' on
+    // instance B, burning hls.js's retry budget until the channel died).
+    // getSegment's on-demand path (kick + urlBySn + direct upstream fetch)
+    // makes any instance able to serve any recent segment. Hover-prefetch
+    // never touches this route (it only resolves JSON), so the spawn cost is
+    // only ever paid during real playback.
+    const session = getTurboSession(channel, mirror);
     session.touch();
     const n = parseInt(searchParams.get('n') || '', 10);
     if (!Number.isFinite(n) || n < 1) {
@@ -69,6 +74,10 @@ export async function GET(req: Request) {
   }
 
   // playlist mode
+  // settle the ffmpeg probe first (ms-fast) so the relay-vs-serve decision
+  // for browser-unsafe (HEVC) feeds is made on fact, not on the probe's
+  // serverless-safe default
+  await ffmpegCapable();
   const session = getTurboSession(channel, mirror);
   session.touch();
   // ⤴ v2 INLINE KICK — advance the prefetch NOW (bounded), then wait for a

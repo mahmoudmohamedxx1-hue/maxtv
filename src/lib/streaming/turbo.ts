@@ -40,6 +40,7 @@
 import { resolveDaddyLiveStream } from '@/lib/sports/daddylive';
 import { unwrapSegment } from './uncloak';
 import { UA } from './resolve';
+import { ffmpegAbsent } from './ffmpeg-cap';
 
 const MAX_SESSIONS = 6;
 const IDLE_KILL_MS = 45_000;
@@ -117,6 +118,12 @@ export class TurboSession {
   private readonly pending = new Set<number>();
   /** codec safety of the source (null = not sniffed yet) */
   private codecSafe: boolean | null = null;
+  /** the source was browser-unsafe from its FIRST sniffed segment (a pure
+   *  HEVC/mpeg2 feed, not a mid-stream flip). When no transcoder exists
+   *  (serverless) such feeds are SERVED ANYWAY: Safari + Chrome-with-HEVC
+   *  play them natively, and incapable browsers walk the alternate-feed
+   *  ladder — infinitely better than 302-ing into a dead relay. */
+  private hevcFromStart = false;
   private lastNewAt = Date.now();
   private startup = true;
   lastServed = Date.now();
@@ -141,9 +148,17 @@ export class TurboSession {
     return this.dead;
   }
 
-  /** Has the source been sniffed and is it safe for direct browser playback? */
+  /** Has the source been sniffed and is it safe for direct browser playback?
+   *  FALSE only when a relay could actually save the stream (ffmpeg present,
+   *  or a mid-stream flip away from a working buffer). Pure-HEVC feeds on
+   *  serverless serve through instead — see hevcFromStart. */
   get needsRelay(): boolean {
-    return this.codecSafe === false;
+    return this.codecSafe === false && !this.serveUnsafe;
+  }
+
+  /** serve browser-unsafe segments through to capable browsers (no relay) */
+  private get serveUnsafe(): boolean {
+    return this.hevcFromStart && ffmpegAbsent() === true;
   }
 
   /**
@@ -179,11 +194,13 @@ export class TurboSession {
     }
   }
 
-  /** contiguous window ending at the newest cached segment (hole-free,
-   *  safe-codec only) */
+  /** contiguous window ending at the newest cached segment (hole-free;
+   *  codec-safe only — unless the whole feed is unsafe and we're serving it
+   *  through to HEVC-capable browsers) */
   private windowRange(): { base: number; list: { sn: number; seg: SegData }[] } | null {
     const n = this.windowSns.length;
     if (!n) return null;
+    const allowUnsafe = this.serveUnsafe;
     const list: { sn: number; seg: SegData }[] = [];
     let i = n - 1;
     let expect = this.windowSns[i];
@@ -191,7 +208,7 @@ export class TurboSession {
       const sn = this.windowSns[i];
       if (sn !== expect) break; // hole — the window stops here
       const seg = this.segs.get(sn);
-      if (!seg || !seg.safe) break; // pruned / codec-unsafe boundary
+      if (!seg || (!allowUnsafe && !seg.safe)) break; // pruned / codec-unsafe boundary
       list.unshift({ sn, seg });
       expect = sn - 1;
       i--;
@@ -222,23 +239,42 @@ export class TurboSession {
 
   /** Serve one segment by UPSTREAM sn. Cache miss (instance flap / eviction)
    *  → inline refresh + direct upstream fetch instead of a 404, so a segment
-   *  URL minted by instance A still resolves on instance B. */
+   *  URL minted by instance A still resolves on instance B. The second
+   *  kick/fetch round exists for freshly-spawned sessions on a cold instance:
+   *  the first bounded kick can lose the race with the constructor's initial
+   *  playlist fetch, and losing it used to mean a hard 404. */
   async getSegment(n: number): Promise<Uint8Array | null> {
     const direct = this.segs.get(n);
     if (direct) return direct.ts;
+    const t0 = Date.now();
     // refresh our view of the upstream window, then re-check
     await this.kick(Math.min(KICK_MS, 1_800));
-    const second = this.segs.get(n);
-    if (second) return second.ts;
-    // last resort: we (or a sibling instance) listed this sn — its URL may
-    // still be known; fetch it on demand
-    const url = this.urlBySn.get(n);
+    let seg = this.segs.get(n);
+    if (seg) return seg.ts;
+    // we (or a sibling instance) listed this sn — its URL may still be
+    // known; fetch it on demand
     const referer = this.upstream?.referer || '';
+    let url = this.urlBySn.get(n);
     if (url) {
       const ts = await this.fetchSeg(url, referer);
       if (ts && ts.length >= 188) {
         this.commit(n, ts, this.urlDur.get(n) || 6, false);
         return ts;
+      }
+    }
+    // cold-start second chance — only while we're still inside hls.js's
+    // time-to-first-byte budget (no point retrying after a 12s segment hang)
+    if (Date.now() - t0 < 4_000) {
+      await this.kick(2_000);
+      seg = this.segs.get(n);
+      if (seg) return seg.ts;
+      url = this.urlBySn.get(n);
+      if (url) {
+        const ts = await this.fetchSeg(url, referer);
+        if (ts && ts.length >= 188) {
+          this.commit(n, ts, this.urlDur.get(n) || 6, false);
+          return ts;
+        }
       }
     }
     return null;
@@ -406,8 +442,10 @@ export class TurboSession {
       else if (this.windowSns[at - 1] !== sn) this.windowSns.splice(at, 0, sn);
     }
     if (codec) {
-      if (this.codecSafe === null) this.codecSafe = safe;
-      else if (!safe) {
+      if (this.codecSafe === null) {
+        this.codecSafe = safe;
+        if (!safe) this.hevcFromStart = true; // pure-unsafe feed (e.g. HEVC)
+      } else if (!safe && this.codecSafe) {
         // mid-stream flip to a codec the browser cannot decode — mark the
         // session unsafe: the window tip freezes on the last safe segment
         // and the route redirects playlist polls to the transcode relay

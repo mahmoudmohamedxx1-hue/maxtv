@@ -920,6 +920,51 @@ export function PlayerOverlay() {
               setPhase('error');
               setErrorMsg(`Network error (${d.details}).`);
             } else if (d.type === Hls.ErrorTypes.MEDIA_ERROR) {
+              // codec-shaped failures are DETERMINISTIC — the browser's MSE
+              // cannot decode this feed's codec (the DaddyLive HEVC flip:
+              // server-side we serve such feeds through so capable browsers
+              // play them, and incapable ones land here). recoverMediaError
+              // can never fix MSE support, so skip the recovery ladder and
+              // walk the alternate feeds (same channel first, then
+              // brand-family) before the honest error.
+              const codecShaped =
+                d.details === 'bufferAppendError' ||
+                d.details === 'bufferAddCodecError' ||
+                d.details === 'bufferIncompatibleCodecsError' ||
+                d.details === 'manifestIncompatibleCodecsError' ||
+                (d.details === 'bufferAppendingError' && d.fatal);
+              if (codecShaped) {
+                const cur = playerRef.current;
+                const h = hlsRef.current as unknown as { _zillaAppendRecov?: boolean } | null;
+                // one plain reconnect first — append races can mimic codec
+                // errors (holes from discontinuity flushes); a fresh MSE
+                // usually clears those
+                if (cur && h && !h._zillaAppendRecov && d.details === 'bufferAppendError') {
+                  h._zillaAppendRecov = true;
+                  showToast('Stream hiccup — reconnecting');
+                  triedRef.current = { chId: cur.id, tried: new Set() };
+                  void loadRef.current(cur);
+                  return;
+                }
+                if (cur) {
+                  if (cur.kind === 'iptv') triedRef.current.tried.add(cur.ref);
+                  const next =
+                    alternatesRef.current.find((a) => a.sameChannel !== false && !triedRef.current.tried.has(a.url)) ||
+                    alternatesRef.current.find((a) => !triedRef.current.tried.has(a.url));
+                  if (next) {
+                    showToast(
+                      next.sameChannel === false
+                        ? `This feed's codec isn't supported here — trying ${next.sourceName}…`
+                        : `Codec not supported here — trying ${next.sourceName}…`
+                    );
+                    void loadRef.current(altPlayable(cur, next), { isAlternate: true });
+                    return;
+                  }
+                }
+                setPhase('error');
+                setErrorMsg("This channel's current feed uses a codec your browser can't decode.");
+                return;
+              }
               // append/codec buffer errors mean the SourceBuffer state itself
               // is corrupted (holes from discontinuity flushes racing in-flight
               // appends) — recoverMediaError cannot clear it. Reload the whole
