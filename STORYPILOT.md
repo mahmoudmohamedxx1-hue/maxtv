@@ -3,7 +3,7 @@
 This repo runs an **hourly automation** on GitHub Actions:
 
 1. **Fetch the story** from the Google Sheet that Gemini Spark updates every hour
-   (fallback: generate a fresh story **keyless** with [`freellmpool`](https://github.com/0xzr/freellmpool), default model `glm-5.3-flash`).
+   (fallback: generate a fresh story **keyless** with [`freellmpool`](https://github.com/0xzr/freellmpool) — GLM Flash first, auto-failover to live keyless routes).
 2. **Render a vertical 1080×1920 MP4** with Edge-TTS voiceover (free, no API keys) + MoviePy + Pillow + arabic-reshaper + python-bidi.
 3. **Post** to YouTube, TikTok and Instagram Reels (each platform activates as soon as you add its secrets).
 
@@ -34,7 +34,7 @@ Add only what you need — every platform is optional and skipped gracefully:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `FLP_MODEL` | `glm-5.3-flash` | Keyless model used by freellmpool |
+| `FLP_MODEL` | `glm-4.7-flash` | Story model tried first by freellmpool (GLM Flash; falls over to live keyless routes, then `auto`) |
 | `SHEET_ID` | the Spark sheet | Google Sheet id with the hourly story |
 | `TTS_VOICE_AR` | `ar-EG-ShakirNeural` | Edge-TTS Arabic voice |
 | `YOUTUBE_PRIVACY` | `public` | `public` / `unlisted` / `private` |
