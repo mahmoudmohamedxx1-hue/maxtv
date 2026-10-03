@@ -24,6 +24,7 @@ CODE_TAB = os.environ.get("CODE_TAB", "كود بايثون - المولد الآ
 USE_AI_STORY = os.environ.get("USE_AI_STORY", "false").lower() in ("1", "true", "yes")
 FLP_MODEL = os.environ.get("FLP_MODEL", "glm-4.7-flash")
 STORY_TOPIC = os.environ.get("STORY_TOPIC", "").strip()
+STORY_JSON = os.environ.get("STORY_JSON", "").strip()
 OUT = os.environ.get("STORY_PATH", "story.json")
 UA = {"User-Agent": "Mozilla/5.0 (compatible; StoryPilotAgent/1.0)"}
 
@@ -214,10 +215,34 @@ def story_from_freellmpool():
     raise ValueError(f"all freellmpool attempts failed ({last_err})")
 
 
+def story_from_payload():
+    """Full story JSON provided by the StoryPilot app (any sheet tab, any format)."""
+    data = json.loads(STORY_JSON)
+    if not data.get("title") or not data.get("scenes"):
+        raise ValueError("payload missing title/scenes")
+    data.setdefault("duration", "60 Seconds")
+    data.setdefault("narration", " ".join(s.get("voiceover", "") for s in data["scenes"]))
+    data["language"] = data.get("language") or detect_language(data["title"] + " " + data["narration"])
+    for i, s in enumerate(data["scenes"], 1):
+        s.setdefault("index", i)
+        s.setdefault("timeRange", f"scene {i}")
+        s.setdefault("visual", "")
+        s.setdefault("aiPrompt", "")
+        s.setdefault("voiceover", "")
+        s.setdefault("sfx", "")
+    return data
+
+
 def main():
     story = None
     source = "none"
-    if not USE_AI_STORY:
+    if STORY_JSON:
+        try:
+            story = story_from_payload()
+            source = "storypilot library payload"
+        except Exception as e:
+            print(f"[story] STORY_JSON invalid ({e}); falling back to sheet", flush=True)
+    if story is None and not USE_AI_STORY:
         try:
             story = story_from_sheet()
             source = "google-sheet (gemini spark hourly)"
@@ -233,7 +258,8 @@ def main():
             source = "built-in fallback"
     with open(OUT, "w", encoding="utf-8") as f:
         json.dump(story, f, ensure_ascii=False, indent=2)
-    save_sheet_code()
+    if source != "storypilot library payload":
+        save_sheet_code()
     print(f"[story] source = {source}", flush=True)
     print(f"[story] '{story.get('title')}' | {len(story.get('scenes', []))} scenes -> {OUT}", flush=True)
 
