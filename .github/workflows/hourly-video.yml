@@ -26,6 +26,16 @@ jobs:
   render-and-post:
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    env:
+      # secrets/vars mapped at job level — step-level if: may only read the env context
+      YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
+      YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
+      YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
+      TIKTOK_ACCESS_TOKEN: ${{ secrets.TIKTOK_ACCESS_TOKEN }}
+      INSTAGRAM_ACCESS_TOKEN: ${{ secrets.INSTAGRAM_ACCESS_TOKEN }}
+      INSTAGRAM_USER_ID: ${{ secrets.INSTAGRAM_USER_ID }}
+      YOUTUBE_PRIVACY: ${{ vars.YOUTUBE_PRIVACY || 'public' }}
+      TIKTOK_PRIVACY: ${{ vars.TIKTOK_PRIVACY || 'SELF_ONLY' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -49,7 +59,7 @@ jobs:
       - name: Prepare story (Google Sheet by Gemini Spark + keyless GLM fallback)
         env:
           SHEET_ID: ${{ vars.SHEET_ID || '1nNsUcwR9foKN_MTPm5bwMR5jz2HUE68UeRqJ0OFp-d4' }}
-          FLP_MODEL: ${{ vars.FLP_MODEL || 'glm-5.3-flash' }}
+          FLP_MODEL: ${{ vars.FLP_MODEL || 'glm-4.7-flash' }}
           USE_AI_STORY: ${{ github.event_name == 'workflow_dispatch' && inputs.use_ai_story || 'false' }}
           STORY_TOPIC: ${{ github.event_name == 'workflow_dispatch' && inputs.topic || '' }}
         run: python scripts/generate_story.py
@@ -70,24 +80,13 @@ jobs:
           if-no-files-found: error
 
       - name: Post to YouTube
-        if: ${{ secrets.YOUTUBE_REFRESH_TOKEN != '' }}
-        env:
-          YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
-          YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
-          YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
-          YOUTUBE_PRIVACY: ${{ vars.YOUTUBE_PRIVACY || 'public' }}
+        if: env.YOUTUBE_REFRESH_TOKEN != ''
         run: python post_video.py --youtube
 
       - name: Post to TikTok
-        if: ${{ secrets.TIKTOK_ACCESS_TOKEN != '' }}
-        env:
-          TIKTOK_ACCESS_TOKEN: ${{ secrets.TIKTOK_ACCESS_TOKEN }}
-          TIKTOK_PRIVACY: ${{ vars.TIKTOK_PRIVACY || 'SELF_ONLY' }}
+        if: env.TIKTOK_ACCESS_TOKEN != ''
         run: python post_video.py --tiktok
 
       - name: Post to Instagram Reels
-        if: ${{ secrets.INSTAGRAM_ACCESS_TOKEN != '' }}
-        env:
-          INSTAGRAM_ACCESS_TOKEN: ${{ secrets.INSTAGRAM_ACCESS_TOKEN }}
-          INSTAGRAM_USER_ID: ${{ secrets.INSTAGRAM_USER_ID }}
+        if: env.INSTAGRAM_ACCESS_TOKEN != ''
         run: python post_video.py --instagram
