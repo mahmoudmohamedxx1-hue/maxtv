@@ -1,0 +1,93 @@
+# StoryPilot - Hourly Story -> MP4 -> YouTube/TikTok/Instagram
+# Deployed by the StoryPilot agent app. Runs every hour on GitHub Actions.
+name: Hourly Story Video
+
+on:
+  schedule:
+    - cron: "0 * * * *" # every hour (UTC)
+  workflow_dispatch:
+    inputs:
+      use_ai_story:
+        description: "Generate a fresh story with keyless GLM (ignore the Sheet)"
+        type: boolean
+        default: false
+      topic:
+        description: "Topic for the AI story (optional)"
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hourly-video
+  cancel-in-progress: false
+
+jobs:
+  render-and-post:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install system deps (ffmpeg + fonts incl. Arabic)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg fonts-dejavu-core fonts-noto-core fonts-noto-ui-core || true
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Prepare story (Google Sheet by Gemini Spark + keyless GLM fallback)
+        env:
+          SHEET_ID: ${{ vars.SHEET_ID || '1nNsUcwR9foKN_MTPm5bwMR5jz2HUE68UeRqJ0OFp-d4' }}
+          FLP_MODEL: ${{ vars.FLP_MODEL || 'glm-5.3-flash' }}
+          USE_AI_STORY: ${{ github.event_name == 'workflow_dispatch' && inputs.use_ai_story || 'false' }}
+          STORY_TOPIC: ${{ github.event_name == 'workflow_dispatch' && inputs.topic || '' }}
+        run: python scripts/generate_story.py
+
+      - name: Render MP4 (Edge-TTS + MoviePy, 1080x1920)
+        env:
+          TTS_VOICE_AR: ${{ vars.TTS_VOICE_AR || 'ar-EG-ShakirNeural' }}
+        run: python generate_video.py
+
+      - name: Upload video artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hourly-video
+          path: |
+            output/output.mp4
+            output/meta.json
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Post to YouTube
+        if: ${{ secrets.YOUTUBE_REFRESH_TOKEN != '' }}
+        env:
+          YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
+          YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
+          YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
+          YOUTUBE_PRIVACY: ${{ vars.YOUTUBE_PRIVACY || 'public' }}
+        run: python post_video.py --youtube
+
+      - name: Post to TikTok
+        if: ${{ secrets.TIKTOK_ACCESS_TOKEN != '' }}
+        env:
+          TIKTOK_ACCESS_TOKEN: ${{ secrets.TIKTOK_ACCESS_TOKEN }}
+          TIKTOK_PRIVACY: ${{ vars.TIKTOK_PRIVACY || 'SELF_ONLY' }}
+        run: python post_video.py --tiktok
+
+      - name: Post to Instagram Reels
+        if: ${{ secrets.INSTAGRAM_ACCESS_TOKEN != '' }}
+        env:
+          INSTAGRAM_ACCESS_TOKEN: ${{ secrets.INSTAGRAM_ACCESS_TOKEN }}
+          INSTAGRAM_USER_ID: ${{ secrets.INSTAGRAM_USER_ID }}
+        run: python post_video.py --instagram
