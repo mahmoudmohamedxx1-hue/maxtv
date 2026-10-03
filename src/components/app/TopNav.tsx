@@ -15,13 +15,13 @@ export type TabId = 'sports' | 'others';
 const NATIVE_QUALITIES = [
   { h: 1080, label: '1080p', hint: 'Full HD' },
   { h: 720, label: '720p', hint: 'HD' },
-  { h: 480, label: '480p', hint: 'default' },
+  { h: 480, label: '480p', hint: '' },
   { h: 360, label: '360p', hint: '' },
 ];
 const SAVER_QUALITIES = [
   { h: 1080, label: '1080p', hint: 'Full HD' },
   { h: 720, label: '720p', hint: 'HD' },
-  { h: 480, label: '480p', hint: 'default' },
+  { h: 480, label: '480p', hint: '' },
   { h: 360, label: '360p', hint: '' },
   { h: 244, label: '244p', hint: '' },
   { h: 144, label: '144p', hint: 'ultra low' },

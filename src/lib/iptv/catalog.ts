@@ -271,12 +271,42 @@ function coreChannelName(n: string): string {
  *  ("beIN Sports MENA English 1" ≡ "beIN Sports 1"). Stripped for matching
  *  only; menu labels keep the full name. */
 const REGION_QUALIFIERS =
-  /\b(arabic|english|mena|usa|us|uk|ksa|qatar|egypt|france|french|germany|german|spain|espanol|español|hispanic|portugal|asia|pacific|america|american|international|premium)\b/gi;
+  /\b(arabic|english|mena|usa|us|uk|ksa|qatar|egypt|france|french|germany|german|spain|espanol|español|hispanic|portugal|asia|pacific|america|american|international|premium|turkey|turkish|australia|malaysia)\b/gi;
 
 function regionalCoreName(n: string): string {
   // strip qualifiers from the RAW name (word boundaries need the spaces),
   // then normalize — "beIN Sports 1 Arabic" → "beinsports1"
   return normalizeChannelName(n.replace(REGION_QUALIFIERS, ' '));
+}
+
+/** Region CLASS of a channel name — which localized variant of the network
+ *  this feed actually is. "beIN Sports 5 Arabic" → 'mena-ar'; the UDPTV
+ *  "Bein Sports 5" (tvg-id …sg, NOW-TV HK artwork) → '' — the Singapore/
+ *  English feed. Two feeds are the SAME channel only when their region
+ *  classes match: a regional twin is a language/content swap, and the
+ *  2026-10-03 field report showed auto-failover hopping beIN 5 Arabic onto
+ *  the unqualified (English) feed when the Arabic CDN id died — "arabic is
+ *  not arabic". Quality rungs share the guard: picking 480p must never
+ *  change the commentary language. */
+const REGION_CLASS_RULES: Array<[RegExp, string]> = [
+  // english FIRST — "MENA English" must classify as english, not mena-arabic
+  [/\benglish\b/i, 'en'],
+  [/\barabic\b|\bmena\b|\b(ksa|qatar|egypt)\b/i, 'mena-ar'],
+  [/\bturk(ey|ish|ce)\b/i, 'tr'],
+  [/\bfrance\b|\bfrench\b/i, 'fr'],
+  [/\baustralia\b/i, 'au'],
+  [/\bmalaysia\b/i, 'my'],
+  [/\busa\b|\bus\b|\bespa[nñ]ol\b|\bhispanic\b|\bamerica(?:n)?\b/i, 'us'],
+  [/\buk\b/i, 'uk'],
+  [/\bgermany\b|\bgerman\b/i, 'de'],
+  [/\bspain\b|\bportugal\b/i, 'es'],
+  [/\basia\b|\bpacific\b/i, 'apac'],
+  [/\bpremium\b/i, 'premium'],
+];
+
+function regionClass(n: string): string {
+  for (const [re, cls] of REGION_CLASS_RULES) if (re.test(n)) return cls;
+  return '';
 }
 
 /** standalone channel numbers of a name ("ESPN 2" → ["2"]). Same channel
@@ -350,6 +380,13 @@ export async function findAlternates(
         channelNumbers(ch.name).join(',') === nums.join(',') &&
         ch.source !== 'bein';
     }
+    // region guard at EVERY tier — a localized twin (Arabic ↔ unqualified/
+    // Singapore ↔ Turkey ↔ France …) is a DIFFERENT channel. Auto-failover
+    // and quality rungs must never silently swap languages (2026-10-03:
+    // "bein 5 arabic is not arabic" — dead premium95 hopped onto the
+    // unqualified English "Bein Sports 5"). Regional twins stay in the
+    // servers menu as manual picks, never automatic ones.
+    if (sameChannel && regionClass(ch.name) !== regionClass(name)) sameChannel = false;
 
     seenUrls.add(ch.url);
     // one menu entry per (source, matched-name) pair — skips "108 X" + "129 X"

@@ -58,3 +58,4 @@ db/
 
 # local-only test harness
 third_party/
+scripts/artifacts/

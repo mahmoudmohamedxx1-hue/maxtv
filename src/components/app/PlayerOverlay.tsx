@@ -1211,7 +1211,7 @@ export function PlayerOverlay() {
       const hls = hlsRef.current;
       if (p.quality === -1) {
         // back to Auto: unpin and leave any auto data-saver rung
-        if (hls && hls.levels?.length && tcHeightRef.current === null) hls.currentLevel = -1;
+        if (hls && hls.levels?.length && tcHeightRef.current === null) hls.nextLevel = -1;
         setCurrentQuality(-1);
         // an EXPLICIT Auto pick exits data-saver; an autoPicked rung stays
         // (the connectivity engine keeps its low-bandwidth choice)
@@ -1226,7 +1226,9 @@ export function PlayerOverlay() {
         idx = below?.i ?? -1;
       }
       if (idx >= 0 && tcHeightRef.current === null) {
-        hls.currentLevel = idx;
+        // smooth switch — nextLevel swaps rung at the next segment boundary
+        // without flushing the live buffer (no stall on a settings pick)
+        hls.nextLevel = idx;
         setCurrentQuality(idx);
       } else if ((DATA_SAVER_HEIGHTS as readonly number[]).includes(p.quality)) {
         // guard: never re-enter for a rung that is ALREADY active (the player
@@ -1650,7 +1652,11 @@ export function PlayerOverlay() {
       }
       const hls = hlsRef.current;
       if (!hls) return;
-      hls.currentLevel = level;
+      // ⚠ nextLevel, not currentLevel: an immediate switch flushes the whole
+      // live buffer and stalls playback ("lags when changing quality") — the
+      // smooth path switches at the next segment boundary as the buffered
+      // window plays out. -1 (Auto) rides the same path back to ABR.
+      hls.nextLevel = level;
       setCurrentQuality(level);
       showToast(level === -1 ? 'Quality: Auto (network-adaptive)' : `Quality: ${label} — saved as your default`);
     },
@@ -2053,9 +2059,6 @@ export function PlayerOverlay() {
                                 {RUNG_HINTS[h] && (
                                   <span className="ml-1.5 text-[9px] font-bold text-zilla-dim">{RUNG_HINTS[h]}</span>
                                 )}
-                                {h === 480 && (
-                                  <span className="ml-1.5 text-[9px] font-bold text-zilla-dim">default</span>
-                                )}
                               </span>
                               <span className="text-[9px] font-bold text-zilla-dim">{ladderAlt.sourceName}</span>
                             </button>
@@ -2098,7 +2101,6 @@ export function PlayerOverlay() {
                               {RUNG_HINTS[h] && (
                                 <span className="ml-1.5 text-[9px] font-bold text-zilla-dim">{RUNG_HINTS[h]}</span>
                               )}
-                              {h === 480 && <span className="ml-1.5 text-[9px] font-bold text-zilla-dim">default</span>}
                             </span>
                             {tcHeight === h && <span>✓</span>}
                           </button>

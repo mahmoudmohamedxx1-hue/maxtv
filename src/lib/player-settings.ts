@@ -23,12 +23,14 @@ export interface PlayerPrefs {
   v?: number;
 }
 
-/** current schema version. v2: 480p becomes the blessed default quality —
- *  stored prefs from v1 are reset to it ONCE so every existing visitor lands
- *  on the “works perfectly” rung; explicit picks made afterwards persist. */
-const PREFS_VERSION = 2;
+/** current schema version. v3: Auto (network-adaptive) becomes the default
+ *  quality — the 2026-10-03 field report ("quality fixed at 408p everywhere,
+ *  I want it to follow my connection speed") showed a pinned default defeats
+ *  the whole point of an adaptive ladder. Stored prefs from v2 are reset to
+ *  Auto ONCE; explicit picks made afterwards persist as before. */
+const PREFS_VERSION = 3;
 
-const DEFAULTS: PlayerPrefs = { volume: 0.9, muted: true, quality: 480, autoAdvance: true, perfMode: 'fast', v: PREFS_VERSION };
+const DEFAULTS: PlayerPrefs = { volume: 0.9, muted: true, quality: -1, autoAdvance: true, perfMode: 'fast', v: PREFS_VERSION };
 
 const EVT = 'maxtv-prefs';
 
@@ -38,13 +40,13 @@ export function loadPrefs(): PlayerPrefs {
     const raw = window.localStorage.getItem(PLAYER_PREFS_KEY);
     if (raw) {
       const p = JSON.parse(raw) as Partial<PlayerPrefs>;
-      let q = typeof p.quality === 'number' ? p.quality : 480;
+      let q = typeof p.quality === 'number' ? p.quality : -1;
       // legacy 240p data-saver pref → the new 244p rung
       if (q === 240) q = 244;
       const migrated =
         typeof p.v === 'number' && p.v >= PREFS_VERSION
           ? { ...DEFAULTS, ...p, quality: q, v: PREFS_VERSION }
-          : { ...DEFAULTS, ...p, quality: 480, v: PREFS_VERSION }; // v1 → v2: 480p is the new default
+          : { ...DEFAULTS, ...p, quality: -1, v: PREFS_VERSION }; // v≤2 → v3: Auto is the new default
       const needsMigration = typeof p.v !== 'number' || p.v < PREFS_VERSION;
       if (needsMigration) {
         // persist the migration immediately (plain setItem — no prefs event:
