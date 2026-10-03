@@ -230,12 +230,12 @@ export function TopNav({
               >
                 <span>
                   Auto
-                  <span className="ml-1.5 text-[9px] font-bold text-zilla-dim">network-adaptive</span>
+                  <span className="ml-1.5 text-[9px] font-bold text-zilla-dim">most stable</span>
                 </span>
                 {prefs?.quality === -1 && <span>✓</span>}
               </button>
               <p className="px-4 pb-2 text-[10px] font-medium leading-snug text-zilla-dim">
-                Picks the best quality your connection can hold and follows it as it changes.
+                Picks the most stable quality for your connection — starts safe, climbs when the link proves it, drops on stalls.
               </p>
               {NATIVE_QUALITIES.map((q) => (
                 <button

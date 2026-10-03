@@ -470,11 +470,55 @@ export function PlayerOverlay() {
    * native ladder AND the data-saver transcodes. (It used to live only on
    * the native hls instance, which attachSource destroys when data-saver
    * engages — so the "connection improved → back to native" recovery could
-   * never fire while transcoding.) */
+   * never fire while transcoding.)
+   *
+   * 2026-10-03 field report ("auto quality isn't working well — I want the
+   * most STABLE stream for my connection") hardened this into three rules:
+   *   1. sticky ABR cap — autoLevelCapping only moves on SUSTAINED evidence
+   *      (6 good frags to raise, 3 bad to lower), so the CDN's latency flaps
+   *      can't thrash the rung up/down every 10s. Raising is also rate-limited.
+   *   2. stall downshift — a bufferStalledError drops the cap one rung below
+   *      whatever is playing RIGHT NOW (rate-limited 12s). Stability first.
+   *   3. starvation rung hop — on single-rendition feeds (most DaddyLive
+   *      channels: one 408p variant, nothing for ABR to choose), 8
+   *      consecutive frags (~40s+) measured BELOW 85% of the stream's own
+   *      bitrate means the link truly can't hold the native feed → hop to
+   *      the transcoded rung that fits the measured estimate. */
   const attachNetWatcher = (hls: Hls) => {
     let seen = 0; // per-instance fragment count — skip the EWMA warm-up window
-    hls.on(Hls.Events.FRAG_BUFFERED, () => {
+    // sticky-cap state (per hls instance)
+    let capIdx = -1; // current autoLevelCapping (-1 = uncapped)
+    let lastCapChange = 0;
+    let aboveRun = 0; // consecutive frags whose sustainable target exceeds the cap
+    let belowRun = 0; // … falls short of the cap
+    let streamBr = 0; // EWMA of the stream's OWN bitrate (segment bytes/duration)
+    let starveRun = 0; // consecutive frags with est < 85% of streamBr
+
+    /** levels sorted by bitrate → {index, bitrate}; empty when unknown */
+    const levelsByRate = () =>
+      (hls.levels || [])
+        .map((l, i) => ({ i, b: l.bitrate || 0 }))
+        .filter((x) => x.b > 0)
+        .sort((a, b) => a.b - b.b);
+
+    const applyCap = (idx: number) => {
+      if (idx === capIdx) return;
+      // raising is rate-limited (12s) — stability over eagerness; lowering is instant
+      if (idx > capIdx && Date.now() - lastCapChange < 12_000) return;
+      capIdx = idx;
+      lastCapChange = Date.now();
+      hls.autoLevelCapping = idx;
+    };
+
+    hls.on(Hls.Events.FRAG_BUFFERED, (_e, d) => {
       seen++;
+      // the stream's own bitrate from real segment payloads (bps)
+      const bytes = (d.frag?.stats?.total as number) || 0;
+      const dur = (d.frag?.duration as number) || 0;
+      if (bytes > 0 && dur > 0) {
+        const br = (bytes * 8) / dur;
+        streamBr = streamBr ? streamBr * 0.7 + br * 0.3 : br;
+      }
       if (seen <= 3) return; // fresh instance: bandwidthEstimate is still seeding
       const p = loadPrefs();
       if (p.quality !== -1) return; // manual mode — user is in charge
@@ -517,6 +561,55 @@ export function PlayerOverlay() {
         return;
       }
 
+      // native mode, single rendition (most DaddyLive channels): nothing for
+      // ABR to pick between — the only stable option is the transcode rung
+      // that fits the measured link. Sustained starvation only (8 frags ≈
+      // 40s+; CDN flaps are 10-20s and never qualify).
+      if ((hls.levels || []).length < 2 && streamBr > 0) {
+        starveRun = est < streamBr * 0.85 ? starveRun + 1 : 0;
+        if (starveRun >= 8 && canTc) {
+          const rung = est < 350_000 ? 144 : est < 700_000 ? 244 : est < 1_200_000 ? 360 : 480;
+          const nativeH = nativeHeightRef.current || 0;
+          // a rung at/above the native height gains nothing (never encode up)
+          if (nativeH === 0 || rung < nativeH - 30) {
+            showToast(`Slow connection — switching to ${rung}p for stability`);
+            starveRun = 0;
+            net.lows = 0;
+            void selectDataSaverRef.current?.(rung, { auto: true });
+            return;
+          }
+        }
+      }
+
+      // native mode, real ladder: the sticky ABR cap. Target = the highest
+      // rung the measured link holds with ~30% headroom.
+      if ((hls.levels || []).length > 1 && hls.autoLevelEnabled) {
+        const sorted = levelsByRate();
+        if (sorted.length > 1) {
+          let target = sorted[0].i;
+          for (const s of sorted) if (s.b <= est * 0.7) target = s.i;
+          const curCap = capIdx === -1 ? Number.MAX_SAFE_INTEGER : capIdx;
+          if (target > curCap) {
+            aboveRun++;
+            belowRun = 0;
+            if (aboveRun >= 6) {
+              applyCap(target);
+              aboveRun = 0;
+            }
+          } else if (target < curCap) {
+            belowRun++;
+            aboveRun = 0;
+            if (belowRun >= 3) {
+              applyCap(target);
+              belowRun = 0;
+            }
+          } else {
+            aboveRun = 0;
+            belowRun = 0;
+          }
+        }
+      }
+
       // native mode: only a SUSTAINED, genuinely starved link hops down to a
       // transcoded rung (6 consecutive low estimates ≈ 30s+ of real slowness —
       // CDN flaps never qualify)
@@ -526,6 +619,21 @@ export function PlayerOverlay() {
         showToast(`Slow connection — switching to ${rung}p data saver`);
         net.lows = 0;
         void selectDataSaverRef.current?.(rung, { auto: true });
+      }
+    });
+
+    // stability rule 2: a stall drops the cap one rung below what's playing.
+    // Repeated stalls keep stepping down (applyCap dedupes) — stability first;
+    // recovery up is the sticky-cap raise rule's job once the link measures good.
+    hls.on(Hls.Events.ERROR, (_e, d) => {
+      if (d.details !== 'bufferStalledError') return;
+      if (loadPrefs().quality !== -1) return; // manual mode — user is in charge
+      if (tcHeightRef.current !== null) return; // data-saver rung already active
+      if ((hls.levels || []).length > 1 && hls.autoLevelEnabled) {
+        const sorted = levelsByRate();
+        const playing = hls.currentLevel >= 0 ? hls.currentLevel : hls.loadLevel;
+        const pos = sorted.findIndex((s) => s.i === playing);
+        if (pos > 0) applyCap(sorted[pos - 1].i);
       }
     });
   };
@@ -716,7 +824,12 @@ export function PlayerOverlay() {
 
         if (Hls.isSupported()) {
           // seed ABR with the browser's connection estimate so Auto starts on a
-          // rung the link can actually sustain (instead of overshoot + stall)
+          // rung the link can actually sustain (instead of overshoot + stall).
+          // ⚠ the seed is 75% of the estimate and the start rung is picked from
+          // 60% of the budget: navigator.connection.downlink over-reports on
+          // flaky mobile links, and an overshooting START is exactly the
+          // "isn't working well" stall users see — better to open one rung low
+          // and let sustained measurements climb (the sticky-cap raise rule).
           const budget = connectionBudget();
           const hls = new Hls({
             // ⚠ lowLatencyMode MUST be false: with it on, hls.js's
@@ -730,7 +843,7 @@ export function PlayerOverlay() {
             startFragPrefetch: true,
             ...hlsPerfConfig(loadPrefs().perfMode),
             ...RESILIENT_LOAD_POLICIES,
-            ...(budget > 0 ? { abrEwmaDefaultEstimate: budget } : {}),
+            ...(budget > 0 ? { abrEwmaDefaultEstimate: Math.max(400_000, budget * 0.75) } : {}),
           });
           hlsRef.current = hls;
           // TEMP DEBUG — expose the live hls instance for E2E inspection
@@ -759,11 +872,14 @@ export function PlayerOverlay() {
             const canTc = (ch.kind === 'daddylive' || !!tcSrcRef.current) && tcCapRef.current;
 
             if (prefH === -1) {
-              // AUTO — connectivity-chosen: start at the best rung the measured
-              // link can hold, then let hls.js ABR adapt up/down on its own
+              // AUTO — connectivity-chosen: open on the best rung a
+              // CONSERVATIVE 60% of the estimated link can hold (the estimate
+              // over-reports; overshoot = the opening stall), then let the
+              // sticky-cap rules adapt up on sustained good measurements.
               setCurrentQuality(-1);
               if (budget > 0 && hls.levels?.length) {
-                const cap = budget < 500_000 ? 244 : budget < 900_000 ? 360 : budget < 1_800_000 ? 480 : budget < 3_500_000 ? 720 : 1080;
+                const safe = budget * 0.6;
+                const cap = safe < 350_000 ? 144 : safe < 500_000 ? 244 : safe < 750_000 ? 360 : safe < 1_400_000 ? 480 : safe < 2_800_000 ? 720 : 1080;
                 let target = 0;
                 for (let i = 0; i < hls.levels.length; i++) {
                   const lh = hls.levels[i].height || 0;
@@ -1647,7 +1763,7 @@ export function PlayerOverlay() {
           setPhase('loading');
           attachSource(src, level >= 0 ? level : undefined);
         }
-        showToast(level === -1 ? 'Quality: Auto (network-adaptive)' : `Quality: ${label} — saved as your default`);
+        showToast(level === -1 ? 'Quality: Auto — most stable for your connection' : `Quality: ${label} — saved as your default`);
         return;
       }
       const hls = hlsRef.current;
@@ -1658,7 +1774,7 @@ export function PlayerOverlay() {
       // window plays out. -1 (Auto) rides the same path back to ABR.
       hls.nextLevel = level;
       setCurrentQuality(level);
-      showToast(level === -1 ? 'Quality: Auto (network-adaptive)' : `Quality: ${label} — saved as your default`);
+      showToast(level === -1 ? 'Quality: Auto — most stable for your connection' : `Quality: ${label} — saved as your default`);
     },
     [quality, showToast, tcHeight, attachSource]
   );
@@ -2019,7 +2135,8 @@ export function PlayerOverlay() {
                       Auto {currentQuality === -1 && tcHeight === null && <span>✓</span>}
                     </button>
                     <p className="px-3.5 pb-1.5 text-[10px] font-medium leading-snug text-zilla-dim">
-                      Network-adaptive — chosen from your connection, adjusts as it changes.
+                      Picks the most stable quality for your connection — starts safe, climbs when the
+                      link proves it can hold more, drops instantly on stalls.
                     </p>
                     {quality.map((q) => (
                       <button

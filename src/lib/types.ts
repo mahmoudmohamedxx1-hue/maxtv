@@ -56,6 +56,12 @@ export interface SportsMatch {
   channels: SportsChannelRef[];
   /** Day header the event was listed under */
   day: string;
+  /** women's competition (WSL, NWSL, Frauen-Bundesliga, Serie A Femminile …).
+   *  Field report 2026-10-03: a WSL "Manchester United vs Liverpool" listing
+   *  read as the MEN'S derby — "there is no match at that time in real
+   *  fixtures" — because nothing on the card said it was the women's match.
+   *  This flag drives an unmissable WOMEN'S badge on every card. */
+  women?: boolean;
 }
 
 export interface ResolvedStream {

@@ -229,7 +229,7 @@ export function SportsTab({
       onPlayChannel(
         {
           id: `dl_${chId}`,
-          name: `${m.title} — ${chName}`,
+          name: `${m.title}${m.women ? " (Women's)" : ''} — ${chName}`,
           kind: 'daddylive',
           ref: chId,
           source: m.league,
@@ -292,10 +292,10 @@ export function SportsTab({
             onPlayChannel(
               {
                 id: `dl_${chId}`,
-                name: chName,
+                name: m?.women ? `${chName} · Women's` : chName,
                 kind: 'daddylive',
                 ref: chId,
-                source: 'DaddyLive',
+                source: m?.league || 'DaddyLive',
                 logo,
               },
               feeds.map((c) => ({

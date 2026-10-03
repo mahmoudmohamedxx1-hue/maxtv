@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { cn } from '@/lib/utils';
 import { logoSrc } from './ChannelCard';
-import type { MatchCardData } from './MatchCard';
+import { WomensBadge, type MatchCardData } from './MatchCard';
 
 /** Deterministic hero backdrop gradient per event */
 function heroGradient(title: string): string {
@@ -227,6 +227,7 @@ export function HeroBanner({
               )}
               {m.league}
             </span>
+            {m.women && <WomensBadge />}
             <span className="text-[11px] font-bold uppercase tracking-widest text-zilla-dim">
               {m.channels.length} streams available
             </span>

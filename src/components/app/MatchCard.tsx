@@ -21,6 +21,9 @@ export interface MatchCardData {
   team2Logo?: string;
   leagueLogo?: string;
   channelLogo?: string;
+  /** women's competition — drives the unmissable WOMEN'S badge so a WSL
+   *  "Manchester United vs Liverpool" never reads as the men's derby */
+  women?: boolean;
 }
 
 const SPORT_ICON: Record<string, string> = {
@@ -72,6 +75,22 @@ function Crest({ logo, name, size = 'md' }: { logo?: string; name: string; size?
       onError={() => setOk(false)}
       className={cn('shrink-0 rounded-full object-contain drop-shadow-lg', dim)}
     />
+  );
+}
+
+/** women's-competition chip — fuchsia so it can't be missed against the
+ *  yellow/red live UI. "Manchester United vs Liverpool" on a WSL listing
+ *  must never read as the men's derby again. */
+export function WomensBadge({ compact = false }: { compact?: boolean }) {
+  return (
+    <span
+      className={cn(
+        'inline-flex items-center rounded-md border border-fuchsia-400/40 bg-fuchsia-500/20 font-black uppercase tracking-wider text-fuchsia-300',
+        compact ? 'px-1.5 py-0.5 text-[9px]' : 'px-2 py-0.5 text-[10px]'
+      )}
+    >
+      Women&rsquo;s
+    </span>
   );
 }
 
@@ -134,6 +153,7 @@ export function MatchCard({
           <span className="text-zilla-dim">{SPORT_ICON[match.category] || '📡'}</span>
         </span>
         <span className="flex max-w-[55%] items-center gap-1.5">
+          {match.women && <WomensBadge compact />}
           {match.leagueLogo && (
             <img
               src={logoSrc(match.leagueLogo, match.league)}
@@ -158,9 +178,12 @@ export function MatchCard({
                 {match.team1 || vs[0]}
               </p>
             </div>
-            <span className="shrink-0 self-center rounded-md bg-zilla-line px-2 py-1 text-[10px] font-black uppercase text-zilla-dim">
-              vs
-            </span>
+            <div className="flex shrink-0 flex-col items-center gap-1.5">
+              <span className="rounded-md bg-zilla-line px-2 py-1 text-[10px] font-black uppercase text-zilla-dim">
+                vs
+              </span>
+              {match.women && <WomensBadge compact />}
+            </div>
             <div className="flex min-w-0 flex-1 flex-col items-center gap-1.5 text-center">
               <Crest logo={match.team2Logo} name={match.team2 || vs[1]} />
               <p className="line-clamp-2 text-xs font-extrabold leading-tight text-zilla-text">

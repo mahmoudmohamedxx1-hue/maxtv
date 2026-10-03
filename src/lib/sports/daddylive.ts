@@ -173,6 +173,18 @@ const DURATIONS: Record<string, number> = {
 };
 
 // ─── schedule scraping ───────────────────────────────────────────────────────
+
+/** Women's-competition detector — accent-normalized so "Féminine",
+ *  "Femenina", "Femenil" and "Frauen-Bundesliga" all match. Drives the
+ *  WOMEN'S badge (see SportsMatch.women). Bare "WSL" is deliberately NOT
+ *  matched — the World Surf League uses the same abbreviation. */
+const WOMENS_RE =
+  /\bwomen|women's|femin|femen|frauen|nwsl|wnba|damallsvenskan|kvinner|w-league|liga f\b/i;
+function isWomensCompetition(hay: string): boolean {
+  const flat = hay.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+  return WOMENS_RE.test(flat);
+}
+
 async function fetchScheduleUncached(): Promise<SportsMatch[]> {
   let html: string | null = null;
   for (const base of MIRRORS) {
@@ -313,6 +325,7 @@ export function parseScheduleHtml(html: string): SportsMatch[] {
           status: now >= matchTime && now <= matchTime + maxDuration ? 'live' : 'upcoming',
           channels,
           day: dayTitle,
+          women: isWomensCompetition(`${league} ${cleanCat}`),
         });
       });
     });

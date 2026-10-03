@@ -3,7 +3,7 @@
 import { useEffect, useState } from 'react';
 import { cn } from '@/lib/utils';
 import { logoSrc } from './ChannelCard';
-import type { MatchCardData } from './MatchCard';
+import { WomensBadge, type MatchCardData } from './MatchCard';
 
 /** shared 30s clock so every countdown updates together without spamming renders */
 function useTick(ms = 30_000) {
@@ -101,6 +101,7 @@ export function BigMatchCard({
           <span className="truncate text-[12px] font-black uppercase tracking-wider text-zilla-yellow">
             {match.league}
           </span>
+          {match.women && <WomensBadge />}
         </span>
         {isLive ? (
           <span className="inline-flex shrink-0 items-center gap-1 rounded-md bg-zilla-red px-2 py-0.5 text-[10px] font-black uppercase text-white">
@@ -130,6 +131,7 @@ export function BigMatchCard({
           <span className="rounded-lg bg-zilla-line px-2.5 py-1 text-[10px] font-black uppercase text-zilla-dim">
             vs
           </span>
+          {match.women && <WomensBadge />}
           {!isLive && (
             <span className="text-center text-[10px] font-bold leading-tight text-zilla-dim">
               {dayLabel(match.startTime)}
