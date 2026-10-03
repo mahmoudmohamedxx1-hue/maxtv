@@ -14,6 +14,10 @@ on:
       topic:
         description: "Topic for the AI story (optional)"
         default: ""
+      story_json:
+        description: "Full story JSON from the StoryPilot library (skips sheet parsing)"
+        default: ""
+        type: string
 
 permissions:
   contents: read
@@ -62,6 +66,7 @@ jobs:
           FLP_MODEL: ${{ vars.FLP_MODEL || 'glm-4.7-flash' }}
           USE_AI_STORY: ${{ github.event_name == 'workflow_dispatch' && inputs.use_ai_story || 'false' }}
           STORY_TOPIC: ${{ github.event_name == 'workflow_dispatch' && inputs.topic || '' }}
+          STORY_JSON: ${{ github.event_name == 'workflow_dispatch' && inputs.story_json || '' }}
         run: python scripts/generate_story.py
 
       - name: Render MP4 (Edge-TTS + MoviePy, 1080x1920)
