@@ -40,7 +40,11 @@
 import { resolveDaddyLiveStream } from '@/lib/sports/daddylive';
 import { unwrapSegment } from './uncloak';
 import { UA } from './resolve';
-import { ffmpegAbsent } from './ffmpeg-cap';
+import { ffmpegAbsent, ffmpegExecutable, SERVERLESS } from './ffmpeg-cap';
+import { spawn } from 'child_process';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 
 const MAX_SESSIONS = 6;
 const IDLE_KILL_MS = 45_000;
@@ -172,9 +176,13 @@ export class TurboSession {
     return this.codecSafe === false;
   }
 
-  /** serve browser-unsafe segments through to capable browsers (no relay) */
+  /** serve browser-unsafe segments through to capable browsers (no relay).
+   *  2026-10-03: also true on SERVERLESS even when the bundled binary exists —
+   *  the continuous /api/live relay can't survive isolate freezes, so an
+   *  HEVC phase serves through natively; incapable browsers get the explicit
+   *  HEVC panel (with the new "play converted" segment-ladder option). */
   private get serveUnsafe(): boolean {
-    return this.hevcFromStart && ffmpegAbsent() === true;
+    return this.hevcFromStart && (SERVERLESS || ffmpegAbsent() === true);
   }
 
   /**
@@ -221,12 +229,27 @@ export class TurboSession {
    *  bytes only a warm instance cached). When upstream has just flapped, the
    *  margin lifts and the deep cache becomes servable again — that runway
    *  is what rides out CDN flaps in the first place. */
-  private windowRange(): { base: number; list: { sn: number; seg: SegData }[] } | null {
+  private windowRange(forceUnsafe = false): { base: number; list: { sn: number; seg: SegData }[] } | null {
     const n = this.windowSns.length;
     if (!n) return null;
-    const allowUnsafe = this.serveUnsafe;
+    const allowUnsafe = forceUnsafe || this.serveUnsafe;
     const upstreamLive = this.lastParseAt > 0 && Date.now() - this.lastParseAt < 15_000;
-    const hopFloor = upstreamLive && this.lastUpFloor > 0 ? this.lastUpFloor + 1 : 0;
+    // CROSS-INSTANCE DRIFT MARGIN (native): never serve below upstream's
+    // current floor + 1 — those sns are still listed upstream, so ANY
+    // instance can on-demand fetch them.
+    // &h= LADDER (forceUnsafe): transcoded segments are per-instance caches
+    // ANYWAY (a cold instance re-transcodes from raw bytes it can fetch) —
+    // but the transcode latency (~1.5-4s/segment) means the player rides
+    // several segments behind the edge, and a shallow sliding window jumps
+    // out from under it (measured: buffer [6,12] while the 3-deep window
+    // slid past → total stall). Serve DEEPER — 6 below the upstream floor
+    // from the local cache — so the slow ladder has runway. An instance hop
+    // below the floor 404s and hls.js skip-aheads, same as native.
+    const hopFloor = upstreamLive && this.lastUpFloor > 0
+      ? forceUnsafe
+        ? Math.max(this.newestSn - KEEP + 2, this.lastUpFloor - 6)
+        : this.lastUpFloor + 1
+      : 0;
     const list: { sn: number; seg: SegData }[] = [];
     let i = n - 1;
     let expect = this.windowSns[i];
@@ -245,9 +268,11 @@ export class TurboSession {
 
   /** Build the served playlist. Segment lines are `t<upSn>.ts`; the route
    *  rewrites them to /api/turbo URLs. MEDIA-SEQUENCE = oldest served sn —
-   *  derived purely from upstream state, so every instance agrees on it. */
-  readPlaylist(): string | null {
-    const w = this.windowRange();
+   *  derived purely from upstream state, so every instance agrees on it.
+   *  `tcHeight` (data-saver ladder): list ALL segments — the per-segment
+   *  transcode re-encodes even browser-unsafe (HEVC) ones to clean h264. */
+  readPlaylist(tcHeight?: number): string | null {
+    const w = this.windowRange(tcHeight !== undefined);
     if (!w) return null;
     const maxDur = Math.max(4, ...w.list.map((x) => x.seg.dur));
     const out: string[] = [
@@ -305,6 +330,93 @@ export class TurboSession {
       }
     }
     return null;
+  }
+
+  // ── per-segment transcode ladder (the serverless data-saver) ────────────
+
+  /** transcoded segment cache — key `${sn}:${h}` (bounded, LRU by sn order) */
+  private readonly tcSegs = new Map<string, Uint8Array>();
+  /** last fire-and-forget warm for a height — throttles the after() warm so
+   *  playlist poll bursts can't pile transcodes onto the CPU */
+  private readonly tcWarmAt = new Map<number, number>();
+
+  /** Serve one segment re-encoded to `h` pixels tall (h264+AAC, browser-safe
+   *  even when the source is in an HEVC phase). One-shot ffmpeg per segment
+   *  — the only transcode shape that works on serverless (each invocation
+   *  fetches + converts one bounded segment and returns). IN-FLIGHT DEDUPE:
+   *  a concurrent warm + player request for the same segment share ONE
+   *  promise (the "switch quality → buffering → channel death" fix: warm
+   *  tasks used to flood both transcode slots and starve the player's own
+   *  segment loads). Falls back to the ORIGINAL bytes when the binary is
+   *  missing/crashes — an h264 source keeps playing (just full-size); an
+   *  HEVC source surfaces the player's codec ladder instead of a hard 404. */
+  getTranscodedSegment(n: number, h: number): Promise<Uint8Array | null> {
+    const key = `${this.key}|${n}:${h}`;
+    const hit = this.tcSegs.get(`${n}:${h}`);
+    if (hit) return Promise.resolve(hit);
+    const inflight = tcInflight.get(key);
+    if (inflight) return inflight;
+    const p = (async () => {
+      const raw = await this.getSegment(n);
+      if (!raw) return null;
+      const out = await transcodeSegment(raw, h, true); // player-facing: priority
+      if (!out) return raw; // graceful: original bytes beat a 404
+      this.tcSegs.set(`${n}:${h}`, out);
+      if (this.tcSegs.size > 64) {
+        const it = this.tcSegs.keys();
+        for (let i = 0; i < 24; i++) {
+          const v = it.next();
+          if (v.done) break;
+          this.tcSegs.delete(v.value);
+        }
+      }
+      return out;
+    })().finally(() => tcInflight.delete(key));
+    tcInflight.set(key, p);
+    return p;
+  }
+
+  /** fire-and-forget warm of the newest segments at `h` — after serving an
+   *  &h= playlist, so the first segment requests hit warm bytes when the
+   *  isolate stays alive long enough (local/self-hosted; on Vercel the
+   *  after() callback keeps the invocation alive for it). THROTTLED to one
+   *  batch per 2s and deduped against in-flight transcodes so poll bursts
+   * can't starve the player (priority stays with player-facing requests). */
+  warmTranscodes(h: number, count = 2): void {
+    const now = Date.now();
+    const last = this.tcWarmAt.get(h) || 0;
+    if (now - last < 2_000) return;
+    this.tcWarmAt.set(h, now);
+    const w = this.windowRange(true);
+    if (!w) return;
+    const sns = w.list.slice(-count).map((x) => x.sn);
+    for (const sn of sns) {
+      const key = `${this.key}|${sn}:${h}`;
+      if (this.tcSegs.has(`${sn}:${h}`) || tcInflight.has(key)) continue;
+      const p = (async () => {
+        const raw = await this.getSegment(sn);
+        if (!raw) return null;
+        const out = await transcodeSegment(raw, h, false); // warm: low priority
+        if (out) this.tcSegs.set(`${sn}:${h}`, out);
+        return out;
+      })().finally(() => tcInflight.delete(key));
+      tcInflight.set(key, p);
+      void p.catch(() => {});
+    }
+  }
+
+  /** wait until a servable window exists for the transcode ladder — unlike
+   *  waitReady, codec safety is IRRELEVANT (unsafe segments get converted),
+   *  so an HEVC-from-start feed is immediately usable at &h=. */
+  async waitReadyTC(timeoutMs = 7_000): Promise<boolean> {
+    const t0 = Date.now();
+    for (;;) {
+      if (this.dead) return false;
+      const w = this.windowRange(true);
+      if (w && w.list.length >= 1) return true;
+      if (Date.now() - t0 >= timeoutMs) return !!w;
+      await this.kick(600);
+    }
   }
 
   // ── upstream engine ────────────────────────────────────────────────────────
@@ -543,6 +655,112 @@ export class TurboSession {
     if (this.timer) clearInterval(this.timer);
     SESSIONS.delete(this.key);
     if (reason) console.warn(`[turbo] session ${this.key} stopped: ${reason.message}`);
+  }
+}
+
+// ── per-segment one-shot transcode (serverless data-saver ladder) ───────────
+// Runs the build-time static ffmpeg (BtbN n8.1) once per segment: bounded
+// input (≤25s), tmp files in os.tmpdir() (writable on lambdas), concurrency
+// capped at 2 so a burst of segment requests can't fork-bomb a 1-vCPU
+// isolate. Benchmarks (2026-10-03): h264 720p → 360p ≈ 1.9s per 10s segment,
+// HEVC 1080p → 480p ≈ 4.8s per 10s segment — comfortably inside the 5s
+// TARGETDURATION budget at ≤480p.
+
+/** in-flight transcodes (dedupe: one promise per session|sn|height — a warm
+ *  task and the player's request for the same segment share it) */
+const tcInflight = new Map<string, Promise<Uint8Array | null>>();
+
+/** heights the serverless segment ladder offers (720/1080 stay native —
+ *  encoding them costs more wall-time than a segment lasts) */
+export const SEG_LADDER_HEIGHTS = [144, 244, 360, 480] as const;
+
+const TC_TIMEOUT_MS = 25_000;
+const TC_MAX_CONCURRENT = 2;
+let tcActive = 0;
+/** waiters for a transcode slot — PLAYER-FACING requests unshift (they get
+ *  the next free slot); warm tasks append. Without the priority split the
+ *  after() warm batches flooded both slots and the player's own segment
+ *  loads queued behind them until hls.js timed out and the channel died. */
+const tcQueue: Array<{ resolve: () => void; priority: boolean }> = [];
+
+async function tcSlot(priority: boolean): Promise<() => void> {
+  while (tcActive >= TC_MAX_CONCURRENT || (priority && tcQueue.some((w) => w.priority))) {
+    if (priority) {
+      // don't let two player requests queue-jump each other — keep order
+      // among priorities, but always ahead of warm tasks
+      const warmIdx = tcQueue.findIndex((w) => !w.priority);
+      const mine = { resolve: () => {}, priority };
+      if (warmIdx === -1) await new Promise<void>((r) => { mine.resolve = r; tcQueue.push(mine); });
+      else await new Promise<void>((r) => { mine.resolve = r; tcQueue.splice(warmIdx, 0, mine); });
+    } else {
+      await new Promise<void>((r) => tcQueue.push({ resolve: r, priority }));
+    }
+  }
+  tcActive++;
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    tcActive--;
+    tcQueue.shift()?.resolve();
+  };
+}
+
+/** one-shot ffmpeg: TS bytes in → scaled h264 TS bytes out (null on failure).
+ *  `priority` marks a player-facing request (slot queue front). */
+async function transcodeSegment(ts: Uint8Array, h: number, priority: boolean): Promise<Uint8Array | null> {
+  const exe = ffmpegExecutable();
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'maxtv-tc-'));
+  const inPath = path.join(dir, 'in.ts');
+  const outPath = path.join(dir, 'out.ts');
+  try {
+    fs.writeFileSync(inPath, ts);
+    const release = await tcSlot(priority);
+    try {
+      await new Promise<void>((res, rej) => {
+        const p = spawn(
+          exe,
+          [
+            '-hide_banner', '-loglevel', 'error', '-y',
+            '-i', inPath,
+            // ⚠ -copyts — CRITICAL: preserve the source's CONTINUOUS
+            // timestamps. Each segment is transcoded in its own one-shot
+            // process; without copyts every output restarts its PTS at ~1.4s,
+            // so consecutive segments carry IDENTICAL timestamps — the MSE
+            // appends collide and playback freezes a couple of segments in
+            // (measured: buffer [6,12] forever while the window slid on).
+            // With copyts the provider's encoder clock passes through and
+            // consecutive segments stay monotonic.
+            '-copyts',
+            '-vf', `scale=-2:${h}`,
+            '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '28', '-pix_fmt', 'yuv420p',
+            '-c:a', 'aac', '-b:a', '96k', '-ac', '2',
+            '-f', 'mpegts', outPath,
+          ],
+          { stdio: 'ignore' }
+        );
+        const t = setTimeout(() => {
+          p.kill('SIGKILL');
+          rej(new Error('transcode timeout'));
+        }, TC_TIMEOUT_MS);
+        p.on('error', (e) => {
+          clearTimeout(t);
+          rej(e);
+        });
+        p.on('close', (code) => {
+          clearTimeout(t);
+          code === 0 ? res() : rej(new Error(`ffmpeg exit ${code}`));
+        });
+      });
+      const out = fs.readFileSync(outPath);
+      return out.length >= 188 ? new Uint8Array(out) : null;
+    } finally {
+      release();
+    }
+  } catch {
+    return null;
+  } finally {
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ }
   }
 }
 

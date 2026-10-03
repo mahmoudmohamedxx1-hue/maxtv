@@ -1,7 +1,7 @@
 {
   "name": "maxtv",
   "version": "1.0.0",
-  "description": "Live sports & free IPTV — a self-hosted, Pluto TV–style streaming experience with a multi-transport HLS engine, real-time quality ladder and network-adaptive playback.",
+  "description": "Live sports & free IPTV \u2014 a self-hosted, Pluto TV\u2013style streaming experience with a multi-transport HLS engine, real-time quality ladder and network-adaptive playback.",
   "keywords": [
     "iptv",
     "hls",
@@ -19,7 +19,7 @@
   },
   "scripts": {
     "dev": "next dev -p 3000",
-    "build": "next build && cp -r .next/static .next/standalone/.next/ && cp -r public .next/standalone/ && cp -r data .next/standalone/",
+    "build": "bash scripts/fetch-ffmpeg.sh && next build && cp -r .next/static .next/standalone/.next/ && cp -r public .next/standalone/ && cp -r data .next/standalone/ && (cp -r third_party .next/standalone/ 2>/dev/null || true)",
     "start": "NODE_ENV=production node .next/standalone/server.js",
     "lint": "eslint ."
   },

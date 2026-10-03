@@ -150,16 +150,24 @@ function fmtAgo(ts: number): string {
   return `started ${h}h ${m % 60}m ago`;
 }
 
-/** Does THIS deployment have the data-saver (transcode) ladder? Serverless
- *  hosts (Vercel…) ship no ffmpeg → false. Cached for the page lifetime;
- *  fail-open so a network hiccup can't needlessly hide the ladder. */
-let tcCapPromise: Promise<boolean> | null = null;
-function probeTcCap(): Promise<boolean> {
+/** Does THIS deployment have the data-saver ladder? Two flavors, probed on
+ *  mount via /api/turbo?mode=cap:
+ *    cap — continuous /api/live relay (self-hosted PATH ffmpeg)
+ *    seg — per-segment &h= ladder via the bundled static binary (works on
+ *          serverless — the "qualities don't work" fix for single-rendition
+ *          DaddyLive channels incl. every beIN)
+ *  Fail-open until the answer lands; the 503-bounce in attachSource covers
+ *  the gap. */
+let tcCapPromise: Promise<{ cap: boolean; seg: boolean }> | null = null;
+function probeTcCap(): Promise<{ cap: boolean; seg: boolean }> {
   if (!tcCapPromise) {
-    tcCapPromise = fetch('/api/transcode?height=480&mode=cap')
+    tcCapPromise = fetch('/api/turbo?mode=cap')
       .then((r) => r.json())
-      .then((d: { cap?: boolean }) => d.cap === true)
-      .catch(() => true);
+      .then((d: { cap?: boolean; seg?: boolean }) => ({
+        cap: d.cap === true,
+        seg: d.seg === true,
+      }))
+      .catch(() => ({ cap: true, seg: true }));
   }
   return tcCapPromise;
 }
@@ -286,6 +294,12 @@ export function PlayerOverlay() {
    *  the answer lands; the 503-bounce in attachSource covers the gap. */
   const [tcCap, setTcCap] = useState(true);
   const tcCapRef = useRef(true);
+  /** the per-segment &h= ladder (bundled static ffmpeg — works on serverless).
+   *  Rungs go through /api/turbo instead of the continuous relay; heights are
+   *  capped at 480p (encoding 720/1080 costs more wall-time than a segment). */
+  const [tcSeg, setTcSeg] = useState(false);
+  const tcSegRef = useRef(false);
+  const tcRelayRef = useRef(true);
   /** one "data saver unavailable" notice per page load — not per channel */
   const tcNoticeRef = useRef(false);
 
@@ -345,10 +359,13 @@ export function PlayerOverlay() {
   // probe the deployment's data-saver capability once (cached per page load)
   useEffect(() => {
     let alive = true;
-    void probeTcCap().then((ok) => {
+    void probeTcCap().then(({ cap, seg }) => {
       if (!alive) return;
-      tcCapRef.current = ok;
-      setTcCap(ok);
+      tcCapRef.current = cap || seg;
+      tcRelayRef.current = cap;
+      tcSegRef.current = seg;
+      setTcCap(cap || seg);
+      setTcSeg(seg);
     });
     return () => {
       alive = false;
@@ -1500,8 +1517,16 @@ export function PlayerOverlay() {
         }
         return;
       }
-      const h = (DATA_SAVER_HEIGHTS as readonly number[]).includes(height) ? height : 360;
+      const h0 = (DATA_SAVER_HEIGHTS as readonly number[]).includes(height) ? height : 360;
       setShowQualityMenu(false);
+      // segment ladder (serverless): heights cap at 480 — encoding 720/1080
+      // costs more wall-time than a segment lasts, so clamp + explain
+      const useSegLadder =
+        cur.kind === 'daddylive' && tcSegRef.current && !tcRelayRef.current;
+      const h = useSegLadder && h0 > 480 ? 480 : h0;
+      if (useSegLadder && h0 > 480) {
+        showToast(`Data saver tops out at 480p on this hosting — picking 480p`);
+      }
       // never encode UP: a rung STRICTLY above the native feed's height can
       // only lose quality and burn CPU (1080p ask on a 720p-only source).
       // ⚠ exit data-saver BEFORE updatePrefs — the settings-sync effect echoes
@@ -1536,7 +1561,9 @@ export function PlayerOverlay() {
       }
       const base =
         cur.kind === 'daddylive'
-          ? `/api/transcode?channel=${encodeURIComponent(cur.ref)}`
+          ? useSegLadder
+            ? `/api/turbo?channel=${encodeURIComponent(cur.ref)}&h=${h}`
+            : `/api/transcode?channel=${encodeURIComponent(cur.ref)}`
           : tcSrcRef.current
             ? `/api/transcode?src=${encodeURIComponent(tcSrcRef.current.src)}&r=${encodeURIComponent(tcSrcRef.current.r)}&s=${encodeURIComponent(tcSrcRef.current.s)}`
             : null;
@@ -1546,26 +1573,29 @@ export function PlayerOverlay() {
       }
       showToast(`Data saver: ${h}p — lighter stream, less bandwidth`);
       setPhase('loading');
-      attachSource(`${base}&height=${h}&mode=m3u8`);
+      attachSource(`${base}${useSegLadder ? '' : `&height=${h}`}&mode=m3u8`);
 
       // learn the source's real height in the background (single-rendition
       // media playlists don't declare it — the server ffprobes a segment).
       // With it: later rung picks hit the no-upscale guard above, and a rung
       // that is ALREADY strictly above the source self-heals back to native.
+      // (Skipped on the segment ladder — its rungs are clamped ≤480 anyway.)
       const gen = loadGenRef.current;
-      void fetch(`${base}&height=${h}&mode=probe`)
-        .then((r) => (r.ok ? (r.json() as Promise<{ sourceHeight?: number }>) : null))
-        .then((d) => {
-          if (gen !== loadGenRef.current) return; // channel changed meanwhile
-          const sh = d?.sourceHeight || 0;
-          if (sh <= 0) return;
-          nativeHeightRef.current = Math.max(nativeHeightRef.current, sh);
-          if (tcHeightRef.current !== null && tcHeightRef.current > sh + 60) {
-            showToast(`This channel tops out at ${sh}p — back to the native feed`);
-            void exitDataSaverRef.current?.();
-          }
-        })
-        .catch(() => {});
+      if (!useSegLadder) {
+        void fetch(`${base}&height=${h}&mode=probe`)
+          .then((r) => (r.ok ? (r.json() as Promise<{ sourceHeight?: number }>) : null))
+          .then((d) => {
+            if (gen !== loadGenRef.current) return; // channel changed meanwhile
+            const sh = d?.sourceHeight || 0;
+            if (sh <= 0) return;
+            nativeHeightRef.current = Math.max(nativeHeightRef.current, sh);
+            if (tcHeightRef.current !== null && tcHeightRef.current > sh + 60) {
+              showToast(`This channel tops out at ${sh}p — back to the native feed`);
+              void exitDataSaverRef.current?.();
+            }
+          })
+          .catch(() => {});
+      }
     },
     [attachSource, showToast]
   );
@@ -1832,7 +1862,15 @@ export function PlayerOverlay() {
   const serverOptions = player.kind === 'daddylive' ? servers.length ? servers : DL_SERVERS : [];
   const hasServerChoices =
     player.kind === 'daddylive' ? serverOptions.length > 0 : alternates.length > 0;
-  const canDataSaver = (player.kind === 'daddylive' || !!tcSrcRef.current) && tcCap;
+  const canDataSaver =
+    (player.kind === 'daddylive' && (tcCap || tcSeg)) ||
+    (player.kind !== 'daddylive' && !!tcSrcRef.current && tcCap);
+  /** heights offered on the data-saver ladder — the serverless segment
+   *  ladder tops out at 480p (encoding 720/1080 can't keep realtime) */
+  const dsHeights =
+    player.kind === 'daddylive' && tcSeg && !tcRelayRef.current
+      ? ([144, 244, 360, 480] as const)
+      : DATA_SAVER_HEIGHTS;
 
   return (
     <div
@@ -2029,7 +2067,7 @@ export function PlayerOverlay() {
                       </>
                     )}
 
-                    {(player.kind === 'daddylive' || !!tcSrcRef.current) && !tcCap && ladderRungs.length === 0 && (
+                    {(player.kind === 'daddylive' || !!tcSrcRef.current) && !canDataSaver && ladderRungs.length === 0 && (
                       <>
                         <p className="border-t border-zilla-line/60 px-3.5 py-2 text-[9px] font-black uppercase tracking-widest text-zilla-dim">
                           Quality ladder · Data saver
@@ -2046,7 +2084,7 @@ export function PlayerOverlay() {
                         <p className="border-t border-zilla-line/60 px-3.5 py-2 text-[9px] font-black uppercase tracking-widest text-zilla-dim">
                           Quality ladder · Data saver
                         </p>
-                        {DATA_SAVER_HEIGHTS.map((h) => (
+                        {dsHeights.map((h) => (
                           <button
                             key={h}
                             onClick={() => selectDataSaver(h)}
@@ -2239,12 +2277,24 @@ export function PlayerOverlay() {
                 {player.name} is live — in a format this browser can&apos;t play
               </p>
               <p className="mx-auto mt-1 max-w-md text-sm font-medium text-white/60">
-                The channel is currently broadcasting in HEVC (a modern video codec). Your browser
-                can&apos;t decode it, but Safari, Edge, and most phones play it natively — or open
-                MaxTV there later.
+                The channel is currently broadcasting in HEVC (a modern video codec). Play it
+                converted to 480p right here, or open MaxTV in Safari, Edge, or on a phone — those
+                play it natively.
               </p>
             </div>
             <div className="flex flex-wrap items-center justify-center gap-2">
+              {player.kind === 'daddylive' && tcSeg && (
+                <button
+                  onClick={() => selectDataSaver(480)}
+                  className="rounded-full bg-emerald-400 px-5 py-2.5 text-xs font-black uppercase tracking-wide text-black hover:bg-emerald-300"
+                  title="The server converts this channel to H.264 at 480p in real time — same channel, same content"
+                >
+                  Play at 480p
+                  <span className="ml-1.5 font-bold normal-case tracking-normal opacity-70">
+                    (converted)
+                  </span>
+                </button>
+              )}
               {hevcBlock.family && (
                 <button
                   onClick={() => switchAlternate(hevcBlock.family!)}

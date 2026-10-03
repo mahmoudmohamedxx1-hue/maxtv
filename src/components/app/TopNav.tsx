@@ -48,13 +48,19 @@ export function TopNav({
   const [tcCap, setTcCap] = useState(true); // server transcoding capability
   const menuRef = useRef<HTMLDivElement>(null);
 
-  // probe once whether this deployment can transcode (data-saver ladder)
+  // probe once whether this deployment can transcode (data-saver ladder).
+  // /api/turbo?mode=cap answers both flavors: cap (continuous relay,
+  // self-hosted) and seg (per-segment &h= ladder — works on serverless via
+  // the bundled static ffmpeg, so the ladder exists on Vercel too).
+  const [segLadder, setSegLadder] = useState(false);
   useEffect(() => {
     let alive = true;
-    fetch('/api/transcode?height=480&mode=cap')
+    fetch('/api/turbo?mode=cap')
       .then((r) => r.json())
-      .then((d: { cap?: boolean }) => {
-        if (alive) setTcCap(d.cap === true);
+      .then((d: { cap?: boolean; seg?: boolean }) => {
+        if (!alive) return;
+        setTcCap(d.cap === true || d.seg === true);
+        setSegLadder(d.seg === true && d.cap !== true);
       })
       .catch(() => {});
     return () => {
@@ -256,7 +262,7 @@ export function TopNav({
                   Not available on this deployment — the server can't re-encode streams. Picks fall back to the nearest native quality.
                 </p>
               )}
-              {SAVER_QUALITIES.map((q) => (
+              {SAVER_QUALITIES.filter((q) => !segLadder || q.h <= 480).map((q) => (
                 <button
                   key={q.h}
                   onClick={() => pickQuality(q.h)}

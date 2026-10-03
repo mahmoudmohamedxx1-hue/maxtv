@@ -43,7 +43,8 @@ yarn-error.log*
 /repos/
 /skills/
 /examples/
-/scripts/
+/scripts/*
+!/scripts/fetch-ffmpeg.sh
 /download/
 /upload/
 /mini-services/
@@ -56,3 +57,4 @@ Caddyfile
 db/
 
 # local-only test harness
+third_party/
