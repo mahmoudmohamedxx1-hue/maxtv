@@ -2,15 +2,14 @@
 """StoryPilot - Hourly story source.
 
 Primary : the Google Sheet that Gemini Spark updates every hour (tab 1 = story).
-Optional: a fresh story generated KEYLESS via freellmpool (default model
-          glm-5.3-flash) when USE_AI_STORY=true or the sheet is unreachable.
+Optional: a fresh story generated KEYLESS via freellmpool (GLM Flash first,
+          auto-failover to the keyless pool) when USE_AI_STORY=true or the
+          sheet is unreachable.
 Fallback: a built-in sample story so the pipeline never breaks.
 
 Writes  : story.json (consumed by generate_video.py)
           sheet_code.py (the raw generator code from the sheet tab, reference only)
 """
-import csv
-import io
 import json
 import os
 import re
@@ -23,7 +22,7 @@ import urllib.request
 SHEET_ID = os.environ.get("SHEET_ID", "1nNsUcwR9foKN_MTPm5bwMR5jz2HUE68UeRqJ0OFp-d4")
 CODE_TAB = os.environ.get("CODE_TAB", "كود بايثون - المولد الآلي")
 USE_AI_STORY = os.environ.get("USE_AI_STORY", "false").lower() in ("1", "true", "yes")
-FLP_MODEL = os.environ.get("FLP_MODEL", "glm-5.3-flash")
+FLP_MODEL = os.environ.get("FLP_MODEL", "glm-4.7-flash")
 STORY_TOPIC = os.environ.get("STORY_TOPIC", "").strip()
 OUT = os.environ.get("STORY_PATH", "story.json")
 UA = {"User-Agent": "Mozilla/5.0 (compatible; StoryPilotAgent/1.0)"}
@@ -56,7 +55,7 @@ def parse_csv(text):
         if q:
             if c == '"':
                 if i + 1 < len(text) and text[i + 1] == '"':
-                    cell += '"'; i_marker = True
+                    cell += '"'
                 else:
                     q = False
             else:
@@ -169,23 +168,50 @@ def story_from_freellmpool():
     topic = STORY_TOPIC or "a surprising 60-second micro-story with a twist ending, cinematic and emotional"
     prompt = f"Write a fresh hourly vertical-video story about: {topic}"
     exe = shutil.which("freellmpool")
-    cmd = [exe] if exe else [sys.executable, "-m", "freellmpool"]
-    cmd += ["ask", "-m", FLP_MODEL, "-s", SYSTEM_PROMPT, prompt]
-    print(f"[story] generating with keyless freellmpool model: {FLP_MODEL}", flush=True)
-    out = subprocess.run(cmd, capture_output=True, text=True, timeout=420)
-    raw = (out.stdout or "") + (out.stderr or "")
-    m = re.search(r"\{[\s\S]*\}", raw)
-    if not m:
-        raise ValueError(f"no JSON in freellmpool reply: {raw[:300]}")
-    data = json.loads(m.group(0))
-    data.setdefault("duration", "60 Seconds")
-    data["language"] = detect_language(json.dumps(data, ensure_ascii=False))
-    if not data.get("scenes"):
-        raise ValueError("model returned no scenes")
-    for i, s in enumerate(data["scenes"], 1):
-        s.setdefault("index", i)
-        s.setdefault("timeRange", f"scene {i}")
-    return data
+    base = [exe] if exe else [sys.executable, "-m", "freellmpool"]
+    # Try the configured model first (e.g. a GLM Flash route), then fail over to
+    # guaranteed-keyless pool routes. "auto" lets freellmpool pick a live keyless model.
+    attempts = []
+    for m in [FLP_MODEL, "zhipu/glm-4.7-flash", "ovh/Qwen3-32B", "auto"]:
+        if m and m not in attempts:
+            attempts.append(m)
+    last_err = ""
+    for model in attempts:
+        cmd = base + [
+            "ask", "-m", model, "--json", "--timeout", "90",
+            "-s", SYSTEM_PROMPT, prompt,
+        ]
+        print(f"[story] trying freellmpool model: {model}", flush=True)
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
+        except subprocess.TimeoutExpired:
+            last_err = f"{model}: timed out"
+            print(f"[story] {last_err}", flush=True)
+            continue
+        raw = (out.stdout or "") + (out.stderr or "")
+        m2 = re.search(r"\{[\s\S]*\}", raw)
+        if not m2:
+            last_err = f"{model}: no JSON in reply ({raw[:160]})"
+            print(f"[story] {last_err}", flush=True)
+            continue
+        try:
+            data = json.loads(m2.group(0))
+        except json.JSONDecodeError:
+            last_err = f"{model}: unparseable JSON"
+            print(f"[story] {last_err}", flush=True)
+            continue
+        if not data.get("scenes"):
+            last_err = f"{model}: no scenes"
+            print(f"[story] {last_err}", flush=True)
+            continue
+        data.setdefault("duration", "60 Seconds")
+        data["language"] = detect_language(json.dumps(data, ensure_ascii=False))
+        for i, s in enumerate(data["scenes"], 1):
+            s.setdefault("index", i)
+            s.setdefault("timeRange", f"scene {i}")
+        print(f"[story] served by: {model}", flush=True)
+        return data
+    raise ValueError(f"all freellmpool attempts failed ({last_err})")
 
 
 def main():
@@ -200,7 +226,7 @@ def main():
     if story is None:
         try:
             story = story_from_freellmpool()
-            source = f"freellmpool keyless ({FLP_MODEL})"
+            source = f"freellmpool keyless ({FLP_MODEL} first, auto-failover)"
         except Exception as e:
             print(f"[story] freellmpool failed: {e}", flush=True)
             story = FALLBACK_STORY
