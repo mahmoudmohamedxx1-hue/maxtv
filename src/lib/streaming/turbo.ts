@@ -856,8 +856,17 @@ export function peekTurboSession(channelId: string, serverPin?: string): TurboSe
  * input side becomes instant whenever the user hopped down from native play.
  */
 export function turboCachedBySn(channelId: string, sn: number): { ts: Uint8Array; dur: number } | null {
+  // ⚠ EXACT channel match — session keys are `ch{id}` / `ch{id}m{pin}`. A
+  // bare startsWith(`ch${channelId}`) matched OTHER channels whose id extends
+  // this one (ch95 → ch950 France 2 … ch959 W9; ch97 → Starz; ch100 →
+  // ch1010 beIN 5 Turkey), so a data-saver transcode input could pull a
+  // DIFFERENT channel's cached bytes and serve its content under this
+  // channel's name (2026-10-03 "bein 5/7 arabic is not arabic" audit).
+  // Same channel via ANY mirror pin is fine — identical upstream content.
+  const own = `ch${channelId}`;
   for (const s of SESSIONS.values()) {
-    if (s.isDead || !s.key.startsWith(`ch${channelId}`)) continue;
+    if (s.isDead) continue;
+    if (s.key !== own && !s.key.startsWith(`${own}m`)) continue;
     const hit = s.cachedBySn(sn);
     if (hit) return hit;
   }
