@@ -1,0 +1,8 @@
+# StoryPilot hourly pipeline - all free / keyless
+edge-tts>=6.1.0
+moviepy>=2.0.0
+pillow>=10.0.0
+arabic-reshaper>=3.0.0
+python-bidi>=0.4.2
+requests>=2.31.0
+freellmpool>=0.13.0
