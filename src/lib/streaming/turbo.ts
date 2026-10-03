@@ -389,7 +389,14 @@ export class TurboSession {
     this.tcWarmAt.set(h, now);
     const w = this.windowRange(true);
     if (!w) return;
-    const sns = w.list.slice(-count).map((x) => x.sn);
+    // WARMS THE PLAYER'S START POSITION, not the window tip: hls.js begins
+    // liveSyncDurationCount (3) segments behind the newest listed segment,
+    // so warming [tip-3, tip-2] is what makes the FIRST segment load fast;
+    // every later segment passes through those positions on successive
+    // polls and gets warmed ~2 polls before the player reaches it.
+    const from = Math.max(0, w.list.length - count - 2);
+    const to = Math.max(from, w.list.length - 2);
+    const sns = w.list.slice(from, to).map((x) => x.sn);
     for (const sn of sns) {
       const key = `${this.key}|${sn}:${h}`;
       if (this.tcSegs.has(`${sn}:${h}`) || tcInflight.has(key)) continue;
