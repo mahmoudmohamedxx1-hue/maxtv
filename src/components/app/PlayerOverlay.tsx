@@ -265,6 +265,9 @@ export function PlayerOverlay() {
   const [quality, setQuality] = useState<{ label: string; level: number }[]>([]);
   const [currentQuality, setCurrentQuality] = useState(-1); // -1 = auto
   const [activeHeight, setActiveHeight] = useState(0); // detected playing height
+  /** the native feed's best height as STATE — drives the quality menu's
+   *  720p/1080p rungs (offered only when the source is actually that tall) */
+  const [srcHeight, setSrcHeight] = useState(0);
   const [showQualityMenu, setShowQualityMenu] = useState(false);
   /** active data-saver (transcoded) height — null = native stream */
   const [tcHeight, setTcHeight] = useState<number | null>(null);
@@ -651,6 +654,7 @@ export function PlayerOverlay() {
       setActiveHeight(0);
       setTcHeight(null);
       nativeHeightRef.current = 0; // learned again from the native manifest
+      setSrcHeight(0);
       if (!opts.isAlternate) setAltUrl(null); // playing a DL server / fresh channel
       pinHeightRef.current = null; // one-shot alternate-rung pin
       proxiedSrcRef.current = null;
@@ -857,7 +861,12 @@ export function PlayerOverlay() {
             const buildLevels = () =>
               (hls.levels || []).map((l, i) => {
                 const resH = Number(String(l.attrs?.RESOLUTION ?? '').split('x')[1]) || 0;
-                const h = l.height || resH || video.videoHeight;
+                // ⚠ manifest-declared heights ONLY — video.videoHeight here is
+                // the PREVIOUS channel's last decoded frame on a channel change
+                // (a 1080p → 720p hop leaked a phantom 1080p rung into the
+                // quality menu). The real height arrives via LEVEL_SWITCHED
+                // once THIS stream decodes a frame.
+                const h = l.height || resH;
                 const k = Math.round((l.bitrate || 0) / 1000);
                 return { label: h ? `${h}p` : k > 0 ? `${k}k` : 'Source', level: i, height: h };
               });
@@ -866,7 +875,10 @@ export function PlayerOverlay() {
             setQuality(levels.map(({ label, level }) => ({ label, level })));
             // remember the native feed's best height — the ladder never encodes up
             const knownH = levels.map((l) => l.height).filter((h) => h > 0);
-            if (knownH.length) nativeHeightRef.current = Math.max(...knownH);
+            if (knownH.length) {
+              nativeHeightRef.current = Math.max(...knownH);
+              setSrcHeight(nativeHeightRef.current);
+            }
 
             const prefH = loadPrefs().quality;
             const canTc = (ch.kind === 'daddylive' || !!tcSrcRef.current) && tcCapRef.current;
@@ -972,10 +984,17 @@ export function PlayerOverlay() {
             // refresh labels — some CDNs only report resolution once fragments load
             const lvl = hls.levels?.[d.level];
             const resH = Number(String(lvl?.attrs?.RESOLUTION ?? '').split('x')[1]) || 0;
-            const h = lvl?.height || resH || video.videoHeight;
+            // videoHeight is trustworthy ONLY once THIS stream decoded a frame
+            // (readyState ≥ 2) — right after a channel change it still shows
+            // the previous channel's frame size
+            const vh = video.readyState >= 2 && video.currentTime > 0 ? video.videoHeight : 0;
+            const h = lvl?.height || resH || vh;
             if (h) {
               setActiveHeight(h);
-              if (tcHeightRef.current === null) nativeHeightRef.current = Math.max(nativeHeightRef.current, h);
+              if (tcHeightRef.current === null) {
+                nativeHeightRef.current = Math.max(nativeHeightRef.current, h);
+                setSrcHeight(nativeHeightRef.current);
+              }
               setQuality((prev) => {
                 const label = `${h}p`;
                 const next = prev.some((q) => q.label === label)
@@ -1637,14 +1656,16 @@ export function PlayerOverlay() {
       }
       const h0 = (DATA_SAVER_HEIGHTS as readonly number[]).includes(height) ? height : 360;
       setShowQualityMenu(false);
-      // segment ladder (serverless): heights cap at 480 — encoding 720/1080
-      // costs more wall-time than a segment lasts, so clamp + explain
+      // segment ladder (serverless): 720/1080 are manual-only DOWNSCALES —
+      // offered when the native feed is at least that tall (never an
+      // upscale); while the source height is still unknown, clamp to 480
+      // so we never blindly encode UP from a low-res source. With the
+      // height KNOWN, the no-upscale guard below bounces oversized asks
+      // back to the native feed ("tops out at 720p") instead of clamping.
       const useSegLadder =
         cur.kind === 'daddylive' && tcSegRef.current && !tcRelayRef.current;
-      const h = useSegLadder && h0 > 480 ? 480 : h0;
-      if (useSegLadder && h0 > 480) {
-        showToast(`Data saver tops out at 480p on this hosting — picking 480p`);
-      }
+      const nh0 = nativeHeightRef.current;
+      const h = useSegLadder && h0 > 480 && nh0 === 0 ? 480 : h0;
       // never encode UP: a rung STRICTLY above the native feed's height can
       // only lose quality and burn CPU (1080p ask on a 720p-only source).
       // ⚠ exit data-saver BEFORE updatePrefs — the settings-sync effect echoes
@@ -1707,6 +1728,7 @@ export function PlayerOverlay() {
             const sh = d?.sourceHeight || 0;
             if (sh <= 0) return;
             nativeHeightRef.current = Math.max(nativeHeightRef.current, sh);
+            setSrcHeight(nativeHeightRef.current);
             if (tcHeightRef.current !== null && tcHeightRef.current > sh + 60) {
               showToast(`This channel tops out at ${sh}p — back to the native feed`);
               void exitDataSaverRef.current?.();
@@ -1987,12 +2009,15 @@ export function PlayerOverlay() {
   const canDataSaver =
     (player.kind === 'daddylive' && (tcCap || tcSeg)) ||
     (player.kind !== 'daddylive' && !!tcSrcRef.current && tcCap);
-  /** heights offered on the data-saver ladder — the serverless segment
-   *  ladder tops out at 480p (encoding 720/1080 can't keep realtime) */
-  const dsHeights =
-    player.kind === 'daddylive' && tcSeg && !tcRelayRef.current
-      ? ([144, 244, 360, 480] as const)
-      : DATA_SAVER_HEIGHTS;
+  /** heights offered on the data-saver ladder. Serverless segment ladder:
+   *  144–480 always; +720/+1080 only once the native feed is VERIFIED at
+   *  least that tall (a real downscale — never an upscale from a 408p
+   *  source). The continuous relay (self-hosted) keeps the full list — its
+   *  ffmpeg pipeline handles any height. */
+  const segLadder = player.kind === 'daddylive' && tcSeg && !tcRelayRef.current;
+  const dsHeights: readonly number[] = segLadder
+    ? ([144, 244, 360, 480, ...(srcHeight >= 720 ? [720] : []), ...(srcHeight >= 1080 ? [1080] : [])] as number[])
+    : DATA_SAVER_HEIGHTS;
 
   return (
     <div

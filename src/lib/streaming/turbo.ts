@@ -677,9 +677,15 @@ export class TurboSession {
  *  task and the player's request for the same segment share it) */
 const tcInflight = new Map<string, Promise<Uint8Array | null>>();
 
-/** heights the serverless segment ladder offers (720/1080 stay native —
- *  encoding them costs more wall-time than a segment lasts) */
-export const SEG_LADDER_HEIGHTS = [144, 244, 360, 480] as const;
+/** heights the serverless segment ladder offers. 720/1080 are real DOWNSCALE
+ *  encodes — the player only offers them when the native feed is at least
+ *  that tall (never an upscale), and Auto never picks them (manual choices
+ *  only: the user explicitly trades encode headroom for max quality).
+ *  Encoding 1080p HEVC → 720p x264 veryfast runs ~5-7s per ~6s segment on a
+ *  1-vCPU isolate — the 2-slot queue + 12-segment window absorbs it, but a
+ *  slow instance can buffer; that's the accepted cost of a manual max rung.
+ *  The player clamps to 480 while the source height is still unknown. */
+export const SEG_LADDER_HEIGHTS = [144, 244, 360, 480, 720, 1080] as const;
 
 const TC_TIMEOUT_MS = 25_000;
 const TC_MAX_CONCURRENT = 2;

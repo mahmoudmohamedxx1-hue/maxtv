@@ -48,7 +48,11 @@ export function isEventStream(name: string | undefined | null): boolean {
  *  module, silently disabling the filter). */
 import { DEAD_DL_SCAN } from '@/data/daddylive-dead';
 
-const HAND_CURATED_DEAD = ['92', '99', '597', '1010', '491', '492']; // kept: long-dead, known
+// kept: long-dead, known. ⚠ #92 (beIN 2 Arabic) and #1010 (beIN 5 Turkey)
+// were removed 2026-10-06 — both resurrected on the CDN but stayed buried
+// here, so football matches fell through to broken English feeds. The
+// runtime probe now overrides this seed either way; keep it accurate.
+const HAND_CURATED_DEAD = ['99', '597', '491', '492'];
 export const DEAD_DL_CHANNEL_IDS = new Set<string>([...HAND_CURATED_DEAD, ...DEAD_DL_SCAN]);
 
 interface SportDef {

@@ -8,8 +8,8 @@
 
 import * as cheerio from 'cheerio';
 import type { SportsMatch, SportsChannelRef, ResolvedStream } from '../types';
-import { normalizeSport, splitLeague, stripEmojis, decodeEntities, isEventStream } from './categories';
-import { rankScheduleFeeds } from './feeds';
+import { normalizeSport, splitLeague, stripEmojis, decodeEntities, isEventStream, DEAD_DL_CHANNEL_IDS } from './categories';
+import { rankScheduleFeeds, type FeedHealth } from './feeds';
 
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36';
@@ -196,8 +196,39 @@ async function fetchScheduleUncached(): Promise<SportsMatch[]> {
 
   const matches = parseScheduleHtml(html);
   // rank feeds so the primary Watch button is the channel most likely to
-  // actually carry the event (the football→F1 fix)
-  return rankScheduleFeeds(matches);
+  // actually carry the event — with RUNTIME health verdicts for the feeds
+  // that decide football primaries (the beIN family + anything the static
+  // dead seed buried). The seed is a snapshot and the CDN drifts both ways:
+  //  • beIN 2 Arabic — seeded dead, resurrected, must come back
+  //  • beIN 5 Arabic — died AFTER the snapshot, must stop winning primaries
+  const health = await probeFootballFeedHealth(matches);
+  return rankScheduleFeeds(matches, health);
+}
+
+/** runtime-probe the channel ids that decide football feed ranking: every
+ *  beIN-family feed plus every statically-seeded-dead feed listed on a
+ *  football fixture. Bounded by a 6s race — verdicts cache 5 min per id, so
+ *  a slow first scrape pays once and every refresh afterwards is instant. */
+async function probeFootballFeedHealth(matches: SportsMatch[]): Promise<FeedHealth | undefined> {
+  const want = new Set<string>();
+  for (const m of matches) {
+    if (m.category !== 'football') continue;
+    for (const c of m.channels) {
+      if (/be\s?in/i.test(c.name) || DEAD_DL_CHANNEL_IDS.has(c.id)) want.add(c.id);
+    }
+  }
+  if (!want.size) return undefined;
+  const ids = [...want];
+  const alive = await Promise.race([
+    probeDaddyLiveChannels(ids),
+    new Promise<Set<string>>((r) => setTimeout(() => r(new Set()), 6_000)),
+  ]);
+  // empty set = probe didn't finish in the budget (or genuinely everything
+  // died) — either way treat as NO runtime info: the static seed still
+  // applies, and nothing gets wrongly sunk on a slow-network moment.
+  if (!alive.size) return undefined;
+  const dead = new Set(ids.filter((id) => !alive.has(id)));
+  return { alive, dead };
 }
 
 /** last non-empty scrape — survives cache expiry so an upstream blip never

@@ -86,7 +86,7 @@ function buildStats(matches: SportsMatch[]): Map<string, ChannelStats> {
   return stats;
 }
 
-function scoreChannel(m: SportsMatch, ch: SportsChannelRef, stats?: ChannelStats): number {
+function scoreChannel(m: SportsMatch, ch: SportsChannelRef, stats?: ChannelStats, health?: FeedHealth): number {
   let score = 0;
 
   // 1. dedicated-sport mismatch — Sky Sports F1 listed on a football match
@@ -128,31 +128,56 @@ function scoreChannel(m: SportsMatch, ch: SportsChannelRef, stats?: ChannelStats
   if (/^\s*(feed|stream|source|link)\s*\d*\s*$/i.test(ch.name)) score += 25;
 
   // 7. beIN Sports ARABIC / MENA networks on football events — the dedicated
-  //    football broadcasters of the MENA region (and the user's preference:
-  //    football should stream from the beIN Arabic feeds). They list hundreds
-  //    of fixtures per day and never preempt with other sports, so they beat
-  //    every generic network. MENA *English* variants get a smaller edge.
+  //    football broadcasters of the MENA region (and the user's standing
+  //    preference: football should stream from the beIN Arabic feeds).
+  //    +600 makes them UNBEATABLE for the primary slot: no combination of
+  //    league-name boosts, shared-network penalties or generic-feed edges
+  //    can push a live beIN Arabic feed below another channel — only the
+  //    dead-CDN penalty (−1000) still sinks it. MENA *English* variants get
+  //    a mild PENALTY instead (2026-10-06 field report: "the English don't
+  //    work") — when no Arabic beIN feed exists, a real broadcaster (RAI 1,
+  //    TF1, DAZN …) is a better primary than a beIN English feed.
   if (m.category === 'football' && /be\s?in/i.test(ch.name)) {
-    if (/mena\s*\d|arabic/i.test(ch.name)) score += 80;
-    else if (/mena\s*english/i.test(ch.name)) score += 30;
+    if (/mena\s*\d|arabic/i.test(ch.name)) score += 600;
+    else if (/mena\s*english|\benglish\b/i.test(ch.name)) score -= 60;
   }
 
-  // 8. statically-known-dead CDN channels sink to the very back — clicking
-  //    the primary Watch feed must never open a channel whose manifest has
-  //    been 404 for days (e.g. beIN Sports MENA 2 on "Germany vs Greece")
-  if (DEAD_DL_CHANNEL_IDS.has(ch.id)) score -= 1000;
+  // 8. dead CDN channels sink to the very back — clicking the primary Watch
+  //    feed must never open a channel whose manifest 404s. TWO sources:
+  //    the static scan seed AND a fresh runtime DEAD verdict (the seed is a
+  //    snapshot — ids that died after it, like beIN 5 Arabic on 2026-10-06,
+  //    were still winning primaries). A runtime ALIVE verdict OVERRIDES the
+  //    seed: resurrected ids (beIN 2 Arabic) must come back.
+  const rtAlive = health?.alive?.has(ch.id) ?? false;
+  const rtDead = health?.dead?.has(ch.id) ?? false;
+  if (!rtAlive && (rtDead || DEAD_DL_CHANNEL_IDS.has(ch.id))) score -= 1000;
+  // 8b. runtime-verified ALIVE right now — a small trust bump
+  if (rtAlive) score += 20;
 
   return score;
 }
 
+/** runtime channel-health verdicts (manifest probe, 5-min cache) */
+export interface FeedHealth {
+  /** ids verified ALIVE right now — resurrects seeded-dead ids */
+  alive?: Set<string>;
+  /** ids verified DEAD right now — sinks ids the static seed never saw
+   *  (the seed is a snapshot; the CDN drifts both ways) */
+  dead?: Set<string>;
+}
+
 /** Rank each event's channels so the primary Watch feed is the best bet.
- *  Stable — equally-scored feeds keep their upstream order. */
-export function rankScheduleFeeds(matches: SportsMatch[]): SportsMatch[] {
+ *  `health` — runtime manifest-probe verdicts. The static dead seed DRIFTS:
+ *  beIN 2 Arabic was seeded dead, came back on the CDN, and stayed buried
+ *  for a week while matches fell through to broken English feeds; beIN 5
+ *  Arabic died AFTER the snapshot and kept winning primaries. Runtime is
+ *  the truth. Stable — equally-scored feeds keep their upstream order. */
+export function rankScheduleFeeds(matches: SportsMatch[], health?: FeedHealth): SportsMatch[] {
   const stats = buildStats(matches);
   let anyChange = false;
   const out = matches.map((m) => {
     if (m.channels.length < 2) return m;
-    const scored = m.channels.map((c, idx) => ({ c, idx, score: scoreChannel(m, c, stats.get(c.id)) }));
+    const scored = m.channels.map((c, idx) => ({ c, idx, score: scoreChannel(m, c, stats.get(c.id), health) }));
     scored.sort((a, b) => b.score - a.score || a.idx - b.idx);
     if (scored.some((s, i) => s.idx !== i)) anyChange = true;
     return { ...m, channels: scored.map((s) => s.c) };
