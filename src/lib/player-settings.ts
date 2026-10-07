@@ -27,8 +27,16 @@ export interface PlayerPrefs {
  *  quality — the 2026-10-03 field report ("quality fixed at 408p everywhere,
  *  I want it to follow my connection speed") showed a pinned default defeats
  *  the whole point of an adaptive ladder. Stored prefs from v2 are reset to
- *  Auto ONCE; explicit picks made afterwards persist as before. */
-const PREFS_VERSION = 3;
+ *  Auto ONCE; explicit picks made afterwards persist as before.
+ *  v4: stored picks ABOVE 480p reset to Auto ONCE — the >480 data-saver
+ *  rungs only ever existed on the serverless segment-transcode ladder
+ *  (2026-10-05..07), where 720p/1080p encodes run slower than realtime;
+ *  anyone who picked one had it persisted as the default for EVERY channel
+ *  and got constant loading (2026-10-08 field report: "before the last
+ *  version I watched an entire match without a single loading"). Native
+ *  720p/1080p levels are unaffected — they are pinned per-channel, never
+ *  stored globally. */
+const PREFS_VERSION = 4;
 
 const DEFAULTS: PlayerPrefs = { volume: 0.9, muted: true, quality: -1, autoAdvance: true, perfMode: 'fast', v: PREFS_VERSION };
 
@@ -43,11 +51,11 @@ export function loadPrefs(): PlayerPrefs {
       let q = typeof p.quality === 'number' ? p.quality : -1;
       // legacy 240p data-saver pref → the new 244p rung
       if (q === 240) q = 244;
-      const migrated =
-        typeof p.v === 'number' && p.v >= PREFS_VERSION
-          ? { ...DEFAULTS, ...p, quality: q, v: PREFS_VERSION }
-          : { ...DEFAULTS, ...p, quality: -1, v: PREFS_VERSION }; // v≤2 → v3: Auto is the new default
-      const needsMigration = typeof p.v !== 'number' || p.v < PREFS_VERSION;
+      const v = typeof p.v === 'number' ? p.v : 0;
+      if (v < 3) q = -1; // v≤2 → v3: Auto is the new default
+      if (v < 4 && q > 480) q = -1; // v3 → v4: unsustainable >480 transcode picks → Auto
+      const migrated = { ...DEFAULTS, ...p, quality: q, v: PREFS_VERSION };
+      const needsMigration = v < PREFS_VERSION;
       if (needsMigration) {
         // persist the migration immediately (plain setItem — no prefs event:
         // nothing has actually changed for the user to react to)

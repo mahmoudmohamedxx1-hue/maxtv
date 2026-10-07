@@ -265,9 +265,6 @@ export function PlayerOverlay() {
   const [quality, setQuality] = useState<{ label: string; level: number }[]>([]);
   const [currentQuality, setCurrentQuality] = useState(-1); // -1 = auto
   const [activeHeight, setActiveHeight] = useState(0); // detected playing height
-  /** the native feed's best height as STATE — drives the quality menu's
-   *  720p/1080p rungs (offered only when the source is actually that tall) */
-  const [srcHeight, setSrcHeight] = useState(0);
   const [showQualityMenu, setShowQualityMenu] = useState(false);
   /** active data-saver (transcoded) height — null = native stream */
   const [tcHeight, setTcHeight] = useState<number | null>(null);
@@ -305,6 +302,10 @@ export function PlayerOverlay() {
   const tcRelayRef = useRef(true);
   /** one "data saver unavailable" notice per page load — not per channel */
   const tcNoticeRef = useRef(false);
+  /** one "your saved 720p/1080p pick isn't servable on this serverless
+   *  ladder" notice per page load — the v4 migration already reset such
+   *  prefs; this covers picks re-made on relay-capable deployments */
+  const hiPrefNoticeRef = useRef(false);
 
   /* ── refs for cross-callback access (hls error handler → failover) ─────── */
   const playerRef = useRef<Playable | null>(null);
@@ -654,7 +655,6 @@ export function PlayerOverlay() {
       setActiveHeight(0);
       setTcHeight(null);
       nativeHeightRef.current = 0; // learned again from the native manifest
-      setSrcHeight(0);
       if (!opts.isAlternate) setAltUrl(null); // playing a DL server / fresh channel
       pinHeightRef.current = null; // one-shot alternate-rung pin
       proxiedSrcRef.current = null;
@@ -877,7 +877,6 @@ export function PlayerOverlay() {
             const knownH = levels.map((l) => l.height).filter((h) => h > 0);
             if (knownH.length) {
               nativeHeightRef.current = Math.max(...knownH);
-              setSrcHeight(nativeHeightRef.current);
             }
 
             const prefH = loadPrefs().quality;
@@ -942,11 +941,22 @@ export function PlayerOverlay() {
             // to the real-time transcode ladder. Skipped on deployments
             // without ffmpeg — there we stay native (closest level or the
             // single rendition) instead of hanging on a 503.
+            // ⚠ 2026-10-08: the SERVERLESS segment ladder tops at 480 — a
+            // >480 preference must never divert playback into a re-encode
+            // that ladder can't sustain (the "loads forever" report). Such
+            // picks stay on the native feed; the v4 prefs migration already
+            // resets them to Auto, this is the belt-and-suspenders guard.
             if (prefH > 0 && (DATA_SAVER_HEIGHTS as readonly number[]).includes(prefH)) {
               const hasNative = levels.some((l) => l.height > 0 && l.height <= prefH + 60);
-              if (!hasNative && tcCapRef.current) {
+              const segOnly = ch.kind === 'daddylive' && tcSegRef.current && !tcRelayRef.current;
+              const servable = !segOnly || prefH <= 480;
+              if (!hasNative && tcCapRef.current && servable) {
                 void selectDataSaverRef.current?.(prefH);
                 return;
+              }
+              if (!hasNative && !servable && prefH > 480 && !hiPrefNoticeRef.current) {
+                hiPrefNoticeRef.current = true;
+                showToast(`${prefH}p isn't available on this channel — playing its native feed`);
               }
               if (!hasNative && !tcCapRef.current && !tcNoticeRef.current) {
                 tcNoticeRef.current = true;
@@ -993,7 +1003,6 @@ export function PlayerOverlay() {
               setActiveHeight(h);
               if (tcHeightRef.current === null) {
                 nativeHeightRef.current = Math.max(nativeHeightRef.current, h);
-                setSrcHeight(nativeHeightRef.current);
               }
               setQuality((prev) => {
                 const label = `${h}p`;
@@ -1656,16 +1665,22 @@ export function PlayerOverlay() {
       }
       const h0 = (DATA_SAVER_HEIGHTS as readonly number[]).includes(height) ? height : 360;
       setShowQualityMenu(false);
-      // segment ladder (serverless): 720/1080 are manual-only DOWNSCALES —
-      // offered when the native feed is at least that tall (never an
-      // upscale); while the source height is still unknown, clamp to 480
-      // so we never blindly encode UP from a low-res source. With the
-      // height KNOWN, the no-upscale guard below bounces oversized asks
-      // back to the native feed ("tops out at 720p") instead of clamping.
+      // segment ladder (serverless): tops at 480 — encoding 720/1080 runs
+      // slower than realtime on a 1-vCPU isolate (5-7s+ per ~6s segment), so
+      // those rungs are no longer offered and a >480 ask can only arrive
+      // from a stale persisted preference. Serving it anyway (clamped to
+      // 480) re-encoded a 408p source through the slow per-segment pipeline
+      // for nothing — the 2026-10-08 "loads constantly since the last
+      // version" report. Refuse, reset the pref to Auto, stay native: the
+      // passthrough already plays the source's full height untouched.
       const useSegLadder =
         cur.kind === 'daddylive' && tcSegRef.current && !tcRelayRef.current;
-      const nh0 = nativeHeightRef.current;
-      const h = useSegLadder && h0 > 480 && nh0 === 0 ? 480 : h0;
+      if (useSegLadder && h0 > 480) {
+        showToast(`${h0}p re-encoding can't run smoothly here — Auto (native feed) restored`);
+        updatePrefs({ quality: -1, autoPicked: false });
+        return;
+      }
+      const h = h0;
       // never encode UP: a rung STRICTLY above the native feed's height can
       // only lose quality and burn CPU (1080p ask on a 720p-only source).
       // ⚠ exit data-saver BEFORE updatePrefs — the settings-sync effect echoes
@@ -1728,7 +1743,6 @@ export function PlayerOverlay() {
             const sh = d?.sourceHeight || 0;
             if (sh <= 0) return;
             nativeHeightRef.current = Math.max(nativeHeightRef.current, sh);
-            setSrcHeight(nativeHeightRef.current);
             if (tcHeightRef.current !== null && tcHeightRef.current > sh + 60) {
               showToast(`This channel tops out at ${sh}p — back to the native feed`);
               void exitDataSaverRef.current?.();
@@ -2010,13 +2024,17 @@ export function PlayerOverlay() {
     (player.kind === 'daddylive' && (tcCap || tcSeg)) ||
     (player.kind !== 'daddylive' && !!tcSrcRef.current && tcCap);
   /** heights offered on the data-saver ladder. Serverless segment ladder:
-   *  144–480 always; +720/+1080 only once the native feed is VERIFIED at
-   *  least that tall (a real downscale — never an upscale from a 408p
-   *  source). The continuous relay (self-hosted) keeps the full list — its
-   *  ffmpeg pipeline handles any height. */
+   *  144–480 ONLY — encoding 720/1080 runs slower than realtime on a
+   *  1-vCPU isolate, so those rungs became constant-loading traps for
+   *  anyone who picked one (2026-10-08 field report: "everything loads
+   *  since the last version; before it I watched an entire match without
+   *  loading"). Full 720p/1080p still reach the menu the SMOOTH ways: as
+   *  native hls levels when the source manifest carries them, and via the
+   *  "More qualities" alternate sources. The continuous relay (self-hosted)
+   *  keeps the full list — its ffmpeg pipeline handles any height. */
   const segLadder = player.kind === 'daddylive' && tcSeg && !tcRelayRef.current;
   const dsHeights: readonly number[] = segLadder
-    ? ([144, 244, 360, 480, ...(srcHeight >= 720 ? [720] : []), ...(srcHeight >= 1080 ? [1080] : [])] as number[])
+    ? ([144, 244, 360, 480] as const)
     : DATA_SAVER_HEIGHTS;
 
   return (
@@ -2256,7 +2274,9 @@ export function PlayerOverlay() {
                           </button>
                         )}
                         <p className="px-3.5 py-2 text-[10px] font-medium leading-snug text-zilla-dim">
-                          Any height, re-encoded in real time to save bandwidth — perfect for slow connections or capping quality.
+                          {segLadder
+                            ? 'Re-encoded live to save bandwidth — built for slow connections. Full 720p/1080p plays natively whenever the source carries them.'
+                            : 'Any height, re-encoded in real time to save bandwidth — perfect for slow connections or capping quality.'}
                         </p>
                       </>
                     )}

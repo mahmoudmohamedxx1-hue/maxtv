@@ -134,6 +134,7 @@ export async function GET(req: Request) {
       const p = new URLSearchParams(searchParams);
       p.set('mode', 'seg');
       p.set('n', String(n));
+      p.set('h', String(h)); // sanitized ladder height — never a dead >480 ask
       return `/api/turbo?${p.toString()}`;
     };
     const text = raw
@@ -191,11 +192,15 @@ export async function GET(req: Request) {
     });
   }
   // rewrite t<sn>.ts lines → /api/turbo segment URLs (n = upstream sn —
-  // instance-independent, so any warm instance can serve the bytes)
+  // instance-independent, so any warm instance can serve the bytes).
+  // ⚠ strip a dead &h= ask (e.g. a stale 720/1080 pref): the sanitized h is
+  // 0 here, and echoing the unsanitized param into segment URLs made the
+  // native playlist LOOK like it still referenced a transcode ladder.
   const segUrlFor = (n: number) => {
     const p = new URLSearchParams(searchParams);
     p.set('mode', 'seg');
     p.set('n', String(n));
+    p.delete('h'); // native passthrough — no ladder height to carry
     return `/api/turbo?${p.toString()}`;
   };
   const text = raw

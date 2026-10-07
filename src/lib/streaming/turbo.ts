@@ -677,15 +677,19 @@ export class TurboSession {
  *  task and the player's request for the same segment share it) */
 const tcInflight = new Map<string, Promise<Uint8Array | null>>();
 
-/** heights the serverless segment ladder offers. 720/1080 are real DOWNSCALE
- *  encodes — the player only offers them when the native feed is at least
- *  that tall (never an upscale), and Auto never picks them (manual choices
- *  only: the user explicitly trades encode headroom for max quality).
- *  Encoding 1080p HEVC → 720p x264 veryfast runs ~5-7s per ~6s segment on a
- *  1-vCPU isolate — the 2-slot queue + 12-segment window absorbs it, but a
- *  slow instance can buffer; that's the accepted cost of a manual max rung.
- *  The player clamps to 480 while the source height is still unknown. */
-export const SEG_LADDER_HEIGHTS = [144, 244, 360, 480, 720, 1080] as const;
+/** heights the serverless segment ladder offers — capped at 480 because that
+ *  is what a 1-vCPU isolate can encode FASTER than realtime (benchmarks
+ *  above: ≤480p ≈ 1.9-4.8s per 10s segment). 720/1080 encodes run 5-7s+ per
+ *  ~6s segment — slower than the stream plays, so the buffer can only drain:
+ *  the 2026-10-08 field report ("everything loads constantly since the last
+ *  version; before it I watched an entire match without a single loading")
+ *  was a persisted 1080p pick routing every channel through that doomed
+ *  re-encode. Full-height playback does NOT need this ladder anyway: the
+ *  native passthrough already serves the source's own 720p/1080p untouched,
+ *  and real ladders surface as hls levels / "More qualities" alternates.
+ *  Asking &h=720|1080 here now falls through to the native playlist (h=0)
+ *  instead of a re-encode that can never keep up. */
+export const SEG_LADDER_HEIGHTS = [144, 244, 360, 480] as const;
 
 const TC_TIMEOUT_MS = 25_000;
 const TC_MAX_CONCURRENT = 2;
