@@ -92,6 +92,11 @@ interface SegData {
    *  NEVER listed in the served window: the browser's MSE cannot decode
    *  them and a single one would kill the whole SourceBuffer */
   safe: boolean;
+  /** MEASURED media duration (first-PTS delta to the next segment) — set
+   *  retroactively when the next segment commits. Providers lie in EXTINF
+   *  (measured: declared 5.0s, real 3.1s on a beIN HEVC phase) and hls.js
+   *  timeline arithmetic goes wrong following the declared values. */
+  realDur?: number;
 }
 
 export type TurboVerdict = 'ready' | 'relay' | 'dead';
@@ -274,17 +279,22 @@ export class TurboSession {
   readPlaylist(tcHeight?: number): string | null {
     const w = this.windowRange(tcHeight !== undefined);
     if (!w) return null;
-    const maxDur = Math.max(4, ...w.list.map((x) => x.seg.dur));
+    // measured media durations when the next segment has taught them to us —
+    // declared EXTINF lies on flappy providers and drags hls.js's timeline
+    // arithmetic (fragment starts, live edge, latency) away from the real media
+    const durs = w.list.map((x) => x.seg.realDur || x.seg.dur);
+    const maxDur = Math.max(4, ...durs);
     const out: string[] = [
       '#EXTM3U',
       '#EXT-X-VERSION:3',
       `#EXT-X-TARGETDURATION:${Math.ceil(maxDur)}`,
       `#EXT-X-MEDIA-SEQUENCE:${w.base}`,
     ];
-    for (const { sn, seg } of w.list) {
+    for (let i = 0; i < w.list.length; i++) {
+      const { seg } = w.list[i];
       if (seg.disc) out.push('#EXT-X-DISCONTINUITY');
-      out.push(`#EXTINF:${seg.dur.toFixed(3)},`);
-      out.push(`t${sn}.ts`);
+      out.push(`#EXTINF:${durs[i].toFixed(3)},`);
+      out.push(`t${w.list[i].sn}.ts`);
     }
     return out.join('\n') + '\n';
   }
@@ -389,11 +399,13 @@ export class TurboSession {
     this.tcWarmAt.set(h, now);
     const w = this.windowRange(true);
     if (!w) return;
-    // WARMS THE PLAYER'S START POSITION, not the window tip: hls.js begins
-    // liveSyncDurationCount (3) segments behind the newest listed segment,
-    // so warming [tip-3, tip-2] is what makes the FIRST segment load fast;
-    // every later segment passes through those positions on successive
-    // polls and gets warmed ~2 polls before the player reaches it.
+    // WARMS THE PLAYER'S RIDE BAND, not the window tip: the ladder player
+    // joins liveSyncDurationCount (5) segments behind the newest listed
+    // segment, so warming [len-count-2, len-2] covers the join position and
+    // the segments above it. Every later segment slides down through that
+    // band on successive polls — riding 5 back means each one is warmed
+    // ~2 polls (≈12s) BEFORE the playhead reaches it: the lead time a cold
+    // encode needs to stay invisible instead of stalling the buffer.
     const from = Math.max(0, w.list.length - count - 2);
     const to = Math.max(from, w.list.length - 2);
     const sns = w.list.slice(from, to).map((x) => x.sn);
@@ -581,7 +593,58 @@ export class TurboSession {
     const codecFlip = !!codec && !!this.lastCodec && !sameCodec(this.lastCodec, codec);
     if (codec) this.lastCodec = codec;
     const safe = codec ? codecSafe(codec) : true;
-    this.segs.set(sn, { ts, dur, disc: disc || codecFlip, safe });
+    // TIMELINE CONTINUITY — an upstream PTS jump (encoder swap / CDN failover)
+    // without its own #EXT-X-DISCONTINUITY marker leaves a hole the size of
+    // the jump in the served timeline; the playhead stalls into it and hls.js
+    // misreads the resulting lag as catch-up latency (measured: +60s jump →
+    // buffer split in two ranges, playhead froze at the hole, playbackRate
+    // heuristics kicked — the 2026-10-08 "480p doesn't render/load constantly"
+    // field report). Mark OUR playlist discontinuous at the jump instead:
+    // hls.js rebases the timeline there and playback rides straight through.
+    let ptsJump = false;
+    if (codec?.videoPid && sn > this.lastPtsSn) {
+      const pts = firstVideoPts(ts, codec.videoPid);
+      if (pts !== null) {
+        if (this.lastFirstPts !== null && this.lastPtsDelta > 0) {
+          const snGap = Math.max(1, sn - this.lastPtsSn);
+          // expected start = previous start + (segments passed × the MEASURED
+          // first-to-first PTS delta). Measured, not EXTINF-declared: declared
+          // durations can lie ~40% on flappy providers (beIN HEVC phase:
+          // declared 5.0s, real 3.1s) and the error would false-fire at the
+          // bootstrap comparison and accumulate afterwards.
+          const expected = this.lastFirstPts + snGap * this.lastPtsDelta;
+          let diff = pts - expected;
+          // 33-bit PTS wrap (2^33 ≈ 26.5h — a long match can cross one)
+          if (diff > 0x100000000) diff -= 0x200000000;
+          else if (diff < -0x100000000) diff += 0x200000000;
+          // tolerance: tight (1.5s + 25%) once the delta is a real measurement;
+          // WIDE (10s / ±100%) while it is still the declared bootstrap — the
+          // declared/real mismatch itself is not a discontinuity.
+          const tol = this.ptsDeltaMeasured
+            ? Math.max(135_000, snGap * this.lastPtsDelta * 0.25)
+            : Math.max(900_000, snGap * this.lastPtsDelta);
+          if (Math.abs(diff) > tol) {
+            ptsJump = true;
+          }
+        }
+        if (sn - this.lastPtsSn === 1 && this.lastFirstPts !== null && !ptsJump) {
+          // learn the real inter-segment duration — both for the next
+          // prediction and as the PREVIOUS segment's realDur (served EXTINF)
+          const delta = pts - this.lastFirstPts;
+          if (delta > 0) {
+            this.lastPtsDelta = delta;
+            this.ptsDeltaMeasured = true;
+            const prevSeg = this.segs.get(sn - 1);
+            if (prevSeg) prevSeg.realDur = delta / 90_000;
+          }
+        } else if (this.lastPtsDelta <= 0) {
+          this.lastPtsDelta = dur * 90_000; // bootstrap before a measurement exists
+        }
+        this.lastFirstPts = pts;
+        this.lastPtsSn = sn;
+      }
+    }
+    this.segs.set(sn, { ts, dur, disc: disc || codecFlip || ptsJump, safe });
     if (sn > this.newestSn) {
       this.windowSns.push(sn);
       this.newestSn = sn;
@@ -606,6 +669,13 @@ export class TurboSession {
   }
 
   private lastCodec: { video: number; audio: number } | null = null;
+  /** timeline-continuity trackers — first video PTS of the last committed
+   *  segment, its sn, the measured first-to-first PTS delta, and whether that
+   *  delta came from a real measurement (vs the declared bootstrap) */
+  private lastFirstPts: number | null = null;
+  private lastPtsSn = 0;
+  private lastPtsDelta = 0;
+  private ptsDeltaMeasured = false;
   private readonly urlDur = new Map<number, number>();
 
   private async fetchSeg(url: string, referer: string): Promise<Uint8Array | null> {
@@ -691,7 +761,7 @@ const tcInflight = new Map<string, Promise<Uint8Array | null>>();
  *  instead of a re-encode that can never keep up. */
 export const SEG_LADDER_HEIGHTS = [144, 244, 360, 480] as const;
 
-const TC_TIMEOUT_MS = 25_000;
+const TC_TIMEOUT_MS = 10_000;
 const TC_MAX_CONCURRENT = 2;
 let tcActive = 0;
 /** waiters for a transcode slot — PLAYER-FACING requests unshift (they get
@@ -749,8 +819,18 @@ async function transcodeSegment(ts: Uint8Array, h: number, priority: boolean): P
             // With copyts the provider's encoder clock passes through and
             // consecutive segments stay monotonic.
             '-copyts',
-            '-vf', `scale=-2:${h}`,
-            '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '28', '-pix_fmt', 'yuv420p',
+            // ⚠ 2026-10-08 "480p doesn't render/load constantly": veryfast
+            // encodes 480p at only ~1.5-2x realtime on a full 1-vCPU isolate
+            // — under Vercel CPU steal that flips to SLOWER than realtime and
+            // the buffer can only drain. ultrafast is ~2.5-3x faster (plenty
+            // of headroom even throttled) and fast_bilinear scaling cuts the
+            // per-frame resample cost. fps=30 caps the frame count (beIN
+            // ships 50/60fps — fewer frames = proportionally less encode
+            // work at barely-visible 480p cost; benchmarked 1.99x realtime
+            // vs 1.1x at native fps) and CRF 31 keeps the rung near
+            // ~1.9Mbps — a real saving vs the ~8Mbps source.
+            '-vf', `scale=-2:${h}:flags=fast_bilinear,fps=30`,
+            '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '31', '-pix_fmt', 'yuv420p',
             '-c:a', 'aac', '-b:a', '96k', '-ac', '2',
             '-f', 'mpegts', outPath,
           ],
@@ -888,6 +968,9 @@ export function turboCachedBySn(channelId: string, sn: number): { ts: Uint8Array
 export interface TsCodecs {
   video: number;
   audio: number;
+  /** PID of the first video elementary stream (0 when absent) — used to
+   *  locate the PES header for the timeline-continuity check below */
+  videoPid?: number;
 }
 
 function sameCodec(a: TsCodecs, b: TsCodecs): boolean {
@@ -899,6 +982,38 @@ function codecSafe(c: TsCodecs): boolean {
   const safeVideo = c.video === 0x1b || c.video === 0x42;
   const safeAudio = c.audio === 0x03 || c.audio === 0x04 || c.audio === 0x0f || c.audio === 0x11 || c.audio === 0;
   return safeVideo && safeAudio;
+}
+
+/** first presentation timestamp (90kHz ticks) on `videoPid`'s first PES —
+ *  null when no PTS-bearing PES shows up in the scanned packets. This is the
+ *  timeline-continuity probe: DaddyLive edges occasionally jump their PTS
+ *  (encoder swap / CDN failover) WITHOUT an #EXT-X-DISCONTINUITY marker, and
+ *  an unmarked jump poisons the served playlist — the playhead hits a hole
+ *  the size of the jump and stalls through it (2026-10-08 "480p doesn't
+ *  render/load constantly": a +60s PTS jump froze the ladder mid-match). */
+export function firstVideoPts(buf: Uint8Array, videoPid: number): number | null {
+  if (!videoPid) return null;
+  const packets = Math.min(Math.floor(buf.length / 188), 400);
+  for (let i = 0; i < packets; i++) {
+    const p = i * 188;
+    if (buf[p] !== 0x47) continue;
+    const pid = ((buf[p + 1] & 0x1f) << 8) | buf[p + 2];
+    if (pid !== videoPid || (buf[p + 1] & 0x40) === 0) continue; // need PES start
+    let off = p + 4;
+    if (buf[p + 3] & 0x20) off += 1 + buf[p + 4]; // adaptation field
+    if (off + 14 > p + 188) continue;
+    // PES: 00 00 01 <stream_id> <len(2)> <marker/flags(2)> <headerLen>
+    if (buf[off] !== 0 || buf[off + 1] !== 0 || buf[off + 2] !== 1) continue;
+    if ((buf[off + 7] & 0x80) === 0) continue; // no PTS flag
+    const pts =
+      (((buf[off + 9] >> 1) & 0x07) * 0x40000000) +
+      (buf[off + 10] * 0x20000) +
+      (((buf[off + 11] >> 1) & 0x7f) * 0x4000) +
+      (buf[off + 12] * 0x80) +
+      (buf[off + 13] >> 1);
+    return pts; // first PTS-bearing video PES — the segment's media start
+  }
+  return null;
 }
 
 /** Parse the PAT → PMT out of a TS buffer; null when nothing parseable. */
@@ -938,14 +1053,19 @@ export function sniffCodecs(buf: Uint8Array): TsCodecs | null {
       let q = off + 12 + pil;
       let video = 0;
       let audio = 0;
+      let videoPid = 0;
       while (q + 5 <= end) {
         const type = buf[q];
+        const esPid = ((buf[q + 1] & 0x1f) << 8) | buf[q + 2];
         const esLen = ((buf[q + 3] & 0x0f) << 8) | buf[q + 4];
-        if (isVideoType(type) && !video) video = type;
+        if (isVideoType(type) && !video) {
+          video = type;
+          videoPid = esPid;
+        }
         if (isAudioType(type) && !audio) audio = type;
         q += 5 + esLen;
       }
-      if (video || audio) out = { video, audio };
+      if (video || audio) out = { video, audio, videoPid };
     }
     if (out) break;
   }

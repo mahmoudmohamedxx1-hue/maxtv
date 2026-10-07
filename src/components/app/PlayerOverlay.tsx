@@ -84,6 +84,21 @@ const RESILIENT_LOAD_POLICIES = {
   },
 };
 
+/** transcode-ladder hls tuning — the &h= data-saver feeds are re-encoded
+ *  one segment at a time on a 1-vCPU serverless isolate, so the player must
+ *  NOT hug the live edge like it does on native passthrough: join 5 segments
+ *  (≈30s) back and keep a deep buffer. That ride distance is what turns the
+ *  encode latency invisible — the warm band has ~2 polls of lead time per
+ *  segment, and a slow cold encode lands in runway instead of draining the
+ *  buffer into a stall (2026-10-08 "480p doesn't render/load constantly"). */
+const LADDER_HLS_CONFIG = {
+  liveSyncDurationCount: 5,
+  maxBufferLength: 60,
+  maxMaxBufferLength: 120,
+  maxLiveSyncPlaybackRate: 1, // never catch-up speed — playback stays 1x
+  backBufferLength: 90,
+} as const;
+
 /** transcode ladder — every height re-encoded in real time for streams whose
  *  provider ships a single rendition (DaddyLive + most free IPTV CDNs) */
 const DATA_SAVER_HEIGHTS = [144, 244, 360, 480, 720, 1080] as const;
@@ -1593,11 +1608,15 @@ export function PlayerOverlay() {
     video.volume = prefs.volume;
     video.muted = prefs.muted;
     if (Hls.isSupported()) {
+      // &h= ladder src → ride 5 segments back with a deep buffer (the encode
+      // needs lead time); native srcs keep the profile-tuned edge distance
+      const ladder = /\/api\/turbo\?.*\bh=\d+/.test(src);
       const hls = new Hls({
         // see the main load() — LL mode off or hls.js plays 2× catch-up
         lowLatencyMode: false,
         enableWorker: true,
         ...hlsPerfConfig(loadPrefs().perfMode),
+        ...(ladder ? LADDER_HLS_CONFIG : null),
         ...RESILIENT_LOAD_POLICIES,
       });
       hlsRef.current = hls;

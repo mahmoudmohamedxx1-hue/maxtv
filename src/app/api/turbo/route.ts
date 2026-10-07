@@ -36,7 +36,10 @@ export const maxDuration = 60;
 async function warmTurboLadder(session: TurboSession, h: number): Promise<void> {
   try {
     await session.kick(2_000);
-    session.warmTranscodes(h, 3);
+    // 5-deep: the ladder player joins 5 segments back, so the warm band
+    // must cover the join position + the segments above it — each segment
+    // then gets ~2 polls (≈12s) of encode lead before the playhead arrives
+    session.warmTranscodes(h, 5);
   } catch {
     /* best effort */
   }
@@ -95,6 +98,12 @@ export async function GET(req: Request) {
         headers: { 'content-type': 'text/plain', 'cache-control': 'no-store' },
       });
     }
+    // ladder: keep warming the ride band from segment requests too — on
+    // Vercel an isolate that ONLY sees segment traffic (playlist polls land
+    // on a sibling) would otherwise serve every segment as a cold encode.
+    // after() runs post-response: zero added player latency. Throttled to
+    // one batch per 2s inside warmTranscodes.
+    if (h) after(() => void warmTurboLadder(session, h));
     return new NextResponse(new Uint8Array(bytes), {
       status: 200,
       headers: {
