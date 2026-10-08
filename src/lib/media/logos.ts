@@ -180,6 +180,11 @@ export function getLeagueLogo(league: string, title = ''): string | null {
 
 const teamCache = new Map<string, string | null>(); // includes negatives
 const inFlight = new Map<string, Promise<string | null>>();
+/** when each NEGATIVE verdict was recorded — a timeout must not poison the
+ *  cache for the isolate's whole life (the comment promised 10 min; the code
+ *  never delivered it, which mattered once lookups became fast-fail 2.5s) */
+const negAt = new Map<string, number>();
+const NEG_TTL_MS = 10 * 60_000;
 
 function cleanTeamName(name: string): string {
   return name
@@ -190,7 +195,7 @@ function cleanTeamName(name: string): string {
     .trim();
 }
 
-function findCachedTeamLogo(name: string): string | null {
+export function findCachedTeamLogo(name: string): string | null {
   if (!name) return null;
   const rawLower = name.toLowerCase().trim();
   if (CLUB_BADGES[rawLower]) return CLUB_BADGES[rawLower];
@@ -216,7 +221,16 @@ function findCachedTeamLogo(name: string): string | null {
 export async function findTeamLogo(name: string): Promise<string | null> {
   if (!name) return null;
   const cached = teamCache.get(name);
-  if (cached !== undefined) return cached;
+  if (cached !== undefined) {
+    // expired negative → treat as a miss so a slow moment doesn't bury a
+    // crest for the rest of the isolate's life
+    if (cached === null && Date.now() - (negAt.get(name) ?? 0) > NEG_TTL_MS) {
+      teamCache.delete(name);
+      negAt.delete(name);
+    } else {
+      return cached;
+    }
+  }
   const direct = findCachedTeamLogo(name);
   if (direct) {
     teamCache.set(name, direct);
@@ -229,7 +243,12 @@ export async function findTeamLogo(name: string): Promise<string | null> {
       const q = name.replace(/\(.*?\)/g, '').trim().slice(0, 48);
       const url = `https://www.thesportsdb.com/api/v1/json/3/searchteams.php?t=${encodeURIComponent(q)}`;
       const res = await fetch(url, {
-        signal: AbortSignal.timeout(7000),
+        // 2.5s hard cap — a crest lookup that can't answer fast is worthless
+        // on a first-paint path; ~300 matches × 7s timeouts on a cold isolate
+        // was the bulk of the 37s "sports section loads forever" (2026-10-09).
+        // The negative cache means the retry happens politely in the
+        // background (after() continuation), not on the user's request.
+        signal: AbortSignal.timeout(2500),
         headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' },
       });
       if (!res.ok) return null;
@@ -242,6 +261,8 @@ export async function findTeamLogo(name: string): Promise<string | null> {
     }
   })().then((logo) => {
     teamCache.set(name, logo);
+    if (logo === null) negAt.set(name, Date.now());
+    else negAt.delete(name);
     inFlight.delete(name);
     return logo;
   });

@@ -65,13 +65,41 @@ export async function GET() {
     const beinDl = daddyliveChs.filter((c) => /be\s?in/i.test(c.name));
     const beinIds = new Set(beinDl.map((b) => b.id));
     let probeOk = true;
+    let verdictsComplete = true;
     if (beinDl.length) {
       // never let a probe outage blank the rail — fall back to showing all
+      // ⚤ 2026-10-09: the probe is BOUNDED now. Awaiting ~35 beIN stream
+      // probes (5 chunks × 3 retries × 3.5s) held cold responses for ~49s —
+      // the #1 reason the sports section "loads forever". The static dead
+      // seed already filters cold starts correctly; runtime verdicts are a
+      // refinement that lands on the next request (client refetches once
+      // when we tell it the verdicts were incomplete).
+      let probesDone = false;
       try {
-        await probeWarm; // the warm-up already holds most verdicts
-        await probeDaddyLiveChannels(beinDl.map((c) => c.ref));
+        await Promise.race([
+          (async () => {
+            await Promise.all([probeWarm, probeDaddyLiveChannels(beinDl.map((c) => c.ref))]);
+            probesDone = true;
+          })(),
+          new Promise((r) => setTimeout(r, 2_500)),
+        ]);
       } catch {
         probeOk = false;
+      }
+      if (!probesDone) {
+        verdictsComplete = false;
+        // partial verdicts would HIDE every not-yet-probed beIN (the
+        // runtime filter only keeps verified ones) — serve the seed-only
+        // view instead, which shows seed-alive beINs immediately
+        probeOk = false;
+        // finish the probes post-response so verdicts cache for the refetch
+        after(async () => {
+          try {
+            await probeDaddyLiveChannels(beinDl.map((c) => c.ref));
+          } catch {
+            /* best effort */
+          }
+        });
       }
     }
     const runtimeAlive = probeOk ? freshAliveIds() : null;
@@ -115,8 +143,17 @@ export async function GET() {
     }));
 
     return NextResponse.json(
-      { channels: [...visibleDl, ...iptvChs], total: visibleDl.length + iptvChs.length },
-      { headers: { 'cache-control': 'public, max-age=120, stale-while-revalidate=300' } }
+      { channels: [...visibleDl, ...iptvChs], total: visibleDl.length + iptvChs.length, partial: !verdictsComplete },
+      {
+        headers: {
+          // an incomplete-verdict response must not be edge-cached — the
+          // client's single refetch (8s) needs to reach the function and get
+          // the runtime-filtered list
+          ...(verdictsComplete
+            ? { 'cache-control': 'public, max-age=120, stale-while-revalidate=300' }
+            : { 'cache-control': 'no-store' }),
+        },
+      }
     );
   } catch (e) {
     return NextResponse.json({ error: 'channels_failed', message: (e as Error).message }, { status: 502 });

@@ -142,28 +142,48 @@ async function build(): Promise<Catalog> {
     if (srcChannels.length) bySource.set(src.id, srcChannels);
   }
 
-  // ── health probe: drop sources where every sample is dead ────────────────
+  // ── health probe: NON-BLOCKING refinement ────────────────────────────────
+  // Awaiting ~18 sources × 3 stream samples (9s timeouts apiece) held the
+  // whole cold catalog build at ~10s (2026-10-09 "sports section loads
+  // forever"). A dead-source filter is a quality REFINEMENT, not a gate:
+  // build now with everything, refine the in-memory catalog when verdicts
+  // land — subsequent requests serve the filtered view.
   const sourceHealth: Record<string, SourceHealth> = {};
   const probeIds = [...bySource.keys()];
-  await Promise.all(
+  void Promise.all(
     probeIds.map(async (id) => {
-      const status = await probeSource(id, bySource.get(id)!);
-      sourceHealth[id] = status.health;
+      try {
+        const status = await probeSource(id, bySource.get(id)!);
+        sourceHealth[id] = status.health;
+      } catch {
+        /* leave unknown — never blocks, never fails the build */
+      }
     })
-  );
+  )
+    .then(() => {
+      const dropped = new Set(
+        Object.entries(sourceHealth)
+          .filter(([, h]) => h === 'dead')
+          .map(([id]) => id)
+      );
+      if (dropped.size === 0 || !cached) return;
+      const keep = (c: IPTVChannel) => !dropped.has(c.source);
+      const liveChannels = cached.channels.filter(keep);
+      const liveSports = cached.sportsChannels.filter(keep);
+      const sportsIds = new Set(liveSports.map((c) => c.id));
+      cached = {
+        ...cached,
+        channels: liveChannels,
+        sportsChannels: liveSports,
+        otherChannels: liveChannels.filter((c) => !sportsIds.has(c.id)),
+        sources: sourcesFor(liveChannels, sourceHealth),
+        sourceHealth: { ...sourceHealth },
+      };
+    })
+    .catch(() => {});
 
-  const dropped = new Set(
-    Object.entries(sourceHealth)
-      .filter(([, h]) => h === 'dead')
-      .map(([id]) => id)
-  );
-
-  let liveChannels = channels;
-  let liveSports = sportsChannels;
-  if (dropped.size > 0) {
-    liveChannels = channels.filter((c) => !dropped.has(c.source));
-    liveSports = sportsChannels.filter((c) => !dropped.has(c.source));
-  }
+  const liveChannels = channels;
+  const liveSports = sportsChannels;
 
   // OTHERS = everything except the curated sports playlists' channels
   const sportsIds = new Set(liveSports.map((c) => c.id));
@@ -190,20 +210,7 @@ async function build(): Promise<Catalog> {
   }
 
   // Source counts + health (alive sources first)
-  const srcCount = new Map<string, number>();
-  for (const c of liveChannels) srcCount.set(c.source, (srcCount.get(c.source) || 0) + 1);
-  const sources: ChannelSourceInfo[] = PLAYLIST_SOURCES.map((s: PlaylistSource) => ({
-    id: s.id,
-    name: s.name,
-    count: srcCount.get(s.id) || 0,
-    health: sourceHealth[s.id] || 'unknown',
-  }))
-    .filter((s) => s.count > 0)
-    .sort((a, b) => {
-      // ok first, then geo, then unknown — alphabetical within a tier
-      const tier = (h?: string) => (h === 'ok' ? 0 : h === 'geo' ? 1 : 2);
-      return tier(a.health) - tier(b.health) || a.name.localeCompare(b.name);
-    });
+  const sources: ChannelSourceInfo[] = sourcesFor(liveChannels, sourceHealth);
 
   return {
     channels: liveChannels,
@@ -232,6 +239,28 @@ function prettify(id: string): string {
     sports: 'Sports',
   };
   return map[id] ?? id;
+}
+
+/** source rows (counts + health tiers) — shared by the cold build and the
+ *  background post-probe refinement so both stay shape-identical */
+function sourcesFor(
+  liveChannels: IPTVChannel[],
+  sourceHealth: Record<string, SourceHealth>
+): ChannelSourceInfo[] {
+  const srcCount = new Map<string, number>();
+  for (const c of liveChannels) srcCount.set(c.source, (srcCount.get(c.source) || 0) + 1);
+  return PLAYLIST_SOURCES.map((s: PlaylistSource) => ({
+    id: s.id,
+    name: s.name,
+    count: srcCount.get(s.id) || 0,
+    health: sourceHealth[s.id] || 'unknown',
+  }))
+    .filter((s) => s.count > 0)
+    .sort((a, b) => {
+      // ok first, then geo, then unknown — alphabetical within a tier
+      const tier = (h?: string) => (h === 'ok' ? 0 : h === 'geo' ? 1 : 2);
+      return tier(a.health) - tier(b.health) || a.name.localeCompare(b.name);
+    });
 }
 
 // ─── per-stream server switching: same channel on other sources ─────────────

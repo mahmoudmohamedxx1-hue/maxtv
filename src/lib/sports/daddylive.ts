@@ -185,13 +185,36 @@ function isWomensCompetition(hay: string): boolean {
   return WOMENS_RE.test(flat);
 }
 
+/** RACE every mirror at once — first response carrying the marker wins.
+ *  Sequential tries made a cold start pay each dead mirror's full timeout
+ *  (9s apiece) before the good one answered; racing bounds the wait to the
+ *  fastest live mirror. A mirror that 403s/redirects-to-garbage just loses
+ *  the race instead of taxing everyone. */
+async function raceMirrorHtml(path: string, marker: string): Promise<string | null> {
+  const attempts = MIRRORS.map(async (base) => {
+    const html = await fetchText(`${base}${path}`, `${base}/`);
+    return html && html.includes(marker) ? html : null;
+  });
+  return new Promise((resolve) => {
+    let pending = attempts.length;
+    let settled = false;
+    for (const p of attempts) {
+      p.then((html) => {
+        if (!settled && html) {
+          settled = true;
+          resolve(html);
+        }
+      })
+        .catch(() => {})
+        .finally(() => {
+          if (!settled && --pending === 0) resolve(null);
+        });
+    }
+  });
+}
+
 async function fetchScheduleUncached(): Promise<SportsMatch[]> {
-  let html: string | null = null;
-  for (const base of MIRRORS) {
-    html = await fetchText(`${base}/`, `${base}/`);
-    if (html && html.includes('schedule__event')) break;
-    html = null;
-  }
+  const html = await raceMirrorHtml('/', 'schedule__event');
   if (!html) return [];
 
   const matches = parseScheduleHtml(html);
@@ -221,7 +244,11 @@ async function probeFootballFeedHealth(matches: SportsMatch[]): Promise<FeedHeal
   const ids = [...want];
   const alive = await Promise.race([
     probeDaddyLiveChannels(ids),
-    new Promise<Set<string>>((r) => setTimeout(() => r(new Set()), 6_000)),
+    // 3.5s budget — feed ranking is a refinement, not a gate; the abandoned
+    // probe keeps running (per-id dedup shares it) and verdicts cache for
+    // the next poll. 6s here + the scrape + enrichment was stacking into
+    // 9s+ cold schedules (2026-10-09 loading fix).
+    new Promise<Set<string>>((r) => setTimeout(() => r(new Set()), 3_500)),
   ]);
   // empty set = probe didn't finish in the budget (or genuinely everything
   // died) — either way treat as NO runtime info: the static seed still
@@ -234,6 +261,12 @@ async function probeFootballFeedHealth(matches: SportsMatch[]): Promise<FeedHeal
 /** last non-empty scrape — survives cache expiry so an upstream blip never
  *  blanks the home page (hero) with an empty schedule */
 let lastGoodSchedule: SportsMatch[] | null = null;
+
+/** single-flight guard for the cold scrape — instrumentation's boot warmup
+ *  and the first user request used to run DUPLICATE multi-second scrapes on
+ *  the same isolate; now they share one promise and the visitor awaits the
+ *  warmup instead of doubling it (2026-10-09 "sports section loads forever"). */
+let scheduleFlight: Promise<SportsMatch[]> | null = null;
 
 export async function getSchedule(): Promise<SportsMatch[]> {
   const key = 'dl:schedule';
@@ -251,7 +284,9 @@ export async function getSchedule(): Promise<SportsMatch[]> {
     }
     return hit;
   }
+  if (scheduleFlight) return scheduleFlight;
 
+  scheduleFlight = (async () => {
   let fresh = await fetchScheduleUncached();
   if (!fresh.length) {
     // transient upstream flap (timeout / 403 on both mirrors) — one retry
@@ -269,6 +304,10 @@ export async function getSchedule(): Promise<SportsMatch[]> {
   // never cache — and never serve — an empty scrape as success: fall back to
   // the last good lineup so the hero + rows survive the blip
   return lastGoodSchedule ?? [];
+  })().finally(() => {
+    scheduleFlight = null;
+  });
+  return scheduleFlight;
 }
 
 export function parseScheduleHtml(html: string): SportsMatch[] {
@@ -379,12 +418,7 @@ function fixMojibake(name: string): string {
 }
 
 async function fetch247Uncached(): Promise<DaddyLiveChannel[]> {
-  let html: string | null = null;
-  for (const base of MIRRORS) {
-    html = await fetchText(`${base}/24-7-channels.php`, `${base}/`);
-    if (html && html.includes('class="card"')) break;
-    html = null;
-  }
+  const html = await raceMirrorHtml('/24-7-channels.php', 'class="card"');
   if (!html) return [];
 
   const $ = cheerio.load(html);
@@ -408,6 +442,10 @@ async function fetch247Uncached(): Promise<DaddyLiveChannel[]> {
   return out;
 }
 
+/** single-flight guard — same cold-start duplicate-scrape fix as the
+ *  schedule (boot warmup + first request share one scrape). */
+let ch247Flight: Promise<DaddyLiveChannel[]> | null = null;
+
 export async function get247Channels(): Promise<DaddyLiveChannel[]> {
   const key = 'dl:247';
   const hit = getCached<DaddyLiveChannel[]>(key);
@@ -420,10 +458,17 @@ export async function get247Channels(): Promise<DaddyLiveChannel[]> {
     }
     return hit;
   }
+  if (ch247Flight) return ch247Flight;
 
-  const fresh = await fetch247Uncached();
-  setCached(key, fresh, 10 * 60_000, 10 * 60_000);
-  return fresh;
+  ch247Flight = fetch247Uncached()
+    .then((fresh) => {
+      setCached(key, fresh, 10 * 60_000, 10 * 60_000);
+      return fresh;
+    })
+    .finally(() => {
+      ch247Flight = null;
+    });
+  return ch247Flight;
 }
 
 // ─── stream resolution (watch page → embed → manifest) ──────────────────────
@@ -823,11 +868,25 @@ export function freshAliveIds(): Set<string> {
   return out;
 }
 
+/** per-id in-flight dedup — the channels route fires probeWarm + the inline
+ *  probe + the after() continuation, and the boot warmup adds its own: four
+ *  concurrent callers used to quadruple the same ~35 beIN stream probes
+ *  (each 3 retries × 3.5s). Sharing one promise per id cuts the cold-start
+ *  probe storm to a single pass. */
+const probeRunning = new Map<string, Promise<boolean>>();
+function probeOneDedup(id: string): Promise<boolean> {
+  const existing = probeRunning.get(id);
+  if (existing) return existing;
+  const p = probeOne(id).finally(() => probeRunning.delete(id));
+  probeRunning.set(id, p);
+  return p;
+}
+
 async function probeAll(ids: string[]): Promise<boolean[]> {
   const out: boolean[] = [];
   for (let i = 0; i < ids.length; i += 8) {
     const chunk = ids.slice(i, i + 8);
-    const v = await Promise.all(chunk.map(probeOne));
+    const v = await Promise.all(chunk.map(probeOneDedup));
     out.push(...v);
   }
   return out;

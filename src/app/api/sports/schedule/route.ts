@@ -1,11 +1,14 @@
-import { NextResponse } from 'next/server';
+import { NextResponse, after } from 'next/server';
 import { getSchedule } from '@/lib/sports/daddylive';
 import { sportName } from '@/lib/sports/categories';
-import { extractTeamsFromTitle, findTeamLogo, getLeagueLogo, getChannelLogo } from '@/lib/media/logos';
+import { extractTeamsFromTitle, findTeamLogo, findCachedTeamLogo, getLeagueLogo, getChannelLogo } from '@/lib/media/logos';
 import { getBigLeagueFixtures, getNFLFixtures, fixtureKey, peekFixtures, warmBigLeagues, type BigFixture } from '@/lib/sports/bigleagues';
 import type { SportsMatch } from '@/lib/types';
 
 export const dynamic = 'force-dynamic';
+/** after() crest-fill continuation needs headroom past the response on
+ *  Vercel — the response itself still ships in ~2-4s cold. */
+export const maxDuration = 30;
 
 /** Enriched match with artwork (same technique as the original repo's
  *  catalog.js: team crests from TheSportsDB/seed, league emblems from the
@@ -42,12 +45,17 @@ async function enrich(m: SportsMatch): Promise<EnrichedMatch> {
 
   const e: EnrichedMatch = { ...m, title: cleanText(m.title), league: cleanText(m.league) };
   const teams = extractTeamsFromTitle(e.title);
+  let logosComplete = true;
   if (teams) {
     e.team1 = cleanText(teams[0]);
     e.team2 = cleanText(teams[1]);
     const [l1, l2] = await Promise.all([findTeamLogo(teams[0]), findTeamLogo(teams[1])]);
     if (l1) e.team1Logo = l1;
     if (l2) e.team2Logo = l2;
+    // a crest lost to the 2.5s fast-fail (timeout → null) must NOT be
+    // frozen into the cache as crest-less — leave it uncached so the
+    // after() fill / next poll re-resolves it from teamCache
+    if (!l1 || !l2) logosComplete = false;
   }
   const leagueLogo = getLeagueLogo(m.league, e.title);
   if (leagueLogo) e.leagueLogo = leagueLogo;
@@ -60,7 +68,7 @@ async function enrich(m: SportsMatch): Promise<EnrichedMatch> {
     const name = cleanText(c.name);
     return { ...c, name, logo: getChannelLogo(name) || e.channelLogo || undefined };
   });
-  enrichCache.set(m.id, e);
+  if (logosComplete) enrichCache.set(m.id, e);
   if (enrichCache.size > 3000) {
     // trim
     const it = enrichCache.keys();
@@ -73,14 +81,47 @@ async function enrich(m: SportsMatch): Promise<EnrichedMatch> {
   return e;
 }
 
-/** bounded-concurrency map (keeps TheSportsDB lookups polite + fast) */
-async function enrichAll(ms: SportsMatch[], limit = 8): Promise<EnrichedMatch[]> {
+/** seed-only (instant, ZERO-network) enrichment — the deadline fallback so a
+ *  cold isolate's first response can never be held hostage by TheSportsDB.
+ *  Cards without a seeded crest render the initials fallback; the after()
+ *  continuation fills enrichCache and the client's 60s poll picks the crests
+ *  up (2026-10-09 "sports section loads forever": ~300 matches × up-to-7s
+ *  logo timeouts at 8-way concurrency WAS the 37s). */
+function enrichSync(m: SportsMatch): EnrichedMatch {
+  const e: EnrichedMatch = { ...m, title: cleanText(m.title), league: cleanText(m.league) };
+  const teams = extractTeamsFromTitle(e.title);
+  if (teams) {
+    e.team1 = cleanText(teams[0]);
+    e.team2 = cleanText(teams[1]);
+    const l1 = findCachedTeamLogo(teams[0]);
+    const l2 = findCachedTeamLogo(teams[1]);
+    if (l1) e.team1Logo = l1;
+    if (l2) e.team2Logo = l2;
+  }
+  const leagueLogo = getLeagueLogo(m.league, e.title);
+  if (leagueLogo) e.leagueLogo = leagueLogo;
+  if (m.channels[0]) {
+    const cl = getChannelLogo(m.channels[0].name);
+    if (cl) e.channelLogo = cl;
+  }
+  // per-channel broadcaster logos — seed map only, still instant
+  e.channels = m.channels.map((c) => {
+    const name = cleanText(c.name);
+    return { ...c, name, logo: getChannelLogo(name) || e.channelLogo || undefined };
+  });
+  return e;
+}
+
+/** bounded-concurrency map (keeps TheSportsDB lookups polite + fast).
+ *  `deadline` (epoch ms): once passed, remaining matches take the sync-only
+ *  path — the response ships on time and the cache fills in background. */
+async function enrichAll(ms: SportsMatch[], limit = 8, deadline = 0): Promise<EnrichedMatch[]> {
   const out: EnrichedMatch[] = new Array(ms.length);
   let cursor = 0;
   const workers = Array.from({ length: Math.min(limit, ms.length) }, async () => {
     while (cursor < ms.length) {
       const i = cursor++;
-      out[i] = await enrich(ms[i]);
+      out[i] = deadline && Date.now() > deadline ? enrichSync(ms[i]) : await enrich(ms[i]);
     }
   });
   await Promise.all(workers);
@@ -190,15 +231,32 @@ export async function GET() {
       }
     }
 
-    // enrich with team logos / league emblems (bounded concurrency)
+    // enrich with team logos / league emblems — 16-way concurrency under a
+    // 2.2s budget: seed hits are instant, network misses either land fast or
+    // fall back to seed-only enrichment. TheSportsDB can no longer decide
+    // how long the first visitor waits.
+    const ENRICH_DEADLINE = Date.now() + 2_200;
     const [live, upcoming, football, americanFootball, bigMatches, bigLive] = await Promise.all([
-      enrichAll(liveRaw.slice(0, 80)),
-      enrichAll(upcomingRaw.slice(0, 60)),
-      enrichAll(footballRaw),
-      enrichAll(amFootRaw),
-      enrichAll(bigRaw),
-      enrichAll(bigLiveRaw),
+      enrichAll(liveRaw.slice(0, 80), 16, ENRICH_DEADLINE),
+      enrichAll(upcomingRaw.slice(0, 60), 16, ENRICH_DEADLINE),
+      enrichAll(footballRaw, 16, ENRICH_DEADLINE),
+      enrichAll(amFootRaw, 16, ENRICH_DEADLINE),
+      enrichAll(bigRaw, 16, ENRICH_DEADLINE),
+      enrichAll(bigLiveRaw, 16, ENRICH_DEADLINE),
     ]);
+
+    // AFTER the response is out: run the FULL network enrichment (no user
+    // waiting) so enrichCache fills with real crests — the client's 60s
+    // auto-refresh then swaps them in. Cached entries return instantly, so
+    // this only pays for the matches the deadline fast-tracked.
+    after(async () => {
+      try {
+        const all = [...liveRaw, ...upcomingRaw, ...footballRaw, ...amFootRaw, ...bigRaw, ...bigLiveRaw];
+        await enrichAll(all, 16, Date.now() + 12_000);
+      } catch {
+        /* best effort */
+      }
+    });
 
     const bigMerged = mergeFixtures([...bigLive, ...bigMatches], sdbFootball).slice(0, 28);
     const amFbMerged = mergeFixtures(
@@ -224,7 +282,10 @@ export async function GET() {
     };
 
     return NextResponse.json(payload, {
-      headers: { 'cache-control': 'public, max-age=30, stale-while-revalidate=60' },
+      // 60s edge/browser freshness matches the client's auto-refresh cadence
+      // — halves function hits without ever showing statuses staler than the
+      // polls the UI already does
+      headers: { 'cache-control': 'public, max-age=60, stale-while-revalidate=120' },
     });
   } catch (e) {
     return NextResponse.json({ error: 'schedule_failed', message: (e as Error).message }, { status: 502 });

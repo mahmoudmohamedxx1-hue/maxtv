@@ -78,6 +78,38 @@ async function fetchJson(url: string, timeoutMs = 20_000, retries = 4): Promise<
   throw lastErr;
 }
 
+// ── localStorage snapshots — instant paint on repeat visits ──────────────────
+// A cold serverless isolate pays the full upstream scrape + enrichment; the
+// user should never stare at a spinner for content they saw 30 seconds ago.
+// The snapshot renders immediately; the fresh fetch swaps in behind it.
+const SCHEDULE_SNAPSHOT_KEY = 'maxtv:sports-schedule:v1';
+const CHANNELS_SNAPSHOT_KEY = 'maxtv:sports-channels:v1';
+const SNAPSHOT_MAX_AGE_MS = 24 * 3600_000; // a day-old lineup is noise — drop it
+
+function readSnapshot<T>(key: string): T | null {
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as { savedAt?: number; data?: T };
+    if (!parsed?.savedAt || !parsed.data) return null;
+    if (Date.now() - parsed.savedAt > SNAPSHOT_MAX_AGE_MS) {
+      localStorage.removeItem(key);
+      return null;
+    }
+    return parsed.data;
+  } catch {
+    return null; // corrupt / private mode / quota — snapshot is best-effort
+  }
+}
+
+function writeSnapshot(key: string, data: unknown): void {
+  try {
+    localStorage.setItem(key, JSON.stringify({ savedAt: Date.now(), data }));
+  } catch {
+    /* quota exceeded — next visit just loads without a snapshot */
+  }
+}
+
 export function SportsTab({
   onPlayChannel,
   onOpenSearch,
@@ -92,6 +124,15 @@ export function SportsTab({
   const [error, setError] = useState('');
   const scheduleTried = useRef(false);
 
+  // ── instant paint: last session's lineup renders while the fresh one loads
+  //    (MUST run before the fetch effect so the first paint has content)
+  useEffect(() => {
+    const s = readSnapshot<ScheduleResponse>(SCHEDULE_SNAPSHOT_KEY);
+    if (s && s.total > 0) setSchedule(s);
+    const c = readSnapshot<Channel247[]>(CHANNELS_SNAPSHOT_KEY);
+    if (c && c.length) setChannels(c);
+  }, []);
+
   // ── progressive load: schedule FIRST (hero + match rows render immediately),
   //    channels second — a slow/failing channel index must never blank the page.
   useEffect(() => {
@@ -103,6 +144,7 @@ export function SportsTab({
         if (s && s.total > 0) {
           setSchedule(s);
           setError('');
+          writeSnapshot(SCHEDULE_SNAPSHOT_KEY, s);
         } else {
           // empty lineup = upstream scrape failed — retry, never blank the hero
           setError('Live sports engine is warming up — retrying automatically…');
@@ -116,8 +158,33 @@ export function SportsTab({
     })();
     (async () => {
       try {
-        const c = (await fetchJson('/api/sports/channels')) as { channels: Channel247[] };
-        if (alive) setChannels(c.channels || []);
+        const c = (await fetchJson('/api/sports/channels')) as { channels: Channel247[]; partial?: boolean };
+        if (alive && c.channels) {
+          setChannels(c.channels);
+          if (c.channels.length) writeSnapshot(CHANNELS_SNAPSHOT_KEY, c.channels);
+        }
+        // incomplete runtime verdicts (cold-start probe budget hit) → bounded
+        // retry ladder swaps in the fully-verified channel list once the
+        // server's background probes finish caching their verdicts
+        if (alive && c.partial) {
+          const refetchPartial = (delay: number, left: number) => {
+            if (left <= 0 || !alive) return;
+            setTimeout(() => {
+              fetchJson('/api/sports/channels', 20_000, 1)
+                .then((r) => {
+                  if (!alive) return;
+                  const cc = r as { channels?: Channel247[]; partial?: boolean };
+                  if (cc.channels && cc.channels.length) {
+                    setChannels(cc.channels);
+                    writeSnapshot(CHANNELS_SNAPSHOT_KEY, cc.channels);
+                  }
+                  if (cc.partial) refetchPartial(delay * 2, left - 1);
+                })
+                .catch(() => {});
+            }, delay);
+          };
+          refetchPartial(8_000, 3);
+        }
       } catch {
         if (alive) setChannels([]);
       }
@@ -127,9 +194,11 @@ export function SportsTab({
     };
   }, []);
 
-  // ── keep retrying the schedule until it succeeds (the #1 "empty home" bug)
+  // ── keep retrying the schedule until it succeeds (the #1 "empty home" bug).
+  //    Guard is on ERROR alone — showing a stale snapshot must not stop the
+  //    retries; success swaps fresh data in and clears the loop.
   useEffect(() => {
-    if (schedule || !error) return;
+    if (!error) return;
     const t = setInterval(async () => {
       try {
         const s = (await fetchJson('/api/sports/schedule', 20_000, 0)) as ScheduleResponse;
@@ -137,13 +206,14 @@ export function SportsTab({
         if (s && s.total > 0) {
           setSchedule(s);
           setError('');
+          writeSnapshot(SCHEDULE_SNAPSHOT_KEY, s);
         }
       } catch {
         /* keep retrying */
       }
     }, 10_000);
     return () => clearInterval(t);
-  }, [schedule, error]);
+  }, [error]);
 
   // auto refresh schedule each minute (live events move fast)
   useEffect(() => {
@@ -154,6 +224,7 @@ export function SportsTab({
         if (s && s.total > 0) {
           setSchedule(s);
           setError('');
+          writeSnapshot(SCHEDULE_SNAPSHOT_KEY, s);
         }
       } catch { /* keep old */ }
     }, 60_000);
