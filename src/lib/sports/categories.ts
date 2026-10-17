@@ -84,9 +84,21 @@ export const SPORT_DEFS: SportDef[] = [
   { id: 'handball', name: 'Handball', any: ['handball', 'ehf', 'bundesliga handball'] },
   { id: 'esports', name: 'Esports', any: ['esports', 'esport', 'csgo', 'dota', 'lol ', 'league of legends', 'valorant', 'rocket league'] },
   { id: 'cycling', name: 'Cycling', any: ['cycling', 'tour de france', 'giro', 'vuelta', 'uci'] },
-  { id: 'golf', name: 'Golf', any: ['golf', 'pga', 'lpga', 'ryder cup', 'european tour', 'masters', 'open championship', 'liv golf'] },
+  // Golf: 'masters' was DROPPED — bare substring matched "ATP Masters" (tennis) and
+  //  mis-filed tennis events into golf (field report 2026-10-17). The other
+  //  tokens ('pga'/'lpga'/'ryder cup'/'european tour'/'open championship'/'liv golf')
+  //  cover the major golf events; "The Masters" at Augusta still lands in golf
+  //  via the DaddyLive section header (cleanCat="Golf" → bare 'golf' fires).
+  { id: 'golf', name: 'Golf', any: ['golf', 'pga', 'lpga', 'ryder cup', 'european tour', 'open championship', 'liv golf'] },
   { id: 'rugby', name: 'Rugby', any: ['rugby', 'super rugby', 'six nations', 'nrl', 'rugby league', 'premiership rugby', 'challenge cup', 'top14', 'top 14', 'mitre 10'] },
-  { id: 'hockey', name: 'Hockey', any: ['hockey', 'nhl', 'nhl ', 'ice hockey', 'khl', 'ahl', 'echl', 'del', 'shl', 'liiga', 'chl hockey'] },
+  // Hockey: every bare 3-4 letter acronym carries a leading space so it fires
+  //  as a word boundary. The bare 'del' substring used to FALSE-MATCH
+  //  "Wen**del**ken" (tennis player surname) and 'liiga' used to FALSE-MATCH
+  //  "Veikka**liiga**" (Finland's top FOOTBALL division — Veikkausliiga),
+  //  mis-filing live tennis/football events into the Hockey row (field report
+  //  2026-10-17). 'ahl'/'shl'/'khl'/'echl'/'nhl' take the same leading-space
+  //  treatment defensively.
+  { id: 'hockey', name: 'Hockey', any: ['hockey', ' nhl', 'nhl ', 'ice hockey', ' khl', ' ahl', ' echl', ' del', ' shl', ' liiga', 'chl hockey'] },
   { id: 'tennis', name: 'Tennis', any: ['tennis', 'atp', 'wta', 'grand slam', 'wimbledon', 'us open', 'french open', 'australian open', 'davis cup', 'laver cup'] },
   { id: 'motorsport', name: 'Motorsport', any: ['f1', 'formula 1', 'formula one', 'formula e', 'nascar', 'motogp', 'wrc', 'rally', 'indycar', 'indy car', 'supercars', 'btcc', 'dtm', 'speedway', 'motorsport', 'wsb', 'world superbike'] },
   // Fight-sports tokens carry a leading space (enforced by the pad in
@@ -96,14 +108,28 @@ export const SPORT_DEFS: SportDef[] = [
   // live football matches into the MMA row. 'ppv' was dropped entirely — it
   // is a DaddyLive section header for premium events of ANY sport (a
   // Champions League PPV game is still football, not MMA).
-  { id: 'mma', name: 'Fight Sports', any: [' ufc', ' mma', ' boxing', ' wwe', ' wrestling', ' aew', ' bellator', ' pfl', ' fight', ' cage', ' glory', ' one championship', ' sumo', ' bareknuckle', ' bare knuckle'] },
+  //
+  // ' glory' was tightened to multi-word 'glory kickboxing' after it kept
+  //  false-matching "Perth Glory" (Australian A-League football club) —
+  //  the leading-space version ' glory' was not enough because the combined
+  //  string contains " perth glory" which still contains " glory". The
+  //  multi-word token only fires on the actual Glory Kickboxing MMA brand
+  //  (field report 2026-10-17: "mma opens football").
+  { id: 'mma', name: 'Fight Sports', any: [' ufc', ' mma', ' boxing', ' wwe', ' wrestling', ' aew', ' bellator', ' pfl', ' fight', ' cage', 'glory kickboxing', ' one championship', ' sumo', ' bareknuckle', ' bare knuckle'] },
   { id: 'baseball', name: 'Baseball', any: ['baseball', 'mlb', 'npb', 'kbo', 'ncaa baseball', 'world series', 'mlb network'] },
   // Basketball tokens likewise carry a leading space so 'nba' / 'nbl' /
   // 'fiba' can't false-fire inside a handball league/team word and pull a
   // handball match into the Basketball row (field report 2026-10-17:
   // "basketball plays handball match").
   { id: 'basketball', name: 'Basketball', any: [' basketball', ' nba', 'ncaa basketball', ' wnba', ' euroleague', ' acb', 'bbl basket', ' fiba', ' gleague', 'g league', ' nbl'] },
-  { id: 'cricket', name: 'Cricket', any: ['cricket', 'ipl', 't20', 'odi', 'test match', 'big bash', 'bbl', 'cpl', 'the hundred', 'psl', 'sheffield shield', 'vitality'] },
+  // Cricket: every bare 3-char acronym carries a leading space so it fires
+  //  as a word boundary. The bare 'odi' substring used to FALSE-MATCH
+  //  "voj**vodina**" (ŽFK Vojvodina, Serbian Women's Super League — football),
+  //  and 'ipl' used to FALSE-MATCH "Mul**ipl**e" or similar generic words,
+  //  mis-filing football events into the Cricket row (field report
+  //  2026-10-17). 't20'/'bbl'/'cpl'/'psl' take the same leading-space treatment
+  //  defensively.
+  { id: 'cricket', name: 'Cricket', any: ['cricket', ' ipl', ' t20', ' odi', 'test match', 'big bash', ' bbl', ' cpl', 'the hundred', ' psl', 'sheffield shield', 'vitality'] },
   { id: 'american_football', name: 'Am. Football', any: ['nfl', 'american football', 'ncaa football', 'cfl', 'ufl', 'super bowl', 'college football'] },
   { id: 'football', name: 'Football', any: ['soccer', 'football', 'futbol', 'fútbol', 'mls', 'premier league', 'la liga', 'serie a', 'bundesliga', 'ligue 1', 'league one', 'league two', 'national league', ' - championship', 'fa cup', 'carabao', 'uefa', 'champions league', 'europa', 'nwsl', 'usl', 'copa', 'world cup', 'fifa', 'afcon', 'eredivisie', 'mls soccer', 'ekstraklasa', 'allsvenskan', 'chinese super'] },
   { id: 'college', name: 'College', any: ['college', 'ncaa', 'ncaaf', 'ncaab', 'university', 'varsity'] },
