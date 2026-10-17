@@ -151,6 +151,30 @@ function isBigLeague(m: SportsMatch): boolean {
   return BIG_LEAGUE_TESTS.some((t) => t(m.league, hay));
 }
 
+// ─── top-5 leagues priority (Europe's "big five" men's top flights) ─────────
+// Field report 2026-10-17: "make the top 5 leagues to appear first in the live
+// matches". These five leagues drive the most viewer demand, so when sorting
+// the live row and the football playlist, matches from these leagues appear
+// before everything else. Excludes women's/handball variants so the priority
+// targets the men's top-flight only (e.g., "Frauen-Bundesliga" or "Bundesliga
+// Handball" don't steal the priority from the actual Bundesliga match).
+function isTop5League(league: string): boolean {
+  return (
+    (/premier league/i.test(league) && !/femen|women/i.test(league)) ||
+    (/primera divisi|la liga/i.test(league) && !/femen|women/i.test(league)) ||
+    (/serie a$/i.test(league.trim()) && !/femen|women/i.test(league)) ||
+    (/bundesliga/i.test(league) && !/handball|femen|women/i.test(league)) ||
+    (/ligue 1/i.test(league) && !/femen|women/i.test(league))
+  );
+}
+
+/** 0 = top-5 league (priority), 1 = anything else. Primary sort key so the
+ *  big five sit at the top of the Live row and the Football playlist zone. */
+function top5LeaguePriority(m: SportsMatch): number {
+  if (m.category !== 'football') return 1;
+  return isTop5League(m.league) ? 0 : 1;
+}
+
 /** merge DaddyLive fixtures with TheSportsDB calendars, DaddyLive wins (it carries feeds) */
 function mergeFixtures(daddyLive: EnrichedMatch[], sdb: BigFixture[]): (EnrichedMatch | BigFixture)[] {
   const seen = new Set<string>();
@@ -172,12 +196,34 @@ export async function GET() {
     const matches = await getSchedule();
     const now = Date.now();
 
-    const liveRaw = matches.filter((m) => m.status === 'live');
+    // Live row — top-5-league matches first (Europe's "big five" drive the
+    // most viewer demand; field report 2026-10-17: "make the top 5 leagues
+    // appear first in the live matches"), then by channel count so the
+    // fixtures with the most feeds (best chance of a working primary) come
+    // next, then by start time as the final tiebreaker.
+    const liveRaw = matches
+      .filter((m) => m.status === 'live')
+      .sort((a, b) => {
+        const pa = top5LeaguePriority(a);
+        const pb = top5LeaguePriority(b);
+        if (pa !== pb) return pa - pb;
+        if (b.channels.length !== a.channels.length) return b.channels.length - a.channels.length;
+        return a.startTime - b.startTime;
+      });
 
-    // football (soccer) + american football playlists — everything, live first
+    // football (soccer) + american football playlists — everything, live first.
+    // Top-5-league priority applies here too so the football playlist zone
+    // leads with Premier League / La Liga / Serie A / Bundesliga / Ligue 1
+    // before any other football competition.
     const footballRaw = matches
       .filter((m) => m.category === 'football' && (m.status as string) !== 'finished')
-      .sort((a, b) => (a.status === b.status ? a.startTime - b.startTime : a.status === 'live' ? -1 : 1))
+      .sort((a, b) => {
+        const pa = top5LeaguePriority(a);
+        const pb = top5LeaguePriority(b);
+        if (pa !== pb) return pa - pb;
+        if (a.status === b.status) return a.startTime - b.startTime;
+        return a.status === 'live' ? -1 : 1;
+      })
       .slice(0, 90);
     const amFootRaw = matches
       .filter((m) => m.category === 'american_football' || /\bnfl\b|college football|\bcfl\b|cfl\(/i.test(m.league))

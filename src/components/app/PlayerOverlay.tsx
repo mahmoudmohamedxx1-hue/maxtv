@@ -700,10 +700,27 @@ export function PlayerOverlay() {
       }
 
       try {
+        // For DaddyLive channels, the resolver's &name= is used to look up
+        // IPTV alternates via findAlternates() — those alternates are the
+        // fallback when the primary DL feed hiccups (cold-start 429, IP
+        // rotation, CDN flap). Schedule-event playables carry the match title
+        // glued onto the channel name ("Espanyol vs Atlético Madrid — beIN
+        // Sports MENA 2"), which breaks the alternate-name match → no
+        // fallback → "doesn't play" (field report 2026-10-17: the Espanyol
+        // match wouldn't play, but the same id=92 channel clicked directly
+        // from the beIN 24/7 rail worked fine, because that path uses a
+        // clean channel name and findAlternates returned alive IPTV
+        // fallbacks). Strip the "{title} — " prefix so the resolver gets
+        // just the channel name — split(' — ').pop() handles both shapes
+        // (with-prefix and no-prefix) cleanly.
+        const resolverName =
+          ch.kind === 'daddylive' && ch.name
+            ? (ch.name.split(' — ').pop() || ch.name)
+            : ch.name;
         const endpoint =
           ch.kind === 'daddylive'
-            ? `/api/sports/stream?channel=${encodeURIComponent(ch.ref)}${opts.server ? `&server=${encodeURIComponent(opts.server)}` : ''}${ch.name ? `&name=${encodeURIComponent(ch.name.slice(0, 80))}` : ''}`
-            : `/api/iptv/stream?url=${encodeURIComponent(ch.ref)}${ch.name ? `&name=${encodeURIComponent(ch.name)}` : ''}`;
+            ? `/api/sports/stream?channel=${encodeURIComponent(ch.ref)}${opts.server ? `&server=${encodeURIComponent(opts.server)}` : ''}${resolverName ? `&name=${encodeURIComponent(resolverName.slice(0, 80))}` : ''}`
+            : `/api/iptv/stream?url=${encodeURIComponent(ch.ref)}${resolverName ? `&name=${encodeURIComponent(resolverName)}` : ''}`;
         // 25s cap — some embed chains crawl; fail fast so auto-advance can surf on
         const ctrl = new AbortController();
         const cap = setTimeout(() => ctrl.abort(), 25_000);
