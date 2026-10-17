@@ -102,7 +102,21 @@ export async function GET() {
         });
       }
     }
-    const runtimeAlive = probeOk ? freshAliveIds() : null;
+    const runtimeAliveRaw = probeOk ? freshAliveIds() : null;
+    // If the probe returned zero alive channels, it almost certainly failed
+    // (DaddyLive blocking the probe, rate limit, CDN flap). Fall back to
+    // seed-only filtering so beIN channels that aren't in the dead seed
+    // stay visible — without this, the beIN-specific filter
+    // (!beinIds.has(c.id)) kills EVERY beIN channel when no channel is
+    // runtime-alive, because the condition is:
+    //   runtimeAlive.has(c.ref) → false (empty set)
+    //   || (!DEAD_DL_CHANNEL_IDS.has(c.ref) && !beinIds.has(c.id)) → false (beIN)
+    // = false → filtered out. This was the root cause of "bein sport keep
+    // bugging and a lot of its channel hides" (field report 2026-10-17):
+    // the probe was failing on every request, so all 30+ beIN channels
+    // that ARE alive on the CDN were hidden from the beIN rail.
+    const runtimeAlive =
+      runtimeAliveRaw && runtimeAliveRaw.size > 0 ? runtimeAliveRaw : null;
     const visibleDl =
       runtimeAlive === null
         ? daddyliveChs.filter((c) => !DEAD_DL_CHANNEL_IDS.has(c.ref)) // probe outage → seed-only filter

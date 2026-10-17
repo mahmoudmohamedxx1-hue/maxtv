@@ -340,18 +340,26 @@ export async function GET() {
       }
     }
 
-    // enrich with team logos / league emblems — 16-way concurrency under a
-    // 2.2s budget: seed hits are instant, network misses either land fast or
-    // fall back to seed-only enrichment. TheSportsDB can no longer decide
-    // how long the first visitor waits.
-    const ENRICH_DEADLINE = Date.now() + 2_200;
+    // enrich with team logos / league emblems — 12-way concurrency under a
+    // 3.5s budget: seed hits are instant, network misses either land fast or
+    // fall back to seed-only enrichment. The deadline was 2.2s with 16-way
+    // concurrency (6 parallel enrichAll calls × 16 = 96 concurrent
+    // TheSportsDB API calls), which was too aggressive — the API rate-limited
+    // and most hockey/volleyball/American football teams fell through to
+    // enrichSync (seed-only, no network) and had no logos. Bumped to 3.5s
+    // and 12-way concurrency so more non-seeded teams get their crests
+    // before the deadline forces the sync fallback.
+    // (field report 2026-10-17: "what about other sports like boxing hockey
+    // and volleyball" — these teams ARE in TheSportsDB but the enrichment
+    // deadline was cutting them off).
+    const ENRICH_DEADLINE = Date.now() + 3_500;
     const [live, upcoming, football, americanFootball, bigMatches, bigLive] = await Promise.all([
-      enrichAll(liveRaw.slice(0, 80), 16, ENRICH_DEADLINE),
-      enrichAll(upcomingRaw.slice(0, 60), 16, ENRICH_DEADLINE),
-      enrichAll(footballRaw, 16, ENRICH_DEADLINE),
-      enrichAll(amFootRaw, 16, ENRICH_DEADLINE),
-      enrichAll(bigRaw, 16, ENRICH_DEADLINE),
-      enrichAll(bigLiveRaw, 16, ENRICH_DEADLINE),
+      enrichAll(liveRaw.slice(0, 80), 12, ENRICH_DEADLINE),
+      enrichAll(upcomingRaw.slice(0, 60), 12, ENRICH_DEADLINE),
+      enrichAll(footballRaw, 12, ENRICH_DEADLINE),
+      enrichAll(amFootRaw, 12, ENRICH_DEADLINE),
+      enrichAll(bigRaw, 12, ENRICH_DEADLINE),
+      enrichAll(bigLiveRaw, 12, ENRICH_DEADLINE),
     ]);
 
     // AFTER the response is out: run the FULL network enrichment (no user
