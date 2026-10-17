@@ -290,6 +290,81 @@ export function extractTeamsFromTitle(title: string): [string, string] | null {
   return [t1, t2];
 }
 
+// ─── Tennis player photos (searchplayers.php) ───────────────────────────────
+// TheSportsDB's searchteams.php endpoint only returns TEAMS — tennis (ATP/WTA)
+// has no "team", just two players. The searchplayers.php endpoint returns
+// individual athletes with strThumb (full photo) and strCutout (cutout PNG).
+// Used by the schedule enrichment for tennis events (field report 2026-10-17:
+// "what about the rest of the sports" — tennis matches had no player photos).
+
+const playerCache = new Map<string, string | null>(); // includes negatives
+const playerInFlight = new Map<string, Promise<string | null>>();
+const playerNegAt = new Map<string, number>();
+
+/** Extract tennis player names from titles like:
+ *  "ATP - Singles: Alexander Zverev vs Alejandro Davidovich Fokina"
+ *  "WTA - Doubles: Player A vs Player B"
+ *  "Challenger Women - Singles: Tamara Zidansek vs Selena Janicijevic"
+ *  Returns [player1, player2] WITHOUT the "ATP - Singles: " prefix, or null
+ *  if the title doesn't look like a tennis singles/doubles match. */
+export function extractTennisPlayers(title: string): [string, string] | null {
+  const m = title.match(
+    /^(?:ATP|WTA|Challenger(?:\s+(?:Women|Men))?|ITF)\s+(?:[-–]\s+)?(?:Singles|Doubles):\s*(.+?)\s+(?:vs\.?|v|@)\s+(.+?)(?:\s*[-–—|]\s*|$)/i
+  );
+  if (!m) return null;
+  const p1 = m[1].trim();
+  const p2 = m[2].trim();
+  if (!p1 || !p2 || p1.length > 42 || p2.length > 42) return null;
+  return [p1, p2];
+}
+
+/** Async lookup of a tennis player's photo via TheSportsDB searchplayers.php.
+ *  Cached + negative-cached (10 min), same pattern as findTeamLogo. Prefers
+ *  strThumb (full photo) over strCutout (cutout PNG with transparent bg). */
+export async function findPlayerLogo(name: string): Promise<string | null> {
+  if (!name) return null;
+  const cached = playerCache.get(name);
+  if (cached !== undefined) {
+    if (cached === null && Date.now() - (playerNegAt.get(name) ?? 0) > NEG_TTL_MS) {
+      playerCache.delete(name);
+      playerNegAt.delete(name);
+    } else {
+      return cached;
+    }
+  }
+  if (playerInFlight.has(name)) return playerInFlight.get(name)!;
+
+  const p = (async () => {
+    try {
+      const q = name.replace(/\(.*?\)/g, '').trim().slice(0, 48);
+      const url = `https://www.thesportsdb.com/api/v1/json/123/searchplayers.php?p=${encodeURIComponent(q)}`;
+      const res = await fetch(url, {
+        signal: AbortSignal.timeout(2500),
+        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' },
+      });
+      if (!res.ok) return null;
+      const data = (await res.json()) as {
+        player?: Array<{ strPlayer: string; strThumb?: string | null; strCutout?: string | null }>;
+      };
+      const player = data.player?.[0];
+      if (player?.strThumb) return player.strThumb;
+      if (player?.strCutout) return player.strCutout;
+      return null;
+    } catch {
+      return null;
+    }
+  })().then((logo) => {
+    playerCache.set(name, logo);
+    if (logo === null) playerNegAt.set(name, Date.now());
+    else playerNegAt.delete(name);
+    playerInFlight.delete(name);
+    return logo;
+  });
+
+  playerInFlight.set(name, p);
+  return p;
+}
+
 /** Route any image through our /api/img proxy (cache + fallback) */
 export function imgProxy(url: string, fallbackText = '', color = 'ffd200'): string {
   const params = new URLSearchParams({ u: url });

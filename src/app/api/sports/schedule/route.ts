@@ -1,7 +1,7 @@
 import { NextResponse, after } from 'next/server';
 import { getSchedule } from '@/lib/sports/daddylive';
 import { sportName } from '@/lib/sports/categories';
-import { extractTeamsFromTitle, findTeamLogo, findCachedTeamLogo, getLeagueLogo, getChannelLogo } from '@/lib/media/logos';
+import { extractTeamsFromTitle, findTeamLogo, findCachedTeamLogo, getLeagueLogo, getChannelLogo, extractTennisPlayers, findPlayerLogo } from '@/lib/media/logos';
 import { getBigLeagueFixtures, getNFLFixtures, fixtureKey, peekFixtures, warmBigLeagues, type BigFixture } from '@/lib/sports/bigleagues';
 import type { SportsMatch } from '@/lib/types';
 
@@ -44,18 +44,39 @@ async function enrich(m: SportsMatch): Promise<EnrichedMatch> {
   if (hit && hit.channels.length === m.channels.length) return hit;
 
   const e: EnrichedMatch = { ...m, title: cleanText(m.title), league: cleanText(m.league) };
-  const teams = extractTeamsFromTitle(e.title);
   let logosComplete = true;
-  if (teams) {
-    e.team1 = cleanText(teams[0]);
-    e.team2 = cleanText(teams[1]);
-    const [l1, l2] = await Promise.all([findTeamLogo(teams[0]), findTeamLogo(teams[1])]);
+
+  // Tennis: extract players (strip the "ATP - Singles: " prefix) and use
+  // searchplayers.php for photos. TheSportsDB's searchteams.php endpoint
+  // doesn't return tennis players (they're individual athletes, not teams),
+  // so findTeamLogo() returned null for every ATP/WTA match (field report
+  // 2026-10-17: "what about the rest of the sports"). findPlayerLogo() uses
+  // the searchplayers.php endpoint which returns strThumb (full photo) and
+  // strCutout (cutout PNG).
+  const tennisPlayers = extractTennisPlayers(e.title);
+  if (tennisPlayers) {
+    e.team1 = cleanText(tennisPlayers[0]);
+    e.team2 = cleanText(tennisPlayers[1]);
+    const [l1, l2] = await Promise.all([
+      findPlayerLogo(tennisPlayers[0]),
+      findPlayerLogo(tennisPlayers[1]),
+    ]);
     if (l1) e.team1Logo = l1;
     if (l2) e.team2Logo = l2;
-    // a crest lost to the 2.5s fast-fail (timeout → null) must NOT be
-    // frozen into the cache as crest-less — leave it uncached so the
-    // after() fill / next poll re-resolves it from teamCache
     if (!l1 || !l2) logosComplete = false;
+  } else {
+    const teams = extractTeamsFromTitle(e.title);
+    if (teams) {
+      e.team1 = cleanText(teams[0]);
+      e.team2 = cleanText(teams[1]);
+      const [l1, l2] = await Promise.all([findTeamLogo(teams[0]), findTeamLogo(teams[1])]);
+      if (l1) e.team1Logo = l1;
+      if (l2) e.team2Logo = l2;
+      // a crest lost to the 2.5s fast-fail (timeout → null) must NOT be
+      // frozen into the cache as crest-less — leave it uncached so the
+      // after() fill / next poll re-resolves it from teamCache
+      if (!l1 || !l2) logosComplete = false;
+    }
   }
   const leagueLogo = getLeagueLogo(m.league, e.title);
   if (leagueLogo) e.leagueLogo = leagueLogo;
@@ -89,14 +110,25 @@ async function enrich(m: SportsMatch): Promise<EnrichedMatch> {
  *  logo timeouts at 8-way concurrency WAS the 37s). */
 function enrichSync(m: SportsMatch): EnrichedMatch {
   const e: EnrichedMatch = { ...m, title: cleanText(m.title), league: cleanText(m.league) };
-  const teams = extractTeamsFromTitle(e.title);
-  if (teams) {
-    e.team1 = cleanText(teams[0]);
-    e.team2 = cleanText(teams[1]);
-    const l1 = findCachedTeamLogo(teams[0]);
-    const l2 = findCachedTeamLogo(teams[1]);
-    if (l1) e.team1Logo = l1;
-    if (l2) e.team2Logo = l2;
+  // Tennis: strip the "ATP - Singles: " prefix so the card shows the
+  // player's name, not the verbose "ATP - Singles: Player" string. No
+  // sync player-logo lookup (playerCache is async-only) — the after()
+  // continuation fills the photos via findPlayerLogo(), and the client's
+  // 60s poll picks them up.
+  const tennisPlayers = extractTennisPlayers(e.title);
+  if (tennisPlayers) {
+    e.team1 = cleanText(tennisPlayers[0]);
+    e.team2 = cleanText(tennisPlayers[1]);
+  } else {
+    const teams = extractTeamsFromTitle(e.title);
+    if (teams) {
+      e.team1 = cleanText(teams[0]);
+      e.team2 = cleanText(teams[1]);
+      const l1 = findCachedTeamLogo(teams[0]);
+      const l2 = findCachedTeamLogo(teams[1]);
+      if (l1) e.team1Logo = l1;
+      if (l2) e.team2Logo = l2;
+    }
   }
   const leagueLogo = getLeagueLogo(m.league, e.title);
   if (leagueLogo) e.leagueLogo = leagueLogo;
