@@ -58,6 +58,16 @@ export const DEAD_DL_CHANNEL_IDS = new Set<string>([...HAND_CURATED_DEAD, ...DEA
 interface SportDef {
   id: string;
   name: string;
+  /** Match tokens applied via substring against the padded, lowercased
+   *  `${cleanCat} ${league} ${title}` string (see normalizeSport — it pads
+   *  with a leading & trailing space so a token like ' mma' fires on a
+   *  section header that is just "MMA", without falsely matching the bare
+   *  'mma' inside "Hammarby" (Swedish football club) or the bare 'pfl'
+   *  inside "(PFL)" abbreviations of the Philippines Football League.
+   *  Convention: every greedy single-word token carries a leading space so
+   *  it only fires as a word boundary; multi-word phrases keep the spaces
+   *  they need; tokens that are merely section-headers (like 'ppv', which
+   *  DaddyLive uses for premium events of ANY sport) are removed entirely. */
   any: string[];
 }
 
@@ -79,9 +89,20 @@ export const SPORT_DEFS: SportDef[] = [
   { id: 'hockey', name: 'Hockey', any: ['hockey', 'nhl', 'nhl ', 'ice hockey', 'khl', 'ahl', 'echl', 'del', 'shl', 'liiga', 'chl hockey'] },
   { id: 'tennis', name: 'Tennis', any: ['tennis', 'atp', 'wta', 'grand slam', 'wimbledon', 'us open', 'french open', 'australian open', 'davis cup', 'laver cup'] },
   { id: 'motorsport', name: 'Motorsport', any: ['f1', 'formula 1', 'formula one', 'formula e', 'nascar', 'motogp', 'wrc', 'rally', 'indycar', 'indy car', 'supercars', 'btcc', 'dtm', 'speedway', 'motorsport', 'wsb', 'world superbike'] },
-  { id: 'mma', name: 'Fight Sports', any: ['ufc', 'mma', 'boxing', 'wwe', ' wrestling', 'aew', 'bellator', 'pfl', 'fight', 'ppv', 'cage', 'glory', 'one championship', 'sumo', 'bareknuckle', 'bare knuckle'] },
+  // Fight-sports tokens carry a leading space (enforced by the pad in
+  // normalizeSport) so they fire as word boundaries. The bare 'mma' substring
+  // used to false-match "Hammarby" (Sweden, Allsvenskan) and 'pfl' used to
+  // false-match "(PFL)" in Philippines Football League listings, mis-filing
+  // live football matches into the MMA row. 'ppv' was dropped entirely — it
+  // is a DaddyLive section header for premium events of ANY sport (a
+  // Champions League PPV game is still football, not MMA).
+  { id: 'mma', name: 'Fight Sports', any: [' ufc', ' mma', ' boxing', ' wwe', ' wrestling', ' aew', ' bellator', ' pfl', ' fight', ' cage', ' glory', ' one championship', ' sumo', ' bareknuckle', ' bare knuckle'] },
   { id: 'baseball', name: 'Baseball', any: ['baseball', 'mlb', 'npb', 'kbo', 'ncaa baseball', 'world series', 'mlb network'] },
-  { id: 'basketball', name: 'Basketball', any: ['basketball', 'nba', 'ncaa basketball', 'wnba', 'euroleague', 'acb', 'bbl basket', 'fiba', 'gleague', 'g league', 'nbl'] },
+  // Basketball tokens likewise carry a leading space so 'nba' / 'nbl' /
+  // 'fiba' can't false-fire inside a handball league/team word and pull a
+  // handball match into the Basketball row (field report 2026-10-17:
+  // "basketball plays handball match").
+  { id: 'basketball', name: 'Basketball', any: [' basketball', ' nba', 'ncaa basketball', ' wnba', ' euroleague', ' acb', 'bbl basket', ' fiba', ' gleague', 'g league', ' nbl'] },
   { id: 'cricket', name: 'Cricket', any: ['cricket', 'ipl', 't20', 'odi', 'test match', 'big bash', 'bbl', 'cpl', 'the hundred', 'psl', 'sheffield shield', 'vitality'] },
   { id: 'american_football', name: 'Am. Football', any: ['nfl', 'american football', 'ncaa football', 'cfl', 'ufl', 'super bowl', 'college football'] },
   { id: 'football', name: 'Football', any: ['soccer', 'football', 'futbol', 'fútbol', 'mls', 'premier league', 'la liga', 'serie a', 'bundesliga', 'ligue 1', 'league one', 'league two', 'national league', ' - championship', 'fa cup', 'carabao', 'uefa', 'champions league', 'europa', 'nwsl', 'usl', 'copa', 'world cup', 'fifa', 'afcon', 'eredivisie', 'mls soccer', 'ekstraklasa', 'allsvenskan', 'chinese super'] },
@@ -89,7 +110,15 @@ export const SPORT_DEFS: SportDef[] = [
 ];
 
 export function normalizeSport(hay: string): string {
-  const h = hay.toLowerCase();
+  // Pad the lowercased input with a leading & trailing space so leading-space
+  // tokens like ' mma' / ' wrestling' fire reliably on a section header that
+  // IS the sport word (e.g. "MMA" alone, "Wrestling" alone). Without the pad,
+  // ' mma' would miss "MMA UFC 265" (no leading space at index 0) and the
+  // fallback bare 'mma' substring would FALSE-MATCH "Hammarby" (Swedish
+  // football club) — mis-filing live football matches into the MMA row
+  // (field report 2026-10-17). The pad is harmless for plain substrings and
+  // multi-word phrases like 'bundesliga handball' or 'g league'.
+  const h = ` ${hay.toLowerCase()} `;
   for (const s of SPORT_DEFS) {
     if (s.any.some((k) => h.includes(k))) return s.id;
   }
