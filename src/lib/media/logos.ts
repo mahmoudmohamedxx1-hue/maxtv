@@ -320,19 +320,27 @@ export function extractTennisPlayers(title: string): [string, string] | null {
 
 /** Async lookup of a tennis player's photo via TheSportsDB searchplayers.php.
  *  Cached + negative-cached (10 min), same pattern as findTeamLogo. Prefers
- *  strThumb (full photo) over strCutout (cutout PNG with transparent bg). */
-export async function findPlayerLogo(name: string): Promise<string | null> {
+ *  strThumb (full photo) over strCutout (cutout PNG with transparent bg).
+ *
+ *  The optional `sport` parameter filters results by strSport — this is
+ *  critical for MMA/boxing where partial name matches can return players
+ *  from other sports (e.g., searching "Jon Jones" returns "Kenwyne Jones"
+ *  the soccer player; filtering for "Fighting" skips that and finds the
+ *  actual UFC fighter if he's in the DB). For tennis, filtering for "Tennis"
+ *  avoids matching a soccer player who happens to share the name. */
+export async function findPlayerLogo(name: string, sport?: string): Promise<string | null> {
   if (!name) return null;
-  const cached = playerCache.get(name);
+  const cacheKey = sport ? `${name}\u0001${sport}` : name;
+  const cached = playerCache.get(cacheKey);
   if (cached !== undefined) {
-    if (cached === null && Date.now() - (playerNegAt.get(name) ?? 0) > NEG_TTL_MS) {
-      playerCache.delete(name);
-      playerNegAt.delete(name);
+    if (cached === null && Date.now() - (playerNegAt.get(cacheKey) ?? 0) > NEG_TTL_MS) {
+      playerCache.delete(cacheKey);
+      playerNegAt.delete(cacheKey);
     } else {
       return cached;
     }
   }
-  if (playerInFlight.has(name)) return playerInFlight.get(name)!;
+  if (playerInFlight.has(cacheKey)) return playerInFlight.get(cacheKey)!;
 
   const p = (async () => {
     try {
@@ -344,9 +352,16 @@ export async function findPlayerLogo(name: string): Promise<string | null> {
       });
       if (!res.ok) return null;
       const data = (await res.json()) as {
-        player?: Array<{ strPlayer: string; strThumb?: string | null; strCutout?: string | null }>;
+        player?: Array<{ strPlayer: string; strSport?: string; strThumb?: string | null; strCutout?: string | null }>;
       };
-      const player = data.player?.[0];
+      const players = data.player || [];
+      // If a sport filter is specified, find the first player matching that
+      // sport. Without this, a search for "Jon Jones" returns "Kenwyne Jones"
+      // (soccer) as the first result — the actual UFC fighter Jon Jones
+      // (sport="Fighting") would be buried deeper in the list.
+      const player = sport
+        ? players.find((pl) => pl.strSport?.toLowerCase() === sport.toLowerCase())
+        : players[0];
       if (player?.strThumb) return player.strThumb;
       if (player?.strCutout) return player.strCutout;
       return null;
@@ -354,15 +369,40 @@ export async function findPlayerLogo(name: string): Promise<string | null> {
       return null;
     }
   })().then((logo) => {
-    playerCache.set(name, logo);
-    if (logo === null) playerNegAt.set(name, Date.now());
-    else playerNegAt.delete(name);
-    playerInFlight.delete(name);
+    playerCache.set(cacheKey, logo);
+    if (logo === null) playerNegAt.set(cacheKey, Date.now());
+    else playerNegAt.delete(cacheKey);
+    playerInFlight.delete(cacheKey);
     return logo;
   });
 
-  playerInFlight.set(name, p);
+  playerInFlight.set(cacheKey, p);
   return p;
+}
+
+/** Extract fighter names from MMA/boxing titles, stripping the event prefix.
+ *  Examples:
+ *    "ONE Samurai 4: Haggerty vs. Akimoto"     → ["Haggerty", "Akimoto"]
+ *    "UFC 309: Jones vs Miocic"                → ["Jones", "Miocic"]
+ *    "Boxing WBA : Tyson Fury vs Anthony Joshua" → ["Tyson Fury", "Anthony Joshua"]
+ *    "Glory Kickboxing Glory 110 : Miguel Trindade vs Deniz Demirkapu" → ["Miguel Trindade", "Deniz Demirkapu"]
+ *    "Tanner Boser vs Daniel Weichel"          → ["Tanner Boser", "Daniel Weichel"]
+ *  Strips everything before the LAST colon (the event prefix), then splits
+ *  by "vs" / "v" / "@". Returns null if no "vs" separator is found. */
+export function extractFighters(title: string): [string, string] | null {
+  // Strip the event prefix — everything up to and including the last colon.
+  // "ONE Samurai 4: Haggerty vs. Akimoto" → "Haggerty vs. Akimoto"
+  let fightPart = title;
+  const colonIdx = title.lastIndexOf(':');
+  if (colonIdx !== -1 && colonIdx < title.length - 1) {
+    fightPart = title.slice(colonIdx + 1).trim();
+  }
+  const m = fightPart.match(/^(.+?)\s+(?:vs\.?|v|@)\s+(.+?)(?:\s*[-–—|]\s*|$)/i);
+  if (!m) return null;
+  const f1 = m[1].trim();
+  const f2 = m[2].trim();
+  if (!f1 || !f2 || f1.length > 42 || f2.length > 42) return null;
+  return [f1, f2];
 }
 
 /** Route any image through our /api/img proxy (cache + fallback) */
