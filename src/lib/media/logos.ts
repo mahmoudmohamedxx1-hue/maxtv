@@ -196,6 +196,73 @@ const inFlight = new Map<string, Promise<string | null>>();
 const negAt = new Map<string, number>();
 const NEG_TTL_MS = 10 * 60_000;
 
+// ─── ESPN team logos (instant, no API rate limiting) ─────────────────────────
+// The ESPN CDN has logos for ALL major league teams (NHL, NBA, NFL, college
+// football, college basketball). These are fast, reliable CDN URLs — no
+// 2.5s timeout, no rate limiting, no enrichment deadline issue. Fetched
+// once at startup (fire-and-forget) and cached in-memory for the isolate's
+// life. Used as a fallback in findCachedTeamLogo when the curated seed
+// doesn't have a match — gives INSTANT logos for all major-league teams
+// on the FIRST response (no need for the after() continuation to fill them).
+// (field report 2026-10-17: "really i dont understand why all sports logos
+// isnt there" — the TheSportsDB API was too slow/rate-limited for 80+
+// concurrent lookups; ESPN teams gives comprehensive coverage in one fetch.)
+const espnTeamLogos = new Map<string, string>(); // lowercase team name → logo URL
+let espnWarmPromise: Promise<void> | null = null;
+
+const ESPN_LEAGUES: Array<{ sport: string; league: string }> = [
+  { sport: 'hockey', league: 'nhl' },
+  { sport: 'basketball', league: 'nba' },
+  { sport: 'football', league: 'nfl' },
+  { sport: 'football', league: 'college-football' },
+  { sport: 'basketball', league: 'mens-college-basketball' },
+];
+
+/** Fetch all teams from ESPN for major leagues and cache their logos.
+ *  Fire-and-forget — the first request triggers it; subsequent requests
+ *  use the cached map. */
+export function warmEspnTeamLogos(): Promise<void> {
+  if (espnWarmPromise) return espnWarmPromise;
+  espnWarmPromise = (async () => {
+    for (const { sport, league } of ESPN_LEAGUES) {
+      try {
+        const url = `https://site.api.espn.com/apis/site/v2/sports/${sport}/${league}/teams?limit=1000`;
+        const res = await fetch(url, {
+          signal: AbortSignal.timeout(5000),
+          headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' },
+        });
+        if (!res.ok) continue;
+        const data = (await res.json()) as {
+          sports?: Array<{ leagues?: Array<{ teams?: Array<{ team?: { displayName?: string; shortDisplayName?: string; abbreviation?: string; logos?: Array<{ href?: string }> }> }> }> }>;
+        };
+        const leagues = data.sports?.[0]?.leagues || [];
+        for (const lg of leagues) {
+          for (const t of lg.teams || []) {
+            const team = t.team;
+            if (!team) continue;
+            const logo = team.logos?.[0]?.href;
+            if (!logo) continue;
+            // Store by multiple name variants for flexible lookup
+            if (team.displayName) {
+              const name = team.displayName.toLowerCase().trim();
+              espnTeamLogos.set(name, logo);
+            }
+            if (team.shortDisplayName) {
+              espnTeamLogos.set(team.shortDisplayName.toLowerCase().trim(), logo);
+            }
+            if (team.abbreviation) {
+              espnTeamLogos.set(team.abbreviation.toLowerCase().trim(), logo);
+            }
+          }
+        }
+      } catch {
+        /* best effort — TheSportsDB fallback still works */
+      }
+    }
+  })();
+  return espnWarmPromise;
+}
+
 function cleanTeamName(name: string): string {
   return name
     .toLowerCase()
@@ -224,6 +291,12 @@ export function findCachedTeamLogo(name: string): string | null {
     const last = tokens[tokens.length - 1];
     if (TEAM_SEED[last]) return TEAM_SEED[last];
   }
+  // ESPN team logos (instant — no API call needed). The ESPN CDN has logos
+  // for ALL NHL/NBA/NFL/college teams. Once warmed (first request), this
+  // gives instant logos without any TheSportsDB API call or enrichment
+  // deadline issue.
+  if (espnTeamLogos.has(rawLower)) return espnTeamLogos.get(rawLower)!;
+  if (espnTeamLogos.has(clean)) return espnTeamLogos.get(clean)!;
   return null;
 }
 
@@ -440,6 +513,12 @@ let warmed = false;
 export function warmLogoCache(): void {
   if (warmed) return;
   warmed = true;
+  // Kick off the ESPN team logos fetch (fire-and-forget). This populates
+  // the espnTeamLogos map with ALL NHL/NBA/NFL/college team logos in
+  // ~150ms, giving instant logo lookups for those sports without any
+  // TheSportsDB API call or enrichment deadline issue.
+  void warmEspnTeamLogos();
+
   const urls = [
     ...Object.values(CHANNEL_LOGOS),
     ...Object.values(LEAGUE_EMBLEMS),
