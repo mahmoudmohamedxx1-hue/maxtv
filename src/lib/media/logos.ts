@@ -145,6 +145,16 @@ export function getChannelLogo(title: string): string | null {
   const rawLower = String(title).toLowerCase().trim();
   const cleaned = cleanChannelTitle(rawLower);
 
+  // Special case: beIN Sports N Arabic channels. The substring key
+  // "bein sports arabic" doesn't match "beIN Sports 1 Arabic" because
+  // the channel number ("1") sits between "sports" and "arabic" in the
+  // name. Detect beIN + "arabic" as separate tokens so the Arabic-specific
+  // logo (bein-sports-arabic-mea.png) is returned instead of the generic
+  // French one. (field report 2026-10-17: "bein sport keep bugging")
+  if (/be\s?in/i.test(title) && /arabic/i.test(rawLower)) {
+    return CHANNEL_LOGOS['bein sports arabic'] || null;
+  }
+
   if (CHANNEL_LOGOS[rawLower]) return CHANNEL_LOGOS[rawLower];
   if (CHANNEL_LOGOS[cleaned]) return CHANNEL_LOGOS[cleaned];
 
