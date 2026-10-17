@@ -241,7 +241,16 @@ export async function findTeamLogo(name: string): Promise<string | null> {
   const p = (async () => {
     try {
       const q = name.replace(/\(.*?\)/g, '').trim().slice(0, 48);
-      const url = `https://www.thesportsdb.com/api/v1/json/3/searchteams.php?t=${encodeURIComponent(q)}`;
+      // The old free API key '3' was permanently disabled by TheSportsDB
+      // (2026) — every lookup that fell through the curated seed/CLUB_BADGES
+      // returned the error string "The old '3' Free Sports API key is
+      // permanently disabled…" instead of team JSON, so findTeamLogo() got
+      // no teams back and returned null. This is why "most of the teams
+      // logos doesnt load" (field report 2026-10-17): every non-seeded
+      // team had no crest. The new free test key '123' restores the lookup.
+      // Confirmed working: Napoli + Greuther Fürth return full team JSON
+      // including strBadge URLs.
+      const url = `https://www.thesportsdb.com/api/v1/json/123/searchteams.php?t=${encodeURIComponent(q)}`;
       const res = await fetch(url, {
         // 2.5s hard cap — a crest lookup that can't answer fast is worthless
         // on a first-paint path; ~300 matches × 7s timeouts on a cold isolate
