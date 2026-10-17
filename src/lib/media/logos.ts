@@ -232,9 +232,15 @@ export function warmEspnTeamLogos(): Promise<void> {
           headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' },
         });
         if (!res.ok) continue;
-        const data = (await res.json()) as {
-          sports?: Array<{ leagues?: Array<{ teams?: Array<{ team?: { displayName?: string; shortDisplayName?: string; abbreviation?: string; logos?: Array<{ href?: string }> }> }> }> }>;
-        };
+        // Use a minimal typed interface — the ESPN API response is deeply
+        // nested and a complex inline type annotation confuses the TS parser.
+        interface EspnTeamLogo { href?: string }
+        interface EspnTeam { displayName?: string; shortDisplayName?: string; abbreviation?: string; logos?: EspnTeamLogo[] }
+        interface EspnTeamEntry { team?: EspnTeam }
+        interface EspnLeague { teams?: EspnTeamEntry[] }
+        interface EspnSport { leagues?: EspnLeague[] }
+        interface EspnTeamsResponse { sports?: EspnSport[] }
+        const data = (await res.json()) as EspnTeamsResponse;
         const leagues = data.sports?.[0]?.leagues || [];
         for (const lg of leagues) {
           for (const t of lg.teams || []) {
