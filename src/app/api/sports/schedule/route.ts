@@ -221,13 +221,26 @@ function isBigLeague(m: SportsMatch): boolean {
 // before everything else. Excludes women's/handball variants so the priority
 // targets the men's top-flight only (e.g., "Frauen-Bundesliga" or "Bundesliga
 // Handball" don't steal the priority from the actual Bundesliga match).
+//
+// The regex checks for the COUNTRY prefix + league name to avoid false
+// positives: "Russian Premier League" ≠ "England - Premier League",
+// "Argentina - Primera División" ≠ "Spain - La Liga", "Iraqi Premier League"
+// ≠ "England - Premier League". Without the country check, any league with
+// "Premier League" or "Primera División" in its name would match.
 function isTop5League(league: string): boolean {
+  const l = league.toLowerCase().trim();
+  if (/femen|women|handball/i.test(l)) return false;
   return (
-    (/premier league/i.test(league) && !/femen|women/i.test(league)) ||
-    (/primera divisi|la liga/i.test(league) && !/femen|women/i.test(league)) ||
-    (/serie a$/i.test(league.trim()) && !/femen|women/i.test(league)) ||
-    (/bundesliga/i.test(league) && !/handball|femen|women/i.test(league)) ||
-    (/ligue 1/i.test(league) && !/femen|women/i.test(league))
+    // England - Premier League (NOT Russian/Iraqi/Belarus Premier League)
+    /^england.*premier league$/i.test(l) || /^premier league$/i.test(l) ||
+    // Spain - La Liga (NOT Argentina/Peru Primera División)
+    /^spain.*la liga$/i.test(l) || /^la liga$/i.test(l) ||
+    // Italy - Serie A (NOT Serie A (women), NOT Serie B)
+    /^italy.*serie a$/i.test(l) || /^serie a$/i.test(l) ||
+    // Germany - Bundesliga (NOT Bundesliga 2, NOT Bundesliga Handball)
+    /^germany.*bundesliga$/i.test(l) ||
+    // France - Ligue 1
+    /^france.*ligue 1$/i.test(l) || /^ligue 1$/i.test(l)
   );
 }
 
