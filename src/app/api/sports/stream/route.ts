@@ -179,9 +179,18 @@ export async function GET(req: Request) {
       serverId: serverDef?.id || defaultId,
       servers: serverList.map((s) => ({ ...s, active: s.id === (serverDef?.id || defaultId) })),
       alternates: altTyped,
-      // the sniffed feed is in an HEVC (browser-unsafe codec) phase — the
-      // player checks this against its own decode capability and shows the
-      // explicit HEVC panel instead of silently walking onto another channel
+      // Tell the player to try the direct CDN URL first (browser-side, no
+      // server proxy). The DaddyLive CDN edge blocks the Vercel server's IP
+      // (403 Forbidden), so ALL server-side proxies (turbo, direct, edge,
+      // relay) fail. The browser's IP is different and might not be blocked.
+      // If the CDN is CORS-open, the browser loads the m3u8 directly (zero
+      // proxy latency, native ABR). If not, the player falls back to the
+      // server-side proxy (proxied=url) which might still work for some
+      // channels. (field report 2026-10-17: "most of channels dont work
+      // especially bein sports" — the turbo transport returns 502 "warming
+      // up" on every attempt because the CDN blocks the server's IP.)
+      cors: true,
+      proxied: url,
       ...(hevcFeed ? { hevc: true } : {}),
     });
   } catch (e) {
