@@ -680,7 +680,8 @@ export class TurboSession {
 
   private async fetchSeg(url: string, referer: string): Promise<Uint8Array | null> {
     try {
-      const res = await fetch(url, {
+      const target = proxiedUrl(url, referer);
+      const res = await fetch(target, {
         headers: { 'User-Agent': UA, Accept: '*/*', ...(referer ? { Referer: referer } : {}) },
         signal: AbortSignal.timeout(SEG_FETCH_TIMEOUT_MS),
         redirect: 'follow',
@@ -1082,9 +1083,27 @@ function isAudioType(t: number): boolean {
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
+// Cloudflare Worker proxy — when CF_PROXY_URL is set, ALL upstream fetches
+// (m3u8 manifest + segments) are routed through the Worker. The
+// DaddyLive CDN edge (edge.cowedd4855ws.sbs) returns 403 for Vercel's
+// IPs; the Worker runs on Cloudflare's edge (different IP range) which
+// is NOT blocked. Set CF_PROXY_URL in Vercel env vars to the Worker's
+// URL (e.g. https://nuvio-proxy.yourname.workers.dev).
+const CF_PROXY_URL = process.env.CF_PROXY_URL || '';
+
+/** Route a fetch through the Cloudflare Worker proxy when CF_PROXY_URL is set.
+ *  The Worker fetches the target URL with the correct Referer/UA from
+ *  Cloudflare's IPs (not Vercel's), bypassing the CDN's IP block. */
+function proxiedUrl(url: string, referer: string): string {
+  if (!CF_PROXY_URL) return url;
+  const params = new URLSearchParams({ url, ...(referer ? { referer } : {}) });
+  return `${CF_PROXY_URL}?${params}`;
+}
+
 async function fetchText(url: string, referer: string): Promise<string | null> {
   try {
-    const res = await fetch(url, {
+    const target = proxiedUrl(url, referer);
+    const res = await fetch(target, {
       headers: { 'User-Agent': UA, Accept: '*/*', ...(referer ? { Referer: referer } : {}) },
       signal: AbortSignal.timeout(10_000),
       redirect: 'follow',
