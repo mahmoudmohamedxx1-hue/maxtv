@@ -848,14 +848,7 @@ export function PlayerOverlay() {
           return;
         }
 
-        // When the resolver says the CDN is CORS-open (cors:true), load the
-        // raw CDN URL (directUrl) directly in the browser — the DaddyLive CDN
-        // edge blocks the Vercel server's IP (403), so server-side proxies
-        // (turbo, direct, edge, relay) all fail. The browser's IP is different
-        // and might not be blocked. If the direct CDN fails (CORS error, 403,
-        // network error), the error handler (lines ~1093/1135) swaps to the
-        // server-side proxy (proxiedSrcRef.current) as a fallback.
-        const src = (directPlayRef.current && data.directUrl ? data.directUrl : data.url) as string;
+        const src = data.url as string;
         nativeSrcRef.current = src;
         setPhase('loading');
         const video = videoRef.current;
