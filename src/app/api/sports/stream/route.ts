@@ -179,6 +179,9 @@ export async function GET(req: Request) {
       serverId: serverDef?.id || defaultId,
       servers: serverList.map((s) => ({ ...s, active: s.id === (serverDef?.id || defaultId) })),
       alternates: altTyped,
+      // the sniffed feed is in an HEVC (browser-unsafe codec) phase — the
+      // player checks this against its own decode capability and shows the
+      // explicit HEVC panel instead of silently walking onto another channel
       ...(hevcFeed ? { hevc: true } : {}),
     });
   } catch (e) {
