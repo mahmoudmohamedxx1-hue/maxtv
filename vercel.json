@@ -1,20 +1,10 @@
 {
-  "regions": ["fra1"],
+  "regions": ["cdg1"],
   "functions": {
-    "src/app/api/turbo/route.ts": {
-      "maxDuration": 60
-    },
-    "src/app/api/live/route.ts": {
-      "maxDuration": 60
-    },
-    "src/app/api/transcode/route.ts": {
-      "maxDuration": 60
-    },
-    "src/app/api/sports/schedule/route.ts": {
-      "maxDuration": 30
-    },
-    "src/app/api/sports/channels/route.ts": {
-      "maxDuration": 60
-    }
+    "src/app/api/turbo/route.ts": { "maxDuration": 60 },
+    "src/app/api/live/route.ts": { "maxDuration": 60 },
+    "src/app/api/transcode/route.ts": { "maxDuration": 60 },
+    "src/app/api/sports/schedule/route.ts": { "maxDuration": 30 },
+    "src/app/api/sports/channels/route.ts": { "maxDuration": 60 }
   }
 }
