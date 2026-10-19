@@ -1,7 +1,15 @@
 #EXTM3U
-# Curated beIN Sports networks — discovered via the iptv-org streams index and
-# verified playable. Football-first sports coverage (XTRA = beIN's free FAST
-# tier, officially distributed via Amagi/CloudFront/Xumo/Tubi CDNs).
+# Curated beIN Sports networks — every stream is verified playable from
+# Vercel's edge runtime (no IP-blocked DaddyLive CDN dependency).
+# Football-first sports coverage: US XTRA (free FAST tier) + Turkish beIN
+# Sports 1-5 + Haber (news) + the BD.m3u aynaott CloudFront feed.
+#
+# DaddyLive's beIN Arabic / France / MAX channels (dl247:91-100, 116-118,
+# 494-500) serve from edge.cowedd4855ws.sbs which 403's Vercel's edge
+# runtime IPs. They're unreachable without a Cloudflare Worker bypass.
+# The streams below are the working alternatives on non-blocked CDNs.
+
+# ── beIN Sports XTRA (US) — Amagi / CloudFront / Tubi CDNs ──────────────
 #EXTINF:-1 tvg-id="beINSportsXTRA.us" tvg-logo="https://raw.githubusercontent.com/danielpersson1985/tv-logos/refs/heads/main/tv-logos-main/bein-us.png" group-title="Sports",beIN Sports XTRA
 https://bein-xtra-bein.amagi.tv/playlist.m3u8
 #EXTINF:-1 tvg-id="beINSportsXTRA2.us" tvg-logo="https://raw.githubusercontent.com/danielpersson1985/tv-logos/refs/heads/main/tv-logos-main/bein-us.png" group-title="Sports",beIN Sports XTRA (FireTV)
@@ -16,3 +24,32 @@ https://d9ssxzmclhfo4.cloudfront.net/bein_sports.m3u8
 https://dc1644a9jazgj.cloudfront.net/beIN_Sports_Xtra_Espanol.m3u8
 #EXTINF:-1 tvg-id="beINSportsXtraEspanol2.us" tvg-logo="https://raw.githubusercontent.com/danielpersson1985/tv-logos/refs/heads/main/tv-logos-main/bein-es.png" group-title="Sports",beIN Sports XTRA en Español (Xumo)
 https://bein-esp-xumo.amagi.tv/playlist.m3u8
+
+# ── beIN Sports Turkish (1-5 + Haber news) — andro.mangeinde4.lat CDN ───
+# Discovered via iptv-org's sports category index; all 6 streams verified
+# 200 OK from Vercel edge runtime (Vercel /api/proxy → andro.mangeinde4.lat
+# returns valid m3u8 playlists with live media-sequence numbers).
+#EXTINF:-1 tvg-id="beINSports1Turk.tr" tvg-logo="https://static.wikia.nocookie.net/logopedia/images/2/27/BeinSports1.svg/revision/latest?cb=20230910184457" group-title="Sports",beIN Sports 1 Turk
+https://andro.mangeinde4.lat/checklist/androstreamlivebs1.m3u8
+#EXTINF:-1 tvg-id="beINSports2Turk.tr" tvg-logo="https://static.wikia.nocookie.net/logopedia/images/4/40/BeinSports2.svg/revision/latest?cb=20230910185720" group-title="Sports",beIN Sports 2 Turk
+https://andro.mangeinde4.lat/checklist/androstreamlivebs2.m3u8
+#EXTINF:-1 tvg-id="beINSports3Turk.tr" tvg-logo="https://static.wikia.nocookie.net/logopedia/images/5/53/BeIN_Sports_3_2017_Rectangle.png/revision/latest/scale-to-width-down/1000?cb=20251213114000" group-title="Sports",beIN Sports 3 Turk
+https://andro.mangeinde4.lat/checklist/androstreamlivebs3.m3u8
+#EXTINF:-1 tvg-id="beINSports4Turk.tr" tvg-logo="https://static.wikia.nocookie.net/logopedia/images/9/96/Logo_bein_sports_4.png/revision/latest/scale-to-width-down/1000?cb=20251213115820" group-title="Sports",beIN Sports 4 Turk
+https://andro.mangeinde4.lat/checklist/androstreamlivebs4.m3u8
+#EXTINF:-1 tvg-id="beINSports5Turk.tr" tvg-logo="https://static.wikia.nocookie.net/logopedia/images/1/14/BeIN%2Bsports%2B5.png/revision/latest/scale-to-width-down/1000?cb=20251214104942" group-title="Sports",beIN Sports 5 Turk
+https://andro.mangeinde4.lat/checklist/androstreamlivebs5.m3u8
+#EXTINF:-1 tvg-id="beINSportsHaber.tr" tvg-logo="https://i.imgur.com/QWo0x7S.jpg" group-title="Sports",beIN Sports Haber (News)
+https://andro.mangeinde4.lat/checklist/androstreamlivebsh.m3u8
+
+# ── beIN Sports (Arabic feed via aynaott CloudFront) — from BD.m3u ───────
+# This is the closest substitute for the DaddyLive beIN Sports Arabic
+# channels (dl247:91-98) which are blocked. tvsen6.aynaott.com is on a
+# different CDN (not edge.cowedd4855ws.sbs) and is reachable from Vercel.
+#EXTINF:-1 tvg-id="beINSportsArabic.qa" tvg-logo="https://upload.wikimedia.org/wikipedia/commons/thumb/e/e5/Logo_bein_sports_1.png/1200px-Logo_bein_sports_1.png" group-title="Sports",beIN Sports (Arabic)
+https://tvsen6.aynaott.com/beinsports/index.m3u8?e=1784102515&u=ee5437a7-c16b-4700-b317-a41b77d5cba9&token=67d5960a5b93b5cfcf562312b4627330
+
+# ── beIN Sports 1 (alternate) — streamhostingcdn ──────────────────────
+# From BD.m3u. Verified 200 OK via Vercel edge runtime.
+#EXTINF:-1 tvg-id="beINSports1Alt" tvg-logo="https://upload.wikimedia.org/wikipedia/commons/thumb/e/e5/Logo_bein_sports_1.png/1200px-Logo_bein_sports_1.png" group-title="Sports",beIN Sports 1
+https://1nyaler.streamhostingcdn.top/stream/23/index.m3u8
