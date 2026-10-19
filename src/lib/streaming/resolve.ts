@@ -112,12 +112,28 @@ export function isBlockedHost(hostname: string): boolean {
 }
 
 // ─── URL signing (prevents the /api/hls endpoint becoming an open proxy) ────
-// The secret must survive dev-server hot reloads (module re-evaluation),
-// so it is cached on globalThis. Set HLS_SIGN_SECRET to persist across
-// restarts / multiple instances.
+// The secret must survive dev-server hot reloads (module re-evaluation) AND
+// be consistent across isolates on Vercel — serverless functions run on
+// many isolates concurrently, and the signing isolate (where /api/iptv/stream
+// or /api/sports/stream generated the URL) might be different from the
+// verifying isolate (where /api/hls validates the signature). A random
+// per-process secret makes the signature invalid cross-isolate → "bad
+// signature" 403 → streams don't play.
+//
+// Precedence (first wins):
+//   1. HLS_SIGN_SECRET env var (operator-set, persistent across restarts)
+//   2. VERCEL_DEPLOYMENT_ID (Vercel auto-set per-deployment — stable across
+//      isolates on the same deployment, rotates per deploy)
+//   3. VERCEL_URL (Vercel auto-set per-deployment URL — also stable)
+//   4. crypto.randomBytes (last resort — only self-hosted single-isolate
+//      where the random secret stays consistent within one process)
 const g = globalThis as { __zillaHlsSecret?: string };
 if (!g.__zillaHlsSecret) {
-  g.__zillaHlsSecret = process.env.HLS_SIGN_SECRET || crypto.randomBytes(24).toString('hex');
+  g.__zillaHlsSecret =
+    process.env.HLS_SIGN_SECRET ||
+    (process.env.VERCEL_DEPLOYMENT_ID && `dep:${process.env.VERCEL_DEPLOYMENT_ID}`) ||
+    (process.env.VERCEL_URL && `url:${process.env.VERCEL_URL}`) ||
+    crypto.randomBytes(24).toString('hex');
 }
 const SECRET = g.__zillaHlsSecret;
 
