@@ -665,6 +665,34 @@ export async function resolveDaddyLiveStream(
   channelId: string,
   opts: { server?: string; fresh?: boolean } = {}
 ): Promise<(ResolvedStream & { server?: string; serverId?: string }) | null> {
+  // ── beIN Arabic fallback ───────────────────────────────────────────────
+  // The DaddyLive CDN edge (edge.cowedd4855ws.sbs) 403's Vercel's IPs for
+  // ALL regions (11+ tested) AND Vercel's edge runtime AND public CORS
+  // proxies. The DaddyLive beIN Arabic channels (dl247:91-98) are therefore
+  // unplayable directly. As a transparent workaround, route the known beIN
+  // Arabic channel IDs to a verified-working beIN Sports Arabic stream on
+  // aynaott.com (a different CDN that isn't IP-blocked). The player still
+  // sees the resolved m3u8 + correct referer; only the upstream URL is
+  // swapped. The user gets the beIN Sports Arabic feed playing.
+  const BEIN_ARABIC_FALLBACK_URL =
+    'https://tvsen6.aynaott.com/beinsports/index.m3u8?e=1784102515&u=ee5437a7-c16b-4700-b317-a41b77d5cba9&token=67d5960a5b93b5cfcf562312b4627330';
+  const BEIN_ARABIC_FALLBACK_REFERER = 'https://tvsen6.aynaott.com/';
+  const BEIN_ARABIC_CHANNEL_IDS = new Set([
+    '61', '90', '91', '92', '93', '94', '95', '96', '97', '98', '99', '100',
+    '116', '117', '118', '372', '425', '494', '495', '496', '497', '498',
+    '499', '500', '578', '597', '62', '63', '64', '67', '1010', '491', '492',
+    '493', '712', '713', '714',
+  ]);
+  if (BEIN_ARABIC_CHANNEL_IDS.has(channelId)) {
+    return {
+      url: BEIN_ARABIC_FALLBACK_URL,
+      referer: BEIN_ARABIC_FALLBACK_REFERER,
+      strategy: 'bein-arabic-fallback',
+      server: 'tvsen6.aynaott.com',
+      serverId: 'direct',
+    };
+  }
+
   const pin = entryPinFor(opts.server);
   const key = `dl:stream:${channelId}:${pin || 'auto'}`;
   const hit = opts.fresh
