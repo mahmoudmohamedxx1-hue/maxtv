@@ -156,7 +156,28 @@ export async function GET(req: Request) {
     // proxies the CDN manifest through /api/hls.
     const mirrorParam = serverDef?.mirror ? `&m=${serverDef.mirror}` : '';
     let url: string;
-    if (isTurbo) {
+
+    // ── DaddyLive iframe bypass ───────────────────────────────────────────
+    // The DaddyLive CDN edge (edge.cowedd4855ws.sbs) 403's all datacenter IPs
+    // (Vercel serverless in every region, Vercel edge runtime, Cloudflare
+    // Workers, public CORS proxies, 300+ free HTTP proxies — all tested).
+    // It ALSO has a token endpoint at /api/playlist-token?slug=premiumN that
+    // returns a token bound to the requester's IP — but only when the Origin
+    // is `https://daddyliveplayer.st`. The m3u8 fetch needs `?t=<TOKEN>` and
+    // succeeds ONLY from a residential IP (the IP the token was bound to).
+    //
+    // daddyliveplayer.st/premiumtv/daddy.php?id=N has NO X-Frame-Options, so
+    // we can iframe-embed it. When iframe-embedded, the page's JW Player +
+    // custom hls.js LiveLoader run in the USER'S BROWSER (residential IP) —
+    // the token fetch and m3u8/segment fetches all happen from the user's IP
+    // with Origin=daddyliveplayer.st (the iframe's URL sets it correctly).
+    // For DaddyLive channels, we return this iframe URL directly instead of
+    // the (blocked) /api/turbo or /api/hls URL. The player renders an iframe.
+    const DADDYLIVE_EMBED_PREFIX = 'https://daddyliveplayer.st/premiumtv/daddy.php?id=';
+    const isDaddyLiveChannel = /^\d+$/.test(channel);
+    if (isDaddyLiveChannel && !isRelay) {
+      url = `${DADDYLIVE_EMBED_PREFIX}${encodeURIComponent(channel)}`;
+    } else if (isTurbo) {
       url = `/api/turbo?channel=${encodeURIComponent(channel)}${mirrorParam}&mode=m3u8`;
     } else if (isRelay) {
       url = `/api/live?channel=${encodeURIComponent(channel)}${mirrorParam}&mode=m3u8`;

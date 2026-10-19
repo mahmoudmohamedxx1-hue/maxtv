@@ -837,6 +837,19 @@ export function PlayerOverlay() {
         const video = videoRef.current;
         if (!video) return;
 
+        // DaddyLive iframe bypass — when the src is the daddyliveplayer.st
+        // embed URL, the iframe takes over playback (the iframe's JW Player
+        // runs in the user's browser from their residential IP). Skip the
+        // hls.js init — the iframe renders in JSX instead of <video>.
+        if (
+          src.startsWith('https://daddyliveplayer.st/premiumtv/daddy.php?') ||
+          src.startsWith('https://dembed.st/premiumtv/daddy.php?')
+        ) {
+          setPhase('playing');
+          setBuffering(false);
+          return;
+        }
+
         const prefs = loadPrefs();
         video.volume = prefs.volume;
         video.muted = prefs.muted;
@@ -2072,22 +2085,41 @@ export function PlayerOverlay() {
           !controlsVisible && phase === 'playing' && 'cursor-none'
         )}
       >
-        {/* ── video ─────────────────────────────────────────────────────────── */}
-        <video
-          ref={videoRef}
-          className="absolute inset-0 h-full w-full object-contain"
-          playsInline
-          autoPlay
-          onClick={() => (controlsVisible ? togglePlay() : poke())}
-          onDoubleClick={toggleFullscreen}
-          onPlaying={() => setPhase('playing')}
-          onPause={() => {
-            if (phase === 'playing') setPhase('paused');
-          }}
-          onWaiting={() => setBuffering(true)}
-          onPlayingCapture={() => setBuffering(false)}
-          onCanPlay={() => setBuffering(false)}
-        />
+        {/* ── DaddyLive iframe embed ──────────────────────────────────────── */}
+        {/* When the resolved src is the daddyliveplayer.st embed URL, the
+            DaddyLive CDN's anti-bot can't be bypassed from a serverless IP.
+            Instead, iframe-embed the page directly. The iframe's JW Player
+            runs in the user's browser (residential IP) — the token + m3u8
+            fetches all happen from the user's IP with Origin set correctly
+            by the iframe's URL. daddy.php?id=N has no X-Frame-Options, so
+            embedding is allowed. */}
+        {nativeSrcRef.current?.startsWith('https://daddyliveplayer.st/premiumtv/daddy.php?') ||
+        nativeSrcRef.current?.startsWith('https://dembed.st/premiumtv/daddy.php?') ? (
+          <iframe
+            src={nativeSrcRef.current}
+            className="absolute inset-0 h-full w-full border-0"
+            allow="autoplay; fullscreen; encrypted-media; picture-in-picture"
+            allowFullScreen
+            referrerPolicy="no-referrer"
+            title="DaddyLive Stream"
+          />
+        ) : (
+          <video
+            ref={videoRef}
+            className="absolute inset-0 h-full w-full object-contain"
+            playsInline
+            autoPlay
+            onClick={() => (controlsVisible ? togglePlay() : poke())}
+            onDoubleClick={toggleFullscreen}
+            onPlaying={() => setPhase('playing')}
+            onPause={() => {
+              if (phase === 'playing') setPhase('paused');
+            }}
+            onWaiting={() => setBuffering(true)}
+            onPlayingCapture={() => setBuffering(false)}
+            onCanPlay={() => setBuffering(false)}
+          />
+        )}
 
         {/* buffering ring */}
         {buffering && phase === 'playing' && (
