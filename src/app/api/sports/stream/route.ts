@@ -4,6 +4,7 @@ import { proxyUrlFor } from '@/lib/streaming/proxy';
 import { findAlternates, type AlternateChannel } from '@/lib/iptv/catalog';
 import { probeLadder, peekLadder } from '@/lib/streaming/ladder';
 import { getTurboSession, peekTurboSession } from '@/lib/streaming/turbo';
+import { setProxyOriginFromRequest } from '@/lib/streaming/upstream';
 
 export const dynamic = 'force-dynamic';
 
@@ -44,6 +45,9 @@ const LADDER_PROBE_WAIT_MS = 1_800;
  * ladder is dead on serverless — this is the multi-quality engine now).
  */
 export async function GET(req: Request) {
+  // Capture incoming origin so streaming-layer fetches to /api/proxy use the
+  // public alias (bypasses Vercel's deployment-URL SSO redirect).
+  setProxyOriginFromRequest(req);
   const { searchParams } = new URL(req.url);
   const channel = searchParams.get('channel');
   const serverParam = searchParams.get('server');

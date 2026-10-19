@@ -1,6 +1,7 @@
 import { NextResponse, after } from 'next/server';
 import { getTurboSession, SEG_LADDER_HEIGHTS, TurboSession } from '@/lib/streaming/turbo';
 import { ffmpegCapable, SERVERLESS } from '@/lib/streaming/ffmpeg-cap';
+import { setProxyOriginFromRequest } from '@/lib/streaming/upstream';
 
 export const dynamic = 'force-dynamic';
 /** per-segment transcodes can take up to ~10s (kick + upstream fetch + encode)
@@ -46,6 +47,9 @@ async function warmTurboLadder(session: TurboSession, h: number): Promise<void> 
 }
 
 export async function GET(req: Request) {
+  // Capture incoming origin so streaming-layer fetches to /api/proxy use the
+  // public alias (bypasses Vercel's deployment-URL SSO redirect).
+  setProxyOriginFromRequest(req);
   const { searchParams } = new URL(req.url);
   const mode = searchParams.get('mode') || 'm3u8';
   const channel = searchParams.get('channel');

@@ -4,6 +4,7 @@ import { sportName } from '@/lib/sports/categories';
 import { extractTeamsFromTitle, findTeamLogo, findCachedTeamLogo, getLeagueLogo, getChannelLogo, extractTennisPlayers, findPlayerLogo, extractFighters } from '@/lib/media/logos';
 import { getBigLeagueFixtures, getNFLFixtures, fixtureKey, peekFixtures, warmBigLeagues, type BigFixture } from '@/lib/sports/bigleagues';
 import type { SportsMatch } from '@/lib/types';
+import { setProxyOriginFromRequest } from '@/lib/streaming/upstream';
 
 export const dynamic = 'force-dynamic';
 /** after() crest-fill continuation needs headroom past the response on
@@ -267,7 +268,10 @@ function mergeFixtures(daddyLive: EnrichedMatch[], sdb: BigFixture[]): (Enriched
   return out.sort((a, b) => a.startTime - b.startTime);
 }
 
-export async function GET() {
+export async function GET(req: Request) {
+  // Capture incoming origin so DaddyLive schedule fetches through /api/proxy
+  // use the public alias (bypasses Vercel's deployment-URL SSO redirect).
+  setProxyOriginFromRequest(req);
   try {
     const matches = await getSchedule();
     const now = Date.now();

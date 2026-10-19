@@ -4,6 +4,7 @@ import { proxyUrlFor } from '@/lib/streaming/proxy';
 import { findAlternates, type AlternateChannel } from '@/lib/iptv/catalog';
 import { encodeSource } from '@/lib/streaming/transcode';
 import { probeLadder, peekLadder } from '@/lib/streaming/ladder';
+import { setProxyOriginFromRequest } from '@/lib/streaming/upstream';
 
 export const dynamic = 'force-dynamic';
 
@@ -28,6 +29,9 @@ const PROBE_WAIT_MS = 1_800;
  *     swaps to if the direct manifest/segments fail.
  */
 export async function GET(req: Request) {
+  // Capture incoming origin so streaming-layer fetches to /api/proxy use the
+  // public alias (bypasses Vercel's deployment-URL SSO redirect).
+  setProxyOriginFromRequest(req);
   const { searchParams } = new URL(req.url);
   const raw = searchParams.get('url');
   const name = searchParams.get('name') || '';

@@ -9,6 +9,7 @@ import {
   TRANSCODE_HEIGHTS,
   type TranscodeHeight,
 } from '@/lib/streaming/transcode';
+import { setProxyOriginFromRequest } from '@/lib/streaming/upstream';
 
 export const dynamic = 'force-dynamic';
 
@@ -25,6 +26,9 @@ export const dynamic = 'force-dynamic';
  * (≤ 20s) so hls.js can attach immediately without retry storms.
  */
 export async function GET(req: Request) {
+  // Capture incoming origin so streaming-layer fetches to /api/proxy use the
+  // public alias (bypasses Vercel's deployment-URL SSO redirect).
+  setProxyOriginFromRequest(req);
   const { searchParams } = new URL(req.url);
   const heightRaw = parseInt(searchParams.get('height') || '', 10);
   const mode = searchParams.get('mode') || 'm3u8';

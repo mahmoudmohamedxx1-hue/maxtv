@@ -3,6 +3,7 @@ import { get247Channels, probeDaddyLiveChannels, freshAliveIds } from '@/lib/spo
 import { DEAD_DL_CHANNEL_IDS } from '@/lib/sports/categories';
 import { getCatalog } from '@/lib/iptv/catalog';
 import { getChannelLogo } from '@/lib/media/logos';
+import { setProxyOriginFromRequest } from '@/lib/streaming/upstream';
 
 export const dynamic = 'force-dynamic';
 export const maxDuration = 60;
@@ -37,7 +38,10 @@ let probeCursor = 0;
  * rolling background probe (after()) re-verifies the whole catalog across
  * successive requests — ids that die drop out, ids that resurrect reappear.
  */
-export async function GET() {
+export async function GET(req: Request) {
+  // Capture incoming origin so DaddyLive probes/fetches through /api/proxy
+  // use the public alias (bypasses Vercel's deployment-URL SSO redirect).
+  setProxyOriginFromRequest(req);
   try {
     // warm the beIN health probe immediately — runs while the index loads
     const probeWarm = probeDaddyLiveChannels(BEIN_FAMILY_IDS).catch(() => null);

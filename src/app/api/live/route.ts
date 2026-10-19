@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server';
 import { getChannelSession, getSourceSession, decodeSource } from '@/lib/streaming/transcode';
+import { setProxyOriginFromRequest } from '@/lib/streaming/upstream';
 
 export const dynamic = 'force-dynamic';
 
@@ -22,6 +23,9 @@ export const dynamic = 'force-dynamic';
  * remux produced its first window (≤ 14s) so hls.js attaches immediately.
  */
 export async function GET(req: Request) {
+  // Capture incoming origin so streaming-layer fetches to /api/proxy use the
+  // public alias (bypasses Vercel's deployment-URL SSO redirect).
+  setProxyOriginFromRequest(req);
   const { searchParams } = new URL(req.url);
   const mode = searchParams.get('mode') || 'm3u8';
   const channel = searchParams.get('channel');

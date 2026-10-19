@@ -5,6 +5,7 @@
 import { proxyHlsRequest } from '@/lib/streaming/proxy';
 import { verifySignature } from '@/lib/streaming/resolve';
 import { resolveDaddyLiveStream } from '@/lib/sports/daddylive';
+import { setProxyOriginFromRequest } from '@/lib/streaming/upstream';
 
 export const dynamic = 'force-dynamic';
 
@@ -31,6 +32,9 @@ const CH_UP = upG.__maxtvChUp;
 const CH_UP_TTL = 3 * 60_000;
 
 export async function GET(req: Request) {
+  // Capture the incoming request's origin so the streaming layer can build
+  // ABSOLUTE /api/proxy URLs that bypass Vercel's deployment-URL SSO redirect.
+  setProxyOriginFromRequest(req);
   const { searchParams } = new URL(req.url);
   const target = searchParams.get('url');
   const referer = searchParams.get('r') || '';
