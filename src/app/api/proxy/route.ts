@@ -49,7 +49,11 @@ export async function GET(req: Request) {
     const responseHeaders = new Headers({
       'access-control-allow-origin': '*',
       'cache-control': 'no-store',
-      'access-control-expose-headers': 'content-range, accept-ranges, content-length',
+      // expose the final-upstream-URL header so callers (proxyHlsRequest)
+      // can absolutize relative URIs inside playlists against the correct
+      // base — without this, the rewriter uses the /api/proxy URL as the
+      // base and produces garbage variant URLs.
+      'access-control-expose-headers': 'content-range, accept-ranges, content-length, x-final-url',
     });
     // Forward content-type, content-length, content-range, accept-ranges,
     // last-modified, etag — everything the player needs for correct media
@@ -67,6 +71,13 @@ export async function GET(req: Request) {
       const v = res.headers.get(h);
       if (v) responseHeaders.set(h, v);
     }
+    // Tell the caller the FINAL URL after upstream redirects — res.url is
+    // the URL the upstream itself landed on (after any 3xx chain). Callers
+    // use this as the base for relative-URL absolutization inside m3u8
+    // playlists (variant URLs, segment URIs, KEY URIs). Without this,
+    // proxyHlsRequest rewrites variant URLs against the /api/proxy URL
+    // itself, producing broken /api/<original-filename> paths.
+    if (res.url) responseHeaders.set('x-final-url', res.url);
 
     return new Response(res.body, {
       status: res.status,

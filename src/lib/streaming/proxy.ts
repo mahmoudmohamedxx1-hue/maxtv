@@ -134,7 +134,15 @@ async function upstreamFetch(url: string, referer: string, range?: string, metho
   // cert-tolerance for the self-hosted direct case (no bypass active).
   const routedUrl = routeUpstream(url, referer);
   if (routedUrl !== url) {
-    return fetchTolerant(routedUrl, { headers, timeoutMs: 20000 });
+    const res = await fetchTolerant(routedUrl, { headers, timeoutMs: 20000 });
+    // Override the response.url so proxyHlsRequest's rewritePlaylist
+    // absolutizes relative URIs (variant playlists, segment URIs, KEY
+    // URIs) against the ORIGINAL upstream URL, not the /api/proxy URL.
+    // /api/proxy exposes the upstream's final URL (after redirects) via
+    // the x-final-url response header; fall back to the requested URL
+    // when the header is absent (e.g., CF Worker that doesn't set it).
+    const finalUpstreamUrl = res.headers.get('x-final-url') || url;
+    return { ...res, url: finalUpstreamUrl };
   }
   // GETs go through the cert-tolerant path (expired-cert CDNs keep playing,
   // matching what the ffmpeg relay and VLC do); HEAD stays plain fetch —
