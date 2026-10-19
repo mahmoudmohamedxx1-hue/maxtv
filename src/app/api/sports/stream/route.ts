@@ -173,10 +173,10 @@ export async function GET(req: Request) {
     // with Origin=daddyliveplayer.st (the iframe's URL sets it correctly).
     // For DaddyLive channels, we return this iframe URL directly instead of
     // the (blocked) /api/turbo or /api/hls URL. The player renders an iframe.
-    const DADDYLIVE_EMBED_PREFIX = 'https://dlive.sx/watch.php?id=';
+    const DADDYLIVE_EMBED_PREFIX = 'https://dlive.sx/stream/stream-';
     const isDaddyLiveChannel = /^\d+$/.test(channel);
     if (isDaddyLiveChannel && !isRelay) {
-      url = `${DADDYLIVE_EMBED_PREFIX}${encodeURIComponent(channel)}`;
+      url = `${DADDYLIVE_EMBED_PREFIX}${encodeURIComponent(channel)}.php`;
     } else if (isTurbo) {
       url = `/api/turbo?channel=${encodeURIComponent(channel)}${mirrorParam}&mode=m3u8`;
     } else if (isRelay) {
