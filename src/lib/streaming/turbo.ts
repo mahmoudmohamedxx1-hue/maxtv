@@ -1083,21 +1083,20 @@ function isAudioType(t: number): boolean {
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-// Cloudflare Worker proxy — when CF_PROXY_URL is set, ALL upstream fetches
-// (m3u8 manifest + segments) are routed through the Worker. The
-// DaddyLive CDN edge (edge.cowedd4855ws.sbs) returns 403 for Vercel's
-// IPs; the Worker runs on Cloudflare's edge (different IP range) which
-// is NOT blocked. Set CF_PROXY_URL in Vercel env vars to the Worker's
-// URL (e.g. https://nuvio-proxy.yourname.workers.dev).
-const CF_PROXY_URL = process.env.CF_PROXY_URL || '';
+// Upstream routing — when CF_PROXY_URL is set, ALL upstream fetches
+// (m3u8 manifest + segments) are routed through the operator-deployed
+// Cloudflare Worker. When on Vercel (VERCEL_ENV), they route through
+// /api/proxy (runtime=edge, Cloudflare's IPs). The DaddyLive CDN edge
+// (edge.cowedd4855ws.sbs) returns 403 for Vercel's serverless IPs and
+// for some dev machines; both bypasses fetch from a different IP range
+// that is NOT blocked.
+import { routeUpstream } from './upstream';
 
-/** Route a fetch through the Cloudflare Worker proxy when CF_PROXY_URL is set.
- *  The Worker fetches the target URL with the correct Referer/UA from
- *  Cloudflare's IPs (not Vercel's), bypassing the CDN's IP block. */
+/** Route a fetch through the upstream bypass when active (CF Worker on
+ *  self-hosted / dev; /api/proxy edge route on Vercel). Falls through to
+ *  the original URL when no bypass is configured. */
 function proxiedUrl(url: string, referer: string): string {
-  if (!CF_PROXY_URL) return url;
-  const params = new URLSearchParams({ url, ...(referer ? { referer } : {}) });
-  return `${CF_PROXY_URL}?${params}`;
+  return routeUpstream(url, referer);
 }
 
 async function fetchText(url: string, referer: string): Promise<string | null> {
