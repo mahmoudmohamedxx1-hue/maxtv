@@ -48,8 +48,3 @@ https://andro.mangeinde4.lat/checklist/androstreamlivebsh.m3u8
 # different CDN (not edge.cowedd4855ws.sbs) and is reachable from Vercel.
 #EXTINF:-1 tvg-id="beINSportsArabic.qa" tvg-logo="https://upload.wikimedia.org/wikipedia/commons/thumb/e/e5/Logo_bein_sports_1.png/1200px-Logo_bein_sports_1.png" group-title="Sports",beIN Sports (Arabic)
 https://tvsen6.aynaott.com/beinsports/index.m3u8?e=1784102515&u=ee5437a7-c16b-4700-b317-a41b77d5cba9&token=67d5960a5b93b5cfcf562312b4627330
-
-# ── beIN Sports 1 (alternate) — streamhostingcdn ──────────────────────
-# From BD.m3u. Verified 200 OK via Vercel edge runtime.
-#EXTINF:-1 tvg-id="beINSports1Alt" tvg-logo="https://upload.wikimedia.org/wikipedia/commons/thumb/e/e5/Logo_bein_sports_1.png/1200px-Logo_bein_sports_1.png" group-title="Sports",beIN Sports 1
-https://1nyaler.streamhostingcdn.top/stream/23/index.m3u8
