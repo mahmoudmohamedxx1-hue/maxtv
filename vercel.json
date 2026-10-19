@@ -1,5 +1,5 @@
 {
-  "regions": ["hnd1"],
+  "regions": ["gru1"],
   "functions": {
     "src/app/api/turbo/route.ts": { "maxDuration": 60 },
     "src/app/api/live/route.ts": { "maxDuration": 60 },
