@@ -3,11 +3,14 @@
 // Used to diagnose why /api/hls gets 200/text-html from /api/proxy internally
 // while /api/proxy returns 403 to external curl.
 
-import { routeUpstream, UPSTREAM_BYPASS_ACTIVE } from '@/lib/streaming/upstream';
+import { routeUpstream, UPSTREAM_BYPASS_ACTIVE, setProxyOriginFromRequest } from '@/lib/streaming/upstream';
 
 export const dynamic = 'force-dynamic';
 
 export async function GET(req: Request) {
+  // Capture the incoming request's origin FIRST — this is what production
+  // route handlers (hls, turbo, sports/stream) do at the top of their GET.
+  setProxyOriginFromRequest(req);
   const url = new URL(req.url);
   const target = url.searchParams.get('url') || 'https://edge.cowedd4855ws.sbs/premium100/index.m3u8';
   const referer = url.searchParams.get('referer') || 'https://daddyliveplayer.st/premiumtv/daddy.php?id=100';
@@ -24,6 +27,11 @@ export async function GET(req: Request) {
     PROXY_BASE_URL: process.env.PROXY_BASE_URL || '(unset)',
     PORT: process.env.PORT || '(unset)',
     UPSTREAM_BYPASS_ACTIVE,
+    // incoming request headers — shows what Host the request came in on
+    reqHost: req.headers.get('host'),
+    reqXForwardedHost: req.headers.get('x-forwarded-host'),
+    reqXForwardedProto: req.headers.get('x-forwarded-proto'),
+    reqUrl: req.url,
   };
 
   // Now fetch the routed URL to see what we actually get back
