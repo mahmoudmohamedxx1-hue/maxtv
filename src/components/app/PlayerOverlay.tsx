@@ -837,11 +837,14 @@ export function PlayerOverlay() {
         const video = videoRef.current;
         if (!video) return;
 
-        // DaddyLive iframe bypass — when the src is the daddyliveplayer.st
-        // embed URL, the iframe takes over playback (the iframe's JW Player
-        // runs in the user's browser from their residential IP). Skip the
-        // hls.js init — the iframe renders in JSX instead of <video>.
+        // DaddyLive iframe bypass — when the src is the dlive.sx/watch.php
+        // embed URL (chained iframe that ends at dembed.st/premiumtv/daddy.php),
+        // the iframe takes over playback. The DaddyLive chain handles the
+        // token + m3u8 fetches from the user's residential IP via the inner
+        // JW Player on dembed.st. Skip the hls.js init — the iframe renders
+        // in JSX instead of <video>.
         if (
+          src.startsWith('https://dlive.sx/watch.php?') ||
           src.startsWith('https://daddyliveplayer.st/premiumtv/daddy.php?') ||
           src.startsWith('https://dembed.st/premiumtv/daddy.php?')
         ) {
@@ -2093,7 +2096,8 @@ export function PlayerOverlay() {
             fetches all happen from the user's IP with Origin set correctly
             by the iframe's URL. daddy.php?id=N has no X-Frame-Options, so
             embedding is allowed. */}
-        {nativeSrcRef.current?.startsWith('https://daddyliveplayer.st/premiumtv/daddy.php?') ||
+        {nativeSrcRef.current?.startsWith('https://dlive.sx/watch.php?') ||
+        nativeSrcRef.current?.startsWith('https://daddyliveplayer.st/premiumtv/daddy.php?') ||
         nativeSrcRef.current?.startsWith('https://dembed.st/premiumtv/daddy.php?') ? (
           <iframe
             src={nativeSrcRef.current}
