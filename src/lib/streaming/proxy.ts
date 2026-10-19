@@ -8,7 +8,6 @@
 import { UA, isBlockedHost, signUrl } from './resolve';
 import { unwrapSegment } from './uncloak';
 import { fetchTolerant } from './tls-fetch';
-import { routeUpstream } from './upstream';
 
 const SEGMENT_EXT = /\.(ts|m4s|mp4|aac|mp3|vtt|srt|webvtt|cmfa|cmfv|cmaf|jpg|jpeg|png)(\?|$)/i;
 
@@ -101,11 +100,7 @@ async function warmPrefetch(url: string, referer: string): Promise<void> {
   try {
     // cert-tolerant: many free-IPTV CDNs ship expired certificates — strict
     // fetch 502s them on serverless (no ffmpeg to mask it). See tls-fetch.ts.
-    // Route through /api/proxy (edge runtime) or the CF Worker when the
-    // bypass is active — segment fetches also hit the DaddyLive CDN edge
-    // and would 403 from Vercel's serverless IPs without the bypass.
-    const routedUrl = routeUpstream(url, referer);
-    const res = await fetchTolerant(routedUrl, {
+    const res = await fetchTolerant(url, {
       headers: { 'User-Agent': UA, Accept: '*/*', ...(referer ? { Referer: referer } : {}) },
       timeoutMs: 15000,
     });
@@ -127,23 +122,6 @@ async function upstreamFetch(url: string, referer: string, range?: string, metho
     ...(referer ? { Referer: referer } : {}),
     ...(range ? { Range: range } : {}),
   };
-  // Route through /api/proxy (Vercel edge runtime, Cloudflare IPs) or the
-  // operator-deployed CF Worker when the bypass is active. The DaddyLive
-  // CDN edge returns 403 from Vercel serverless (AWS) IPs — fetching from
-  // the edge runtime's IPs bypasses the block. fetchTolerant still handles
-  // cert-tolerance for the self-hosted direct case (no bypass active).
-  const routedUrl = routeUpstream(url, referer);
-  if (routedUrl !== url) {
-    const res = await fetchTolerant(routedUrl, { headers, timeoutMs: 20000 });
-    // Override the response.url so proxyHlsRequest's rewritePlaylist
-    // absolutizes relative URIs (variant playlists, segment URIs, KEY
-    // URIs) against the ORIGINAL upstream URL, not the /api/proxy URL.
-    // /api/proxy exposes the upstream's final URL (after redirects) via
-    // the x-final-url response header; fall back to the requested URL
-    // when the header is absent (e.g., CF Worker that doesn't set it).
-    const finalUpstreamUrl = res.headers.get('x-final-url') || url;
-    return { ...res, url: finalUpstreamUrl };
-  }
   // GETs go through the cert-tolerant path (expired-cert CDNs keep playing,
   // matching what the ffmpeg relay and VLC do); HEAD stays plain fetch —
   // nothing HEADs an IPTV CDN in this app today.

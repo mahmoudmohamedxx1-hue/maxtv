@@ -10,7 +10,6 @@ import * as cheerio from 'cheerio';
 import type { SportsMatch, SportsChannelRef, ResolvedStream } from '../types';
 import { normalizeSport, splitLeague, stripEmojis, decodeEntities, isEventStream, DEAD_DL_CHANNEL_IDS } from './categories';
 import { rankScheduleFeeds, type FeedHealth } from './feeds';
-import { routeUpstream } from '@/lib/streaming/upstream';
 
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36';
@@ -138,14 +137,7 @@ function setCached<T>(key: string, data: T, ttlMs: number, staleMs = 0) {
 // ─── shared fetch ────────────────────────────────────────────────────────────
 async function fetchText(url: string, referer: string, timeoutMs = 9000): Promise<string | null> {
   try {
-    // Route through /api/proxy (Vercel edge runtime, Cloudflare IPs) or the
-    // operator-deployed CF Worker when the bypass is active. The DaddyLive
-    // CDN edge (edge.cowedd4855ws.sbs) returns 403 from Vercel's serverless
-    // IPs; mirror pages load from any IP but the m3u8 they hand back is on
-    // the blocked edge — so the resolve flow needs the bypass from the
-    // very first fetch, not just at segment-fetch time.
-    const target = routeUpstream(url, referer);
-    const res = await fetch(target, {
+    const res = await fetch(url, {
       headers: {
         'User-Agent': UA,
         Referer: referer,
@@ -786,12 +778,7 @@ async function tryEdgeDirect(
   const referer = `${PLAYER_CDN}/premiumtv/daddy.php?id=${channelId}`;
   const url = `https://${cdnEdge.host}/premium${channelId}/index.m3u8`;
   try {
-    // Route through /api/proxy (Vercel edge) or CF Worker — the DaddyLive
-    // CDN edge returns 403 from Vercel's serverless (AWS) IPs and from
-    // many dev-machine egress IPs. The bypass routes the fetch through
-    // Cloudflare's edge IPs (different range, not blocked).
-    const target = routeUpstream(url, referer);
-    const res = await fetch(target, {
+    const res = await fetch(url, {
       headers: { 'User-Agent': UA, Referer: referer, Accept: '*/*' },
       signal: AbortSignal.timeout(5000),
       redirect: 'follow',
@@ -824,16 +811,11 @@ async function probeOne(id: string): Promise<boolean> {
   // three strikes — the CDN edges flap (round-robin nodes + connection
   // throttling on bursts), so one or two failed GETs prove nothing.
   // A clean 404/410 is definitive and skips the retries.
-  const probeUrl = `https://${cdnEdge.host}/premium${id}/index.m3u8`;
-  const probeReferer = `${PLAYER_CDN}/`;
-  // Route through /api/proxy (Vercel edge) or CF Worker — without the bypass
-  // every probe 403s and the entire catalogue reads as dead on Vercel.
-  const target = routeUpstream(probeUrl, probeReferer);
   for (let attempt = 0; attempt < 3; attempt++) {
     if (attempt > 0) await new Promise((r) => setTimeout(r, 500 + Math.random() * 500));
     try {
-      const res = await fetch(target, {
-        headers: { 'User-Agent': UA, Referer: probeReferer },
+      const res = await fetch(`https://${cdnEdge.host}/premium${id}/index.m3u8`, {
+        headers: { 'User-Agent': UA, Referer: `${PLAYER_CDN}/` },
         signal: AbortSignal.timeout(3500),
         redirect: 'follow',
       });
