@@ -72,35 +72,18 @@ export async function GET(req: Request) {
       html = html.replace(re, '');
     }
 
-    // ── Inject function overrides BEFORE the page's main JS ──────────
+    // ── Inject function overrides + clean CSS before </head> ──────────
     // Override isEmbedded() to return true (page thinks it's in an iframe)
     // Override inAdSandbox() to return false (page thinks it's not sandboxed)
     // This prevents blockPlayer('This player only works when embedded.')
     // and blockPlayer('Remove sandbox') from firing.
-    const overrideScript = `<script>
+    const overrideAndCss = `<script>
       window.isEmbedded = function() { return true; };
       window.inAdSandbox = function() { return false; };
-    </script>`;
+    </script>
+    <style>*{margin:0;padding:0;box-sizing:border-box}html,body{width:100%;height:100%;overflow:hidden;background:#000}#player,#thatframe{width:100%!important;height:100%!important}#msg{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);z-index:9999;color:#fff;font:16px/1.5 system-ui,sans-serif;text-align:center}</style>`;
 
-    // Inject the override script right before the FIRST inline <script> tag
-    // (which is the page's main JS). Using a marker that appears before
-    // the main JS — the </style> tag at the end of the CSS section.
-    html = html.replace('</style>', '</style>' + overrideScript, 1);
-
-    // ── Rewrite token fetch URL to same-origin proxy ─────────────────
-    // The page's JS has: fetch(EDGE + '/api/playlist-token?slug=' + ...)
-    // Rewrite to: fetch('/api/daddylive-embed?token=' + ...)
-    // The proxy fetches with Origin=dembed.st server-side.
-    html = html.replace(
-      /EDGE\s*\+\s*['"]\/api\/playlist-token\?slug=['"]/g,
-      '"/api/daddylive-embed?token=" + '
-    );
-
-    // ── Add clean CSS ─────────────────────────────────────────────────
-    html = html.replace(
-      '</head>',
-      '<style>*{margin:0;padding:0;box-sizing:border-box}html,body{width:100%;height:100%;overflow:hidden;background:#000}#player,#thatframe{width:100%!important;height:100%!important}#msg{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);z-index:9999;color:#fff;font:16px/1.5 system-ui,sans-serif;text-align:center}</style></head>'
-    );
+    html = html.replace('</head>', overrideAndCss + '</head>');
 
     return new Response(html, {
       status: 200,
