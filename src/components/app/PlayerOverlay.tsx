@@ -844,7 +844,6 @@ export function PlayerOverlay() {
         // JW Player on dembed.st. Skip the hls.js init — the iframe renders
         // in JSX instead of <video>.
         if (
-          src.startsWith('/api/daddylive-embed?channel=') ||
           src.startsWith('https://dlive.sx/stream/stream-') ||
           src.startsWith('https://dlive.sx/watch.php?') ||
           src.startsWith('https://daddyliveplayer.st/premiumtv/daddy.php?') ||
@@ -2098,8 +2097,7 @@ export function PlayerOverlay() {
             fetches all happen from the user's IP with Origin set correctly
             by the iframe's URL. daddy.php?id=N has no X-Frame-Options, so
             embedding is allowed. */}
-        {nativeSrcRef.current?.startsWith('/api/daddylive-embed?channel=') ||
-        nativeSrcRef.current?.startsWith('https://dlive.sx/stream/stream-') ||
+        {nativeSrcRef.current?.startsWith('https://dlive.sx/stream/stream-') ||
         nativeSrcRef.current?.startsWith('https://dlive.sx/watch.php?') ||
         nativeSrcRef.current?.startsWith('https://daddyliveplayer.st/premiumtv/daddy.php?') ||
         nativeSrcRef.current?.startsWith('https://dembed.st/premiumtv/daddy.php?') ? (
