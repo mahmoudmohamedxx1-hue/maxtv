@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { useTV, type Playable } from '@/lib/store';
 import { cn } from '@/lib/utils';
+import { useT } from '@/lib/locale';
 
 interface SearchResult {
   matches: {
@@ -40,6 +41,7 @@ export function SearchOverlay({
   const [results, setResults] = useState<SearchResult>(EMPTY);
   const [loading, setLoading] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
+  const { t } = useT();
 
   useEffect(() => {
     if (open) {
@@ -63,7 +65,7 @@ export function SearchOverlay({
       return;
     }
     setLoading(true);
-    const t = setTimeout(async () => {
+    const tm = setTimeout(async () => {
       try {
         const res = await fetch(`/api/search?q=${encodeURIComponent(q.trim())}`);
         const data = (await res.json()) as Partial<SearchResult>;
@@ -74,7 +76,7 @@ export function SearchOverlay({
         setLoading(false);
       }
     }, 280);
-    return () => clearTimeout(t);
+    return () => clearTimeout(tm);
   }, [q]);
 
   if (!open) return null;
@@ -102,7 +104,7 @@ export function SearchOverlay({
             ref={inputRef}
             value={q}
             onChange={(e) => setQ(e.target.value)}
-            placeholder="Search live events, sports channels, TV channels…"
+            placeholder={t('search.placeholder')}
             className="w-full bg-transparent text-base font-semibold text-zilla-text placeholder:text-zilla-dim/70 focus:outline-none"
             aria-label="Search query"
           />
@@ -119,19 +121,17 @@ export function SearchOverlay({
           {q.trim().length < 2 ? (
             <div className="px-4 py-10 text-center">
               <p className="text-4xl">🔍</p>
-              <p className="mt-3 text-sm font-bold text-zilla-dim">
-                Type at least 2 characters to search 12,000+ channels & live events
-              </p>
+              <p className="mt-3 text-sm font-bold text-zilla-dim">{t('search.minChars')}</p>
             </div>
           ) : !loading && total === 0 ? (
             <div className="px-4 py-10 text-center">
               <p className="text-4xl">📡</p>
-              <p className="mt-3 text-sm font-bold text-zilla-dim">No results for “{q}”</p>
+              <p className="mt-3 text-sm font-bold text-zilla-dim">{t('search.noResults')} “{q}”</p>
             </div>
           ) : (
             <>
               {results.matches.length > 0 && (
-                <Section title="Live & upcoming events">
+                <Section title={t('search.liveSection')}>
                   {results.matches.map((m) => (
                     <button
                       key={m.id}
@@ -165,7 +165,7 @@ export function SearchOverlay({
               )}
 
               {results.sports.length > 0 && (
-                <Section title="Sports channels">
+                <Section title={t('search.sportsSection')}>
                   {results.sports.map((c) => (
                     <button
                       key={c.id}
@@ -188,7 +188,7 @@ export function SearchOverlay({
               )}
 
               {results.channels.length > 0 && (
-                <Section title="TV channels">
+                <Section title={t('search.tvSection')}>
                   {results.channels.map((c) => (
                     <button
                       key={c.id}

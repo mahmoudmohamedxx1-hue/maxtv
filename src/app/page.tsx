@@ -5,8 +5,11 @@ import { TopNav, type TabId } from '@/components/app/TopNav';
 import { SportsTab } from '@/components/app/SportsTab';
 import { OthersTab } from '@/components/app/OthersTab';
 import { PlayerOverlay } from '@/components/app/PlayerOverlay';
+import { MultiViewGrid } from '@/components/app/multiview/MultiViewGrid';
 import { SearchOverlay } from '@/components/app/SearchOverlay';
 import { useTV, type Playable } from '@/lib/store';
+import { useT } from '@/lib/locale';
+import { decodePlayable } from '@/components/app/player/utils';
 
 /** Give persisted recents/favorites their photos back.
  *  Entries saved before logos were attached to playables (or via flows that
@@ -68,12 +71,21 @@ function useLogoBackfill() {
 }
 
 export default function Home() {
-  const [tab, setTab] = useState<TabId>('sports');
+  // PWA shortcut deep links: /?tab=sports | /?tab=others — resolved at
+  // init (no setState-in-effect cascade); the URL cleanup happens below
+  const [tab, setTab] = useState<TabId>(() => {
+    if (typeof window !== 'undefined') {
+      const p = new URLSearchParams(window.location.search).get('tab');
+      if (p === 'sports' || p === 'others') return p;
+    }
+    return 'sports';
+  });
   const [searchOpen, setSearchOpen] = useState(false);
   const [liveCount, setLiveCount] = useState(0);
   const [totalChannels, setTotalChannels] = useState(0);
   const [zapPool, setZapPool] = useState<Playable[]>([]);
   const { openPlayer, player } = useTV();
+  const { t } = useT();
 
   // backfill photos for persisted recents/favorites (Recently watched fix)
   useLogoBackfill();
@@ -98,19 +110,23 @@ export default function Home() {
     };
   }, []);
 
-  // deep link: /?ch=<base64 playable> opens the player straight away (share feature)
+  // deep link: /?ch=<base64 playable> opens the player straight away (share
+  // feature); tab= handled at init above. OpenPlayer is a store action (not
+  // setState), so this effect stays cascade-free.
   useEffect(() => {
-    const ch = new URLSearchParams(window.location.search).get('ch');
-    if (!ch) return;
-    try {
-      const p = JSON.parse(decodeURIComponent(escape(atob(ch)))) as Playable;
+    const params = new URLSearchParams(window.location.search);
+    const ch = params.get('ch');
+    if (ch) {
+      const p = decodePlayable(ch);
       // strict kind check — a corrupted/typo'd kind must not fall through to
       // the IPTV branch (url=<channel-id> → guaranteed 400 "offline")
-      if (p && (p.kind === 'daddylive' || p.kind === 'iptv') && p.ref) openPlayer(p);
-      // clean the URL so refreshes don't force the same channel forever
+      if (p) openPlayer(p);
+    }
+    if (ch || params.get('tab')) {
+      // clean the URL so refreshes don't force the same channel/tab forever
       window.history.replaceState({}, '', window.location.pathname);
-    } catch { /* ignore malformed links */ }
-  }, []);
+    }
+  }, [openPlayer]);
 
   const buildZapPool = useCallback(async (): Promise<Playable[]> => {
     // zap pool: live event feeds first, then 24/7 sports, then iptv picks
@@ -206,20 +222,16 @@ export default function Home() {
                 <p className="text-sm font-black tracking-tight text-zilla-text">
                   MAX<span className="text-zilla-yellow">TV</span>
                 </p>
-                <p className="text-[11px] font-medium text-zilla-dim">Sports-first free streaming</p>
+                <p className="text-[11px] font-medium text-zilla-dim">{t('footer.tagline')}</p>
               </div>
             </div>
-            <p className="max-w-md text-[11px] font-medium leading-relaxed text-zilla-dim">
-              Live sports engine ported from{' '}
-              <span className="font-bold text-zilla-text">live-sport-plugin</span> · channel lineup from{' '}
-              <span className="font-bold text-zilla-text">IPTV-Scraper-Zilla</span>. MaxTV hosts no content —
-              it aggregates publicly available streams for informational purposes.
-            </p>
+            <p className="max-w-md text-[11px] font-medium leading-relaxed text-zilla-dim">{t('footer.blurb')}</p>
           </div>
         </div>
       </footer>
 
       <PlayerOverlay />
+      <MultiViewGrid />
       <SearchOverlay
         open={searchOpen}
         onClose={() => setSearchOpen(false)}

@@ -5,6 +5,7 @@ import { useTV, type Playable } from '@/lib/store';
 import { ChannelCard } from './ChannelCard';
 import { CategoryPills } from './CategoryPills';
 import { cn } from '@/lib/utils';
+import { useT } from '@/lib/locale';
 
 interface CatalogResponse {
   categories: { id: string; name: string; count: number }[];
@@ -21,6 +22,7 @@ const PAGE = 60;
 
 export function OthersTab({ onPlayChannel }: { onPlayChannel: (ch: Playable) => void }) {
   const { favorites, recents } = useTV();
+  const { t } = useT();
   const [catalog, setCatalog] = useState<CatalogResponse | null>(null);
   const [category, setCategory] = useState('all');
   const [source, setSource] = useState('');
@@ -104,12 +106,10 @@ export function OthersTab({ onPlayChannel }: { onPlayChannel: (ch: Playable) => 
         {/* header */}
         <div className="px-4 sm:px-6 lg:px-10">
           <h1 className="text-2xl font-black uppercase tracking-tight text-zilla-text sm:text-3xl">
-            Everything else, <span className="text-zilla-yellow">one tab</span>
+            {t('others.headingA')} <span className="text-zilla-yellow">{t('others.headingB')}</span>
           </h1>
           <p className="mt-1 max-w-2xl text-sm font-medium text-zilla-dim">
-            {catalog ? catalog.total.toLocaleString() : '11,000+'} free channels from Pluto TV, Samsung TV
-            Plus, Plex, Xumo, Tubi, Roku, LG Channels, STIRR and more — refreshed hourly by{' '}
-            <span className="font-bold text-zilla-text">IPTV-Scraper-Zilla</span>.
+            {t('others.blurb', { n: (catalog ? catalog.total : 11000).toLocaleString() })}
           </p>
         </div>
 
@@ -163,7 +163,7 @@ export function OthersTab({ onPlayChannel }: { onPlayChannel: (ch: Playable) => 
           ) : channels.length === 0 ? (
             <div className="px-4 py-14 text-center sm:px-6 lg:px-10">
               <p className="text-4xl">📺</p>
-              <p className="mt-3 text-base font-extrabold text-zilla-text">No channels match this filter</p>
+              <p className="mt-3 text-base font-extrabold text-zilla-text">{t('others.noMatch')}</p>
               <p className="mt-1 text-sm font-medium text-zilla-dim">Try a different category or source.</p>
             </div>
           ) : (

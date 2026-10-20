@@ -78,6 +78,19 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
+/* ── Arabic locale (RTL) ──
+ * Cairo takes over the UI when the locale is Arabic (Rubik has no Arabic
+ * glyphs). Latin text inside the Arabic UI still renders fine — Cairo ships
+ * a Latin subset too. */
+html[lang="ar"] body {
+  font-family: var(--font-cairo), var(--font-rubik), system-ui, sans-serif;
+}
+/* Arabic headings get a touch more line height — Cairo's tall ascenders
+ * collide with the tight tracking utilities at 0.8× zoom */
+html[lang="ar"] .tracking-tight {
+  letter-spacing: 0;
+}
+
 /* ── Pluto-style utilities ── */
 
 .hide-scrollbar {

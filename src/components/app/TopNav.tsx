@@ -9,22 +9,26 @@ import {
   readConnection,
   type PlayerPrefs,
 } from '@/lib/player-settings';
+import { useT, useLocale } from '@/lib/locale';
+import { usePwa } from '@/lib/pwa';
+import { useTV } from '@/lib/store';
+import { Icon } from './player/icons';
 
 export type TabId = 'sports' | 'others';
 
 const NATIVE_QUALITIES = [
-  { h: 1080, label: '1080p', hint: 'Full HD' },
-  { h: 720, label: '720p', hint: 'HD' },
-  { h: 480, label: '480p', hint: '' },
-  { h: 360, label: '360p', hint: '' },
+  { h: 1080, label: '1080p', hintKey: 'player.rung.fullHd' },
+  { h: 720, label: '720p', hintKey: 'player.rung.hd' },
+  { h: 480, label: '480p', hintKey: '' },
+  { h: 360, label: '360p', hintKey: '' },
 ];
 const SAVER_QUALITIES = [
-  { h: 1080, label: '1080p', hint: 'Full HD' },
-  { h: 720, label: '720p', hint: 'HD' },
-  { h: 480, label: '480p', hint: '' },
-  { h: 360, label: '360p', hint: '' },
-  { h: 244, label: '244p', hint: '' },
-  { h: 144, label: '144p', hint: 'ultra low' },
+  { h: 1080, label: '1080p', hintKey: 'player.rung.fullHd' },
+  { h: 720, label: '720p', hintKey: 'player.rung.hd' },
+  { h: 480, label: '480p', hintKey: '' },
+  { h: 360, label: '360p', hintKey: '' },
+  { h: 244, label: '244p', hintKey: '' },
+  { h: 144, label: '144p', hintKey: 'player.rung.ultraLow' },
 ];
 
 export function TopNav({
@@ -42,6 +46,10 @@ export function TopNav({
   liveCount: number;
   totalChannels: number;
 }) {
+  const { t } = useT();
+  const { locale, setLocale } = useLocale();
+  const pwa = usePwa();
+  const { openGrid, gridPanes } = useTV();
   const [zapSpin, setZapSpin] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [prefs, setPrefs] = useState<PlayerPrefs | null>(null);
@@ -49,9 +57,6 @@ export function TopNav({
   const menuRef = useRef<HTMLDivElement>(null);
 
   // probe once whether this deployment can transcode (data-saver ladder).
-  // /api/turbo?mode=cap answers both flavors: cap (continuous relay,
-  // self-hosted) and seg (per-segment &h= ladder — works on serverless via
-  // the bundled static ffmpeg, so the ladder exists on Vercel too).
   const [segLadder, setSegLadder] = useState(false);
   useEffect(() => {
     let alive = true;
@@ -87,9 +92,13 @@ export function TopNav({
     updatePrefs({ quality: h, autoPicked: false });
   };
 
+  /** cycle EN → AR (→ EN) — the pill shows the language you'd switch TO */
+  const nextLocale = locale === 'en' ? 'ar' : 'en';
+  const nextLocaleLabel = nextLocale === 'ar' ? 'العربية' : 'English';
+
   return (
     <header className="sticky top-0 z-40 border-b border-zilla-line bg-zilla-bg/95 backdrop-blur-md">
-      <div className="flex h-16 items-center gap-2 px-3 sm:gap-6 sm:px-6 lg:px-10">
+      <div className="flex h-16 items-center gap-2 px-3 sm:gap-4 sm:px-6 lg:px-10">
         {/* logo — the real MaxTV mark + wordmark, big and leading the header */}
         <button
           onClick={() => onTab('sports')}
@@ -118,7 +127,7 @@ export function TopNav({
             )}
           >
             <span aria-hidden>⚽</span>
-            Sports
+            {t('common.sports')}
             {liveCount > 0 && (
               <span
                 className={cn(
@@ -142,7 +151,7 @@ export function TopNav({
             )}
           >
             <span aria-hidden>📺</span>
-            Others
+            {t('common.others')}
             <span className={cn('hidden text-[10px] font-bold sm:inline', tab === 'others' ? 'text-black/60' : 'text-zilla-dim')}>
               {totalChannels > 0 ? `${Math.round(totalChannels / 1000)}k+` : ''}
             </span>
@@ -151,16 +160,62 @@ export function TopNav({
 
         <div className="flex-1" />
 
+        {/* multi-view grid */}
+        <button
+          onClick={openGrid}
+          className="relative flex shrink-0 items-center gap-1.5 rounded-full border border-zilla-line bg-zilla-panel px-2.5 py-2 text-[11px] font-black uppercase tracking-wide text-zilla-dim transition-colors hover:border-white/25 hover:text-zilla-text"
+          title={t('grid.open')}
+          aria-label={t('grid.open')}
+        >
+          <span className="h-4 w-4">{Icon.grid}</span>
+          {gridPanes.length > 0 && (
+            <span className="absolute -end-1 -top-1 flex h-4 w-4 items-center justify-center rounded-full bg-zilla-red text-[9px] font-black text-white">
+              {gridPanes.length}
+            </span>
+          )}
+        </button>
+
+        {/* PWA install — only when the browser offers it (or iOS hint) */}
+        {(pwa.canInstall || (pwa.ios && !pwa.standalone)) && (
+          <button
+            onClick={() => {
+              if (pwa.canInstall) void pwa.prompt();
+              else onSearch(); // iOS: no prompt API — point at the share flow via search hint
+            }}
+            className="hidden shrink-0 items-center gap-1.5 rounded-full border border-zilla-yellow/50 bg-zilla-yellow/10 px-2.5 py-2 text-[11px] font-black uppercase tracking-wide text-zilla-yellow transition-colors hover:bg-zilla-yellow/20 sm:flex"
+            title={t('nav.installHint')}
+            aria-label={t('nav.install')}
+          >
+            <svg viewBox="0 0 24 24" className="h-4 w-4 fill-current" aria-hidden>
+              <path d="M11 2h2v10h-2V2zm4.6 2.6 1.4 1.4L14.4 8 13 6.6l2.6-2zM7 6 8.4 4.6 11 7.2 9.6 8.6 7 6zm-2 9h14v2h-6v5h-2v-5H5v-2z" transform="rotate(180 12 12)" />
+            </svg>
+            <span className="hidden md:block">{t('nav.install')}</span>
+          </button>
+        )}
+
+        {/* language toggle — shows the language you'd switch TO */}
+        <button
+          onClick={() => setLocale(nextLocale)}
+          className="flex shrink-0 items-center gap-1.5 rounded-full border border-zilla-line bg-zilla-panel px-2.5 py-2 text-[11px] font-black uppercase tracking-wide text-zilla-dim transition-colors hover:border-white/25 hover:text-zilla-text"
+          title={t('nav.language')}
+          aria-label={t('nav.language')}
+        >
+          <svg viewBox="0 0 24 24" className="h-4 w-4 fill-current" aria-hidden>
+            <path d="M12.9 15l-2.6-2.5.02-.02A17.9 17.9 0 0 0 13.9 7H17V5h-7V3H8v2H1v2h11.2A15.9 15.9 0 0 1 9 11.1 15.9 15.9 0 0 1 6.8 8H4.8a17.9 17.9 0 0 0 2.7 4.4L3.5 16.3l1.4 1.4L10 12.6l3.5 3.5.4-1.1zM18.5 10h-2L12 22h2l1.1-3h4.8l1.1 3h2l-4.5-12zm-2.6 7 1.6-4.3 1.6 4.3h-3.2z" />
+          </svg>
+          {nextLocaleLabel}
+        </button>
+
         {/* search */}
         <button
           onClick={onSearch}
           className="flex shrink-0 items-center gap-2 rounded-full border border-zilla-line bg-zilla-panel px-2.5 py-2 text-xs font-bold text-zilla-dim transition-colors hover:border-white/25 hover:text-zilla-text sm:px-3.5"
-          aria-label="Search channels and events"
+          aria-label={t('nav.searchLabel')}
         >
           <svg viewBox="0 0 24 24" className="h-4 w-4 fill-current" aria-hidden>
             <path d="M15.5 14h-.8l-.3-.3a6.5 6.5 0 1 0-.7.7l.3.3v.8l5 5 1.5-1.5-5-5zm-6 0a4.5 4.5 0 1 1 0-9 4.5 4.5 0 0 1 0 9z" />
           </svg>
-          <span className="hidden md:block">Search</span>
+          <span className="hidden md:block">{t('common.search')}</span>
         </button>
 
         {/* settings — quality, data saver, zap */}
@@ -174,7 +229,7 @@ export function TopNav({
               'flex shrink-0 items-center gap-1.5 rounded-full px-2.5 py-2 text-[11px] font-black uppercase tracking-wide transition-transform hover:scale-105 sm:px-3.5 sm:text-xs',
               settingsOpen ? 'bg-white/15 text-white' : 'bg-zilla-yellow text-black shadow-[0_0_18px_rgba(255,210,0,0.3)]'
             )}
-            aria-label="Settings"
+            aria-label={t('common.settings')}
             aria-expanded={settingsOpen}
           >
             <svg viewBox="0 0 24 24" className="h-4.5 w-4.5" aria-hidden>
@@ -183,11 +238,11 @@ export function TopNav({
                 d="M19.4 13a7.5 7.5 0 0 0 .1-1 7.5 7.5 0 0 0-.1-1l2.1-1.7a.5.5 0 0 0 .1-.6l-2-3.5a.5.5 0 0 0-.6-.2l-2.5 1a7.7 7.7 0 0 0-1.7-1l-.4-2.6a.5.5 0 0 0-.5-.4h-4a.5.5 0 0 0-.5.4l-.4 2.7a7.7 7.7 0 0 0-1.7 1l-2.5-1a.5.5 0 0 0-.6.2l-2 3.5a.5.5 0 0 0 .1.6L4.5 11a7.5 7.5 0 0 0-.1 1 7.5 7.5 0 0 0 .1 1l-2.1 1.7a.5.5 0 0 0-.1.6l2 3.5c.1.2.4.3.6.2l2.5-1a7.7 7.7 0 0 0 1.7 1l.4 2.6c0 .3.2.4.5.4h4c.2 0 .5-.2.5-.4l.4-2.6a7.7 7.7 0 0 0 1.7-1l2.5 1c.2.1.5 0 .6-.2l2-3.5a.5.5 0 0 0-.1-.6L19.4 13zM12 15.5a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7z"
               />
             </svg>
-            <span className="hidden sm:block">Settings</span>
+            <span className="hidden sm:block">{t('common.settings')}</span>
           </button>
 
           {settingsOpen && (
-            <div className="styled-scrollbar absolute right-0 top-12 z-50 max-h-[78vh] w-72 max-w-[88vw] overflow-y-auto rounded-xl border border-zilla-line bg-zilla-bg/97 shadow-2xl backdrop-blur">
+            <div className="styled-scrollbar absolute end-0 top-12 z-50 max-h-[78vh] w-72 max-w-[88vw] overflow-y-auto rounded-xl border border-zilla-line bg-zilla-bg/97 shadow-2xl backdrop-blur">
               {/* zap — the Pluto signature lives on inside settings */}
               <button
                 onClick={() => {
@@ -196,7 +251,7 @@ export function TopNav({
                   onZap();
                   setTimeout(() => setZapSpin(false), 700);
                 }}
-                className="flex w-full items-center gap-3 border-b border-zilla-line/60 px-4 py-3 text-left transition-colors hover:bg-white/5"
+                className="flex w-full items-center gap-3 border-b border-zilla-line/60 px-4 py-3 text-start transition-colors hover:bg-white/5"
               >
                 <span
                   className={cn(
@@ -212,14 +267,14 @@ export function TopNav({
                   </svg>
                 </span>
                 <span className="min-w-0 flex-1">
-                  <span className="block text-xs font-black uppercase tracking-wide text-zilla-text">Zap</span>
-                  <span className="block text-[10px] font-medium text-zilla-dim">Jump to a random live channel</span>
+                  <span className="block text-xs font-black uppercase tracking-wide text-zilla-text">{t('settings.zap')}</span>
+                  <span className="block text-[10px] font-medium text-zilla-dim">{t('settings.zapDesc')}</span>
                 </span>
               </button>
 
               {/* video quality */}
               <p className="border-b border-zilla-line/60 px-4 py-2 text-[9px] font-black uppercase tracking-widest text-zilla-dim">
-                Video quality
+                {t('settings.videoQuality')}
               </p>
               <button
                 onClick={() => pickQuality(-1)}
@@ -229,14 +284,12 @@ export function TopNav({
                 )}
               >
                 <span>
-                  Auto
-                  <span className="ml-1.5 text-[9px] font-bold text-zilla-dim">most stable</span>
+                  {t('settings.auto')}
+                  <span className="ms-1.5 text-[9px] font-bold text-zilla-dim">{t('settings.mostStable')}</span>
                 </span>
                 {prefs?.quality === -1 && <span>✓</span>}
               </button>
-              <p className="px-4 pb-2 text-[10px] font-medium leading-snug text-zilla-dim">
-                Picks the most stable quality for your connection — starts safe, climbs when the link proves it, drops on stalls.
-              </p>
+              <p className="px-4 pb-2 text-[10px] font-medium leading-snug text-zilla-dim">{t('settings.autoDesc')}</p>
               {NATIVE_QUALITIES.map((q) => (
                 <button
                   key={q.h}
@@ -248,18 +301,18 @@ export function TopNav({
                 >
                   <span>
                     {q.label}
-                    {q.hint && <span className="ml-1.5 text-[9px] font-bold text-zilla-dim">{q.hint}</span>}
+                    {q.hintKey && <span className="ms-1.5 text-[9px] font-bold text-zilla-dim">{t(q.hintKey)}</span>}
                   </span>
                   {prefs?.quality === q.h && <span>✓</span>}
                 </button>
               ))}
 
               <p className="border-t border-zilla-line/60 px-4 py-2 text-[9px] font-black uppercase tracking-widest text-zilla-dim">
-                Quality ladder · Data saver
+                {t('settings.dataSaver')}
               </p>
               {!tcCap && (
                 <p className="px-4 pb-1.5 pt-1 text-[10px] font-medium leading-snug text-zilla-yellow/80">
-                  Not available on this deployment — the server can't re-encode streams. Picks fall back to the nearest native quality.
+                  {t('settings.dsUnavailable')}
                 </p>
               )}
               {SAVER_QUALITIES.filter((q) => !segLadder || q.h <= 480).map((q) => (
@@ -273,65 +326,55 @@ export function TopNav({
                 >
                   <span>
                     {q.label}
-                    {q.hint && <span className="ml-1.5 text-[9px] font-bold text-zilla-dim">{q.hint}</span>}
+                    {q.hintKey && <span className="ms-1.5 text-[9px] font-bold text-zilla-dim">{t(q.hintKey)}</span>}
                   </span>
                   {prefs?.quality === q.h && <span>✓</span>}
                 </button>
               ))}
-              <p className="px-4 py-2 text-[10px] font-medium leading-snug text-zilla-dim">
-                Any height, re-encoded in real time to save bandwidth — even heights the provider doesn't offer.
-              </p>
+              <p className="px-4 py-2 text-[10px] font-medium leading-snug text-zilla-dim">{t('settings.dsNote')}</p>
 
               {/* playback behaviour */}
               <p className="border-t border-zilla-line/60 px-4 py-2 text-[9px] font-black uppercase tracking-widest text-zilla-dim">
-                Streaming performance
+                {t('settings.perfTitle')}
               </p>
-              {(
-                [
-                  {
-                    id: 'fast' as const,
-                    label: '⚡ Fast start',
-                    desc: 'Joins the live edge sooner and buffers less — quickest load, lowest lag. Best for normal connections.',
-                  },
-                  {
-                    id: 'steady' as const,
-                    label: '🛡️ Rock steady',
-                    desc: 'Deeper buffer that rides out weak Wi-Fi and mobile data — starts a touch slower, rarely stalls.',
-                  },
-                ] as const
-              ).map((m) => {
-                const active = (prefs?.perfMode ?? 'fast') === m.id;
-                return (
-                  <button
-                    key={m.id}
-                    onClick={() => updatePrefs({ perfMode: m.id })}
-                    className={cn(
-                      'flex w-full items-start gap-2.5 px-4 py-2.5 text-left text-xs font-bold transition-colors hover:bg-white/5',
-                      active ? 'text-zilla-yellow' : 'text-zilla-text'
-                    )}
-                  >
-                    <span className="min-w-0 flex-1">
-                      <span className="block">{m.label}</span>
-                      <span className="mt-0.5 block text-[10px] font-medium leading-snug text-zilla-dim">{m.desc}</span>
-                    </span>
-                    {active && <span className="shrink-0">✓</span>}
-                  </button>
-                );
-              })}
-              <p className="px-4 pb-2 text-[10px] font-medium leading-snug text-zilla-dim">
-                Applies to every channel from your next stream switch.
-              </p>
+              <button
+                onClick={() => updatePrefs({ perfMode: 'fast' })}
+                className={cn(
+                  'flex w-full items-start gap-2.5 px-4 py-2.5 text-start text-xs font-bold transition-colors hover:bg-white/5',
+                  (prefs?.perfMode ?? 'fast') === 'fast' ? 'text-zilla-yellow' : 'text-zilla-text'
+                )}
+              >
+                <span className="min-w-0 flex-1">
+                  <span className="block">{t('settings.perfFast')}</span>
+                  <span className="mt-0.5 block text-[10px] font-medium leading-snug text-zilla-dim">{t('settings.perfFastDesc')}</span>
+                </span>
+                {(prefs?.perfMode ?? 'fast') === 'fast' && <span className="shrink-0">✓</span>}
+              </button>
+              <button
+                onClick={() => updatePrefs({ perfMode: 'steady' })}
+                className={cn(
+                  'flex w-full items-start gap-2.5 px-4 py-2.5 text-start text-xs font-bold transition-colors hover:bg-white/5',
+                  (prefs?.perfMode ?? 'fast') === 'steady' ? 'text-zilla-yellow' : 'text-zilla-text'
+                )}
+              >
+                <span className="min-w-0 flex-1">
+                  <span className="block">{t('settings.perfSteady')}</span>
+                  <span className="mt-0.5 block text-[10px] font-medium leading-snug text-zilla-dim">{t('settings.perfSteadyDesc')}</span>
+                </span>
+                {(prefs?.perfMode ?? 'fast') === 'steady' && <span className="shrink-0">✓</span>}
+              </button>
+              <p className="px-4 pb-2 text-[10px] font-medium leading-snug text-zilla-dim">{t('settings.appliesNextSwitch')}</p>
 
               <p className="border-t border-zilla-line/60 px-4 py-2 text-[9px] font-black uppercase tracking-widest text-zilla-dim">
-                Playback
+                {t('settings.playback')}
               </p>
               <button
                 onClick={() => updatePrefs({ autoAdvance: !(prefs?.autoAdvance ?? true) })}
                 className="flex w-full items-center justify-between px-4 py-2.5 text-xs font-bold text-zilla-text transition-colors hover:bg-white/5"
               >
                 <span>
-                  Auto-switch on dead streams
-                  <span className="block text-[10px] font-medium text-zilla-dim">Surfs to the next channel after 10s</span>
+                  {t('settings.autoAdvance')}
+                  <span className="block text-[10px] font-medium text-zilla-dim">{t('settings.autoAdvanceDesc')}</span>
                 </span>
                 <span
                   className={cn(
@@ -342,7 +385,7 @@ export function TopNav({
                   <span
                     className={cn(
                       'absolute top-0.5 h-4 w-4 rounded-full bg-black transition-all',
-                      prefs?.autoAdvance ?? true ? 'left-[1.15rem]' : 'left-0.5'
+                      prefs?.autoAdvance ?? true ? 'start-[1.15rem]' : 'start-0.5'
                     )}
                   />
                 </span>
@@ -350,12 +393,16 @@ export function TopNav({
 
               {/* connection readout */}
               <p className="border-t border-zilla-line/60 px-4 py-2 text-[10px] font-medium leading-snug text-zilla-dim">
-                Your connection:{' '}
+                {t('settings.connection')}{' '}
                 <span className="font-bold text-zilla-text">
-                  {conn.downlink > 0 ? `~${conn.downlink} Mbps · ${conn.effectiveType}` : conn.effectiveType !== 'unknown' ? conn.effectiveType : 'measuring…'}
+                  {conn.downlink > 0
+                    ? `~${conn.downlink} Mbps · ${conn.effectiveType}`
+                    : conn.effectiveType !== 'unknown'
+                      ? conn.effectiveType
+                      : t('settings.connMeasuring')}
                 </span>
-                {conn.saveData && ' · data saver on'}
-                <span className="mt-1 block">Applies to every channel — in the player you can also switch per stream.</span>
+                {conn.saveData && ` · ${t('settings.dataSaverOn')}`}
+                <span className="mt-1 block">{t('settings.appliesEveryChannel')}</span>
               </p>
             </div>
           )}

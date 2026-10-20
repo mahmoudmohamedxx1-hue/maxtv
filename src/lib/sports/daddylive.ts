@@ -820,6 +820,10 @@ async function probeOne(id: string): Promise<boolean> {
     const dl = await fetchDaddyLivePlaylist(`https://${cdnEdge.host}/premium${id}/index.m3u8`, {
       attempts: 2,
       timeoutMs: 3500,
+      // background health probe — bypass the micro-cache both ways so the
+      // per-channel polls of real viewers keep their cache entries hot
+      // (probe volume otherwise evicts them and tanks the hit rate)
+      skipCache: true,
     });
     if (dl?.ok) return true;
     if (dl && (dl.status === 404 || dl.status === 410)) return false;

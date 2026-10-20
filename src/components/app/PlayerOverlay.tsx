@@ -1,9 +1,27 @@
 'use client';
 
+// ─── PlayerOverlay — the playback engine orchestrator ────────────────────────
+// Decomposed 2026-10-20 out of the old 3,085-line monolith:
+//   • constants/types   → ./player/constants.ts
+//   • icons             → ./player/icons.tsx
+//   • pure helpers      → ./player/utils.ts
+//   • connectivity eng. → ./player/createNetWatcher.ts
+//   • quality menu      → ./player/QualityMenu.tsx
+//   • servers menu      → ./player/ServersMenu.tsx
+//   • channel guide     → ./player/SurfSidebar.tsx
+//   • state panels      → ./player/StateOverlays.tsx
+//   • stats overlay     → ./player/StatsOverlay.tsx  (NEW)
+// This file keeps the STATEFUL engine: resolve → attach hls → failover walk
+// → data-saver ladder → keyboard remote. New in this version:
+//   • IPTV cross-playlist failover — a unified 2-pass hop walker covering
+//     resolve failures, manifest load/parse/timeout errors and network errors
+//   • the stats overlay (I key) with edge-host rotation alerting
+//   • full EN/AR localization + RTL-safe layout
+//   • add-to-grid from the channel guide (multi-view)
+
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Hls from 'hls.js';
 import { useTV, type Playable } from '@/lib/store';
-import { logoSrc } from './ChannelCard';
 import { cn } from '@/lib/utils';
 import {
   loadPrefs,
@@ -13,263 +31,42 @@ import {
   dataSaverForBudget,
   hlsPerfConfig,
 } from '@/lib/player-settings';
-
-type Phase = 'resolving' | 'loading' | 'playing' | 'paused' | 'error' | 'offair' | 'hevc';
-
-/** Can THIS browser decode HEVC through MSE (Safari, Edge, Chrome with
- *  hardware decode)? Cached for the page lifetime — the provider flips
- *  channels into HEVC phases dynamically and an incapable browser used to
- *  buffer into a codec error that silently hopped onto beIN XTRA (a
- *  different channel) — now it gets the explicit HEVC choice panel. */
-const canHevc = (() => {
-  let cached: boolean | null = null;
-  return () => {
-    if (cached !== null) return cached;
-    if (typeof window === 'undefined') return (cached = true);
-    const probe = (cs: string) =>
-      (typeof MediaSource !== 'undefined' &&
-        MediaSource.isTypeSupported(`video/mp4; codecs="${cs}"`)) ||
-      document.createElement('video').canPlayType(`video/mp4; codecs="${cs}"`) === 'probably';
-    return (cached = probe('hvc1.1.6.L93.B0') || probe('hev1.1.6.L93.B0'));
-  };
-})();
-
-/** one entry in the channel-surf sidebar */
-interface SurfItem extends Playable {
-  group: 'feeds' | 'live' | 'channels';
-  sub?: string;
-  startedAt?: number;
-}
-
-/** DaddyLive servers (kept in sync with src/lib/sports/daddylive.ts) —
- *  TRANSPORT-based, BENCHMARK-ORDERED (2026-09-28 bench: edge manifest p95
- *  343ms, cdn route 665ms+, mirror watch pages slowest). Array order =
- *  failover walk order. LABELS ARE STABLE PER ID so the user's "Server N"
- *  mental model never breaks. Direct CDN ("Server 2") is the DEFAULT —
- *  user-verified best of the bunch (no ffmpeg warmup, no extra hop, the
- *  browser reads the CDN manifest straight through /api/hls). */
-const DL_SERVERS = [
-  { id: 'direct', label: 'Server 2', host: 'Direct CDN · straight through' },
-  { id: 'edge', label: 'Server 9', host: 'Edge direct · lowest latency' },
-  { id: 'turbo', label: 'Server 1', host: 'Smart cache · pre-buffered, smoothest' },
-  { id: 'direct-cdn', label: 'Server 5', host: 'Direct via daddyliveplayer.st' },
-  { id: 'direct-dlive', label: 'Server 3', host: 'Direct via dlive.sx' },
-  { id: 'direct-dlstreams', label: 'Server 4', host: 'Direct via dlstreams.st' },
-  { id: 'direct-dlive-player', label: 'Server 10', host: 'Direct via dlive.sx player' },
-  { id: 'direct-dlstreams-player', label: 'Server 11', host: 'Direct via dlstreams.st player' },
-  { id: 'relay', label: 'Server 6', host: 'Stable relay · bulletproof' },
-  { id: 'relay-dlive', label: 'Server 7', host: 'Relay via dlive.sx' },
-  { id: 'relay-dlstreams', label: 'Server 8', host: 'Relay via dlstreams.st' },
-];
-
-/** Deep retry budgets — the DaddyLive CDN edge flaps in 10-20s windows
- *  (playlist 404s / resets, then recovers). Default hls.js policies give up
- *  far too early and surface a fatal "off air" during those windows. */
-const RESILIENT_LOAD_POLICIES = {
-  manifestLoadPolicy: {
-    default: {
-      maxTimeToFirstByteMs: 15_000,
-      maxLoadTimeMs: 30_000,
-      timeoutRetry: { maxNumRetry: 4, retryDelayMs: 0, maxRetryDelayMs: 0 },
-      errorRetry: { maxNumRetry: 6, retryDelayMs: 500, maxRetryDelayMs: 4_000 },
-    },
-  },
-  fragLoadPolicy: {
-    default: {
-      maxTimeToFirstByteMs: 15_000,
-      maxLoadTimeMs: 60_000,
-      timeoutRetry: { maxNumRetry: 4, retryDelayMs: 0, maxRetryDelayMs: 0 },
-      errorRetry: { maxNumRetry: 10, retryDelayMs: 1_000, maxRetryDelayMs: 8_000 },
-    },
-  },
-};
-
-/** transcode-ladder hls tuning — the &h= data-saver feeds are re-encoded
- *  one segment at a time on a 1-vCPU serverless isolate, so the player must
- *  NOT hug the live edge like it does on native passthrough: join 5 segments
- *  (≈30s) back and keep a deep buffer. That ride distance is what turns the
- *  encode latency invisible — the warm band has ~2 polls of lead time per
- *  segment, and a slow cold encode lands in runway instead of draining the
- *  buffer into a stall (2026-10-08 "480p doesn't render/load constantly"). */
-const LADDER_HLS_CONFIG = {
-  liveSyncDurationCount: 5,
-  maxBufferLength: 60,
-  maxMaxBufferLength: 120,
-  maxLiveSyncPlaybackRate: 1, // never catch-up speed — playback stays 1x
-  backBufferLength: 90,
-} as const;
-
-/** transcode ladder — every height re-encoded in real time for streams whose
- *  provider ships a single rendition (DaddyLive + most free IPTV CDNs) */
-const DATA_SAVER_HEIGHTS = [144, 244, 360, 480, 720, 1080] as const;
-/** quality-chip hints for the ladder rungs */
-const RUNG_HINTS: Record<number, string> = {
-  144: 'ultra low',
-  720: 'HD',
-  1080: 'Full HD',
-};
-
-/** alternate source for an IPTV channel (same channel, different provider) */
-interface AltServer {
-  id: string;
-  name: string;
-  source: string;
-  sourceName: string;
-  url: string;
-  logo?: string;
-  health?: string;
-  /** probed native quality rungs (e.g. [240,360,480,720,1080] on amagi) —
-   *  rendered in the quality menu as "via <source>" entries */
-  ladder?: number[];
-  /** CDN answers CORS → the alternate can play straight from the CDN */
-  cors?: boolean;
-  /** TRUE = verified SAME channel (quality-rung eligible). FALSE = brand-family
-   *  sibling (beIN 1 → beIN XTRA) — servers-menu only, never a quality rung:
-   *  picking a quality must never change the channel. */
-  sameChannel?: boolean;
-}
-
-/** build the playable for hopping to an alternate (multi-quality) source —
- *  a DaddyLive channel flips to the iptv resolve path, KEEPING its id so
- *  the servers-menu state and the failover chain survive the hop. */
-function altPlayable(cur: Playable, alt: AltServer): Playable {
-  return cur.kind === 'daddylive'
-    ? { ...cur, kind: 'iptv', ref: alt.url, name: alt.name, source: alt.sourceName, logo: alt.logo || cur.logo }
-    : { ...cur, ref: alt.url, source: alt.sourceName, logo: alt.logo || cur.logo };
-}
-
-/** encode/decode a playable as a shareable ?ch= deep link */
-function encodePlayable(p: Playable): string {
-  try {
-    return btoa(unescape(encodeURIComponent(JSON.stringify(p))));
-  } catch {
-    return '';
-  }
-}
-function decodePlayable(s: string): Playable | null {
-  try {
-    const p = JSON.parse(decodeURIComponent(escape(atob(s)))) as Playable;
-    // strict kind check — a typo'd kind ("daddylyve") is truthy but must not
-    // fall through to the IPTV branch (url=<channel-id> → guaranteed 400)
-    return p && (p.kind === 'daddylive' || p.kind === 'iptv') && p.ref ? p : null;
-  } catch {
-    return null;
-  }
-}
-
-function fmtAgo(ts: number): string {
-  const m = Math.max(0, Math.floor((Date.now() - ts) / 60_000));
-  if (m < 1) return 'just started';
-  if (m < 60) return `started ${m} min ago`;
-  const h = Math.floor(m / 60);
-  return `started ${h}h ${m % 60}m ago`;
-}
-
-/** Does THIS deployment have the data-saver ladder? Two flavors, probed on
- *  mount via /api/turbo?mode=cap:
- *    cap — continuous /api/live relay (self-hosted PATH ffmpeg)
- *    seg — per-segment &h= ladder via the bundled static binary (works on
- *          serverless — the "qualities don't work" fix for single-rendition
- *          DaddyLive channels incl. every beIN)
- *  Fail-open until the answer lands; the 503-bounce in attachSource covers
- *  the gap. */
-let tcCapPromise: Promise<{ cap: boolean; seg: boolean }> | null = null;
-function probeTcCap(): Promise<{ cap: boolean; seg: boolean }> {
-  if (!tcCapPromise) {
-    tcCapPromise = fetch('/api/turbo?mode=cap')
-      .then((r) => r.json())
-      .then((d: { cap?: boolean; seg?: boolean }) => ({
-        cap: d.cap === true,
-        seg: d.seg === true,
-      }))
-      .catch(() => ({ cap: true, seg: true }));
-  }
-  return tcCapPromise;
-}
-
-/* ─── tiny icon set ────────────────────────────────────────────────────────── */
-const Icon = {
-  play: (
-    <svg viewBox="0 0 24 24" className="h-full w-full fill-current" aria-hidden>
-      <path d="M8 5v14l11-7z" />
-    </svg>
-  ),
-  pause: (
-    <svg viewBox="0 0 24 24" className="h-full w-full fill-current" aria-hidden>
-      <path d="M6 5h4v14H6zm8 0h4v14h-4z" />
-    </svg>
-  ),
-  volumeHi: (
-    <svg viewBox="0 0 24 24" className="h-full w-full fill-current" aria-hidden>
-      <path d="M3 10v4h4l5 4V6L7 10H3zm13.5 2a4.5 4.5 0 0 0-2.5-4v8a4.5 4.5 0 0 0 2.5-4zM14 3.8v2.1a6.5 6.5 0 0 1 0 12.2v2.1a8.5 8.5 0 0 0 0-16.4z" />
-    </svg>
-  ),
-  volumeOff: (
-    <svg viewBox="0 0 24 24" className="h-full w-full fill-current" aria-hidden>
-      <path d="M3 10v4h4l5 4V6L7 10H3zm13.6 2 2.7-2.7-1.4-1.4-2.7 2.7-2.7-2.7-1.4 1.4 2.7 2.7-2.7 2.7 1.4 1.4 2.7-2.7 2.7 2.7 1.4-1.4-2.7-2.7z" />
-    </svg>
-  ),
-  fullscreen: (
-    <svg viewBox="0 0 24 24" className="h-full w-full fill-current" aria-hidden>
-      <path d="M5 5h5v2H7v3H5V5zm9 0h5v5h-2V7h-3V5zM5 14h2v3h3v2H5v-5zm12 0h2v5h-5v-2h3v-3z" />
-    </svg>
-  ),
-  fullscreenExit: (
-    <svg viewBox="0 0 24 24" className="h-full w-full fill-current" aria-hidden>
-      <path d="M7 5h2v5H5V8h2V5zm8 0h2v3h2v2h-4V5zM5 14h4v5H7v-3H5v-2zm10 0h4v2h-2v3h-2v-5z" />
-    </svg>
-  ),
-  pip: (
-    <svg viewBox="0 0 24 24" className="h-full w-full fill-current" aria-hidden>
-      <path d="M19 11h-8v6h8v-6zm4 8V5a2 2 0 0 0-2-2H3a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h18a2 2 0 0 0 2-2zM3 5h18v14H3V5z" />
-    </svg>
-  ),
-  star: (
-    <svg viewBox="0 0 24 24" className="h-full w-full fill-current" aria-hidden>
-      <path d="M12 17.3 6.2 21l1.6-6.6L2.7 9.9l6.7-.6L12 3l2.6 6.3 6.7.6-5.1 4.5L17.8 21 12 17.3z" />
-    </svg>
-  ),
-  share: (
-    <svg viewBox="0 0 24 24" className="h-full w-full fill-current" aria-hidden>
-      <path d="M18 16.1c-.8 0-1.5.3-2 .8l-7.1-4.2c0-.2.1-.5.1-.7s0-.5-.1-.7L16 7.2c.5.5 1.2.8 2 .8a3 3 0 1 0-3-3c0 .2 0 .5.1.7L8 9.8a3 3 0 1 0 0 4.4l7.1 4.2c0 .2-.1.4-.1.6a3 3 0 1 0 3-2.9z" />
-    </svg>
-  ),
-  close: (
-    <svg viewBox="0 0 24 24" className="h-full w-full fill-current" aria-hidden>
-      <path d="M18.3 5.7 12 12l6.3 6.3-1.4 1.4L10.6 13.4 4.3 19.7 2.9 18.3 9.2 12 2.9 5.7 4.3 4.3l6.3 6.3 6.3-6.3 1.4 1.4z" transform="translate(1.4 -1.4)" />
-    </svg>
-  ),
-  next: (
-    <svg viewBox="0 0 24 24" className="h-full w-full fill-current" aria-hidden>
-      <path d="M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z" />
-    </svg>
-  ),
-  prev: (
-    <svg viewBox="0 0 24 24" className="h-full w-full fill-current" aria-hidden>
-      <path d="M18 6l-8.5 6L18 18V6zM8 6v12H6V6h2z" />
-    </svg>
-  ),
-  tv: (
-    <svg viewBox="0 0 24 24" className="h-full w-full fill-current" aria-hidden>
-      <path d="M21 3H3a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h5v2h8v-2h5a2 2 0 0 0 2-2V5a2 2 0 0 0-2-2zm0 14H3V5h18v12z" />
-    </svg>
-  ),
-  server: (
-    <svg viewBox="0 0 24 24" className="h-full w-full fill-current" aria-hidden>
-      <path d="M4 3h16a1 1 0 0 1 1 1v5a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1zm0 11h16a1 1 0 0 1 1 1v5a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1v-5a1 1 0 0 1 1-1zm2 2v3h2v-3H6zm0-11v3h2V5H6z" />
-    </svg>
-  ),
-};
+import { useT } from '@/lib/locale';
+import {
+  DL_SERVERS,
+  RESILIENT_LOAD_POLICIES,
+  LADDER_HLS_CONFIG,
+  DATA_SAVER_HEIGHTS,
+  isDlIframeSrc,
+  type AltServer,
+  type MatchLike,
+  type Phase,
+  type ServerOption,
+  type SurfItem,
+} from './player/constants';
+import { Icon } from './player/icons';
+import {
+  altPlayable,
+  canHevc,
+  encodePlayable,
+  fmtAgo,
+  probeTcCap,
+} from './player/utils';
+import { createNetWatcher } from './player/createNetWatcher';
+import { QualityMenu } from './player/QualityMenu';
+import { ServersMenu } from './player/ServersMenu';
+import { SurfSidebar } from './player/SurfSidebar';
+import { StateOverlays } from './player/StateOverlays';
+import { StatsOverlay } from './player/StatsOverlay';
 
 export function PlayerOverlay() {
-  const { player, playerOpen, closePlayer, toggleFavorite, favorites, altFeeds, openPlayer } = useTV();
+  const { player, playerOpen, closePlayer, toggleFavorite, favorites, altFeeds, openPlayer, addPane } = useTV();
+  const { t } = useT();
   const videoRef = useRef<HTMLVideoElement>(null);
   const hlsRef = useRef<Hls | null>(null);
   const shellRef = useRef<HTMLDivElement>(null);
   const hideTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const digitTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const surfCache = useRef<SurfItem[] | null>(null);
-  /** latest surf list for the digit-jump timer (never setState inside an updater) */
   const surfRef = useRef<SurfItem[]>([]);
 
   const [phase, setPhase] = useState<Phase>('resolving');
@@ -285,7 +82,7 @@ export function PlayerOverlay() {
   const [tcHeight, setTcHeight] = useState<number | null>(null);
   /** the data-saver rung was picked by the connectivity engine (not the user) */
   const [autoDs, setAutoDs] = useState(false);
-  const [servers, setServers] = useState<{ id: string; label: string; host: string; active?: boolean }[]>([]);
+  const [servers, setServers] = useState<ServerOption[]>([]);
   const [alternates, setAlternates] = useState<AltServer[]>([]);
   const [activeServer, setActiveServer] = useState('');
   const [showServersMenu, setShowServersMenu] = useState(false);
@@ -309,22 +106,21 @@ export function PlayerOverlay() {
    *  the answer lands; the 503-bounce in attachSource covers the gap. */
   const [tcCap, setTcCap] = useState(true);
   const tcCapRef = useRef(true);
-  /** the per-segment &h= ladder (bundled static ffmpeg — works on serverless).
-   *  Rungs go through /api/turbo instead of the continuous relay; heights are
-   *  capped at 480p (encoding 720/1080 costs more wall-time than a segment). */
+  /** the per-segment &h= ladder (bundled static ffmpeg — works on serverless) */
   const [tcSeg, setTcSeg] = useState(false);
   const tcSegRef = useRef(false);
   const tcRelayRef = useRef(true);
   /** one "data saver unavailable" notice per page load — not per channel */
   const tcNoticeRef = useRef(false);
-  /** one "your saved 720p/1080p pick isn't servable on this serverless
-   *  ladder" notice per page load — the v4 migration already reset such
-   *  prefs; this covers picks re-made on relay-capable deployments */
   const hiPrefNoticeRef = useRef(false);
+  /** the HEVC-phase choice panel ({family} = the related free feed, if any) */
+  const [hevcBlock, setHevcBlock] = useState<{ family?: AltServer } | null>(null);
+  /** stats-for-nerds overlay (I key / top-bar button) */
+  const [showStats, setShowStats] = useState(false);
 
   /* ── refs for cross-callback access (hls error handler → failover) ─────── */
   const playerRef = useRef<Playable | null>(null);
-  const serversRef = useRef<{ id: string; label: string; host: string }[]>(DL_SERVERS);
+  const serversRef = useRef<{ id: string; label: string; host: string }[]>([...DL_SERVERS]);
   const alternatesRef = useRef<AltServer[]>([]);
   /** signed source params for data-saver transcodes of the current stream */
   const tcSrcRef = useRef<{ src: string; r: string; s: string } | null>(null);
@@ -334,8 +130,9 @@ export function PlayerOverlay() {
    *  encodes UP: a request at/above it stays on the untouched native feed */
   const nativeHeightRef = useRef(0);
   const loadRef = useRef<(ch: Playable, opts?: { server?: string; isAlternate?: boolean }) => Promise<void>>(async () => {});
-  /** servers/alternate urls already tried for the current channel */
-  const triedRef = useRef<{ chId: string; tried: Set<string> }>({ chId: '', tried: new Set() });
+  /** servers/alternate urls already tried for the current channel (+ which
+   *  failover PASS we're on — see findNextHop) */
+  const triedRef = useRef<{ chId: string; tried: Set<string>; pass: number }>({ chId: '', tried: new Set(), pass: 0 });
   /** cancel hook for the auto-advance countdown (any interaction stops it) */
   const cancelAutoAdvRef = useRef<(() => void) | null>(null);
   /** live bandwidth samples for the connectivity engine (Auto mode) */
@@ -355,16 +152,15 @@ export function PlayerOverlay() {
   const directPlayRef = useRef(false);
   /** the direct→proxy swap fired for this attachment (once) */
   const usedProxyFallbackRef = useRef(false);
-  /** the user explicitly chose "play the HEVC feed anyway" for this channel —
-   *  suppresses the HEVC panel so the serve-through attempt runs */
+  /** the user explicitly chose "play the HEVC feed anyway" for this channel */
   const forceHevcRef = useRef(false);
-  /** codec-reconnect attempts for the CURRENT channel — the reconnect is
-   *  one-shot PER CHANNEL, not per hls instance (a fresh instance has a fresh
-   *  flag, so HEVC feeds in incapable browsers reconnected forever instead
-   *  of ever reaching the HEVC panel) */
+  /** codec-reconnect attempts for the CURRENT channel (one-shot per channel) */
   const codecRecovRef = useRef<{ chId: string; count: number }>({ chId: '', count: 0 });
-  /** the HEVC-phase choice panel ({family} = the related free feed, if any) */
-  const [hevcBlock, setHevcBlock] = useState<{ family?: AltServer } | null>(null);
+  /** ref mirror of tcHeight for hls event closures */
+  const tcHeightRef = useRef<number | null>(null);
+  useEffect(() => {
+    tcHeightRef.current = tcHeight;
+  }, [tcHeight]);
 
   const isFav = player ? favorites.some((f) => f.id === player.id) : false;
 
@@ -411,7 +207,7 @@ export function PlayerOverlay() {
     (async () => {
       try {
         const s = (await fetch('/api/sports/schedule', { cache: 'no-store' }).then((r) => r.json())) as {
-          live?: (MatchLike)[];
+          live?: MatchLike[];
         };
         if (!alive) return;
         const liveFeeds: SurfItem[] = [];
@@ -467,195 +263,79 @@ export function PlayerOverlay() {
     if (!playerOpen) return;
     const update = () => {
       const cur = surf.find((s) => s.id === player?.id);
-      setStartedAgo(cur?.startedAt ? fmtAgo(cur.startedAt) : 'Live channel');
+      setStartedAgo(cur?.startedAt ? fmtAgo(cur.startedAt, t) : t('player.liveChannel'));
     };
     update();
-    const t = setInterval(update, 30_000);
-    return () => clearInterval(t);
-  }, [surf, player, playerOpen]);
+    const iv = setInterval(update, 30_000);
+    return () => clearInterval(iv);
+  }, [surf, player, playerOpen, t]);
 
   /* ── off-air watchdog (placeholder segments that never decode) ─────────── */
   useEffect(() => {
     if ((phase !== 'loading' && phase !== 'resolving') || !playerOpen) return;
-    const t = setTimeout(() => {
+    const tm = setTimeout(() => {
       const v = videoRef.current;
       if (!v || v.readyState < 2) setPhase('offair');
     }, 20000);
-    return () => clearTimeout(t);
+    return () => clearTimeout(tm);
   }, [phase, playerOpen]);
 
-  /* ── connectivity engine ───────────────────────────────────────────────
-   * Auto keeps following the measured bandwidth on EVERY attachment — the
-   * native ladder AND the data-saver transcodes. (It used to live only on
-   * the native hls instance, which attachSource destroys when data-saver
-   * engages — so the "connection improved → back to native" recovery could
-   * never fire while transcoding.)
-   *
-   * 2026-10-03 field report ("auto quality isn't working well — I want the
-   * most STABLE stream for my connection") hardened this into three rules:
-   *   1. sticky ABR cap — autoLevelCapping only moves on SUSTAINED evidence
-   *      (6 good frags to raise, 3 bad to lower), so the CDN's latency flaps
-   *      can't thrash the rung up/down every 10s. Raising is also rate-limited.
-   *   2. stall downshift — a bufferStalledError drops the cap one rung below
-   *      whatever is playing RIGHT NOW (rate-limited 12s). Stability first.
-   *   3. starvation rung hop — on single-rendition feeds (most DaddyLive
-   *      channels: one 408p variant, nothing for ABR to choose), 8
-   *      consecutive frags (~40s+) measured BELOW 85% of the stream's own
-   *      bitrate means the link truly can't hold the native feed → hop to
-   *      the transcoded rung that fits the measured estimate. */
-  const attachNetWatcher = (hls: Hls) => {
-    let seen = 0; // per-instance fragment count — skip the EWMA warm-up window
-    // sticky-cap state (per hls instance)
-    let capIdx = -1; // current autoLevelCapping (-1 = uncapped)
-    let lastCapChange = 0;
-    let aboveRun = 0; // consecutive frags whose sustainable target exceeds the cap
-    let belowRun = 0; // … falls short of the cap
-    let streamBr = 0; // EWMA of the stream's OWN bitrate (segment bytes/duration)
-    let starveRun = 0; // consecutive frags with est < 85% of streamBr
+  /* ── connectivity engine (extracted → createNetWatcher) ─────────────────── */
+  const selectDataSaverRef = useRef<((h: number, opts?: { auto?: boolean }) => void) | null>(null);
+  const exitDataSaverRef = useRef<(() => void) | null>(null);
+  const attachNetWatcher = useMemo(
+    () =>
+      createNetWatcher({
+        netRef,
+        tcHeightRef,
+        nativeHeightRef,
+        tcCapRef,
+        tcSrcRef,
+        playerRef,
+        showToast,
+        t,
+        selectDataSaverRef,
+        exitDataSaverRef,
+      }),
+    [showToast, t]
+  );
 
-    /** levels sorted by bitrate → {index, bitrate}; empty when unknown */
-    const levelsByRate = () =>
-      (hls.levels || [])
-        .map((l, i) => ({ i, b: l.bitrate || 0 }))
-        .filter((x) => x.b > 0)
-        .sort((a, b) => a.b - b.b);
-
-    const applyCap = (idx: number) => {
-      if (idx === capIdx) return;
-      // raising is rate-limited (12s) — stability over eagerness; lowering is instant
-      if (idx > capIdx && Date.now() - lastCapChange < 12_000) return;
-      capIdx = idx;
-      lastCapChange = Date.now();
-      hls.autoLevelCapping = idx;
-    };
-
-    hls.on(Hls.Events.FRAG_BUFFERED, (_e, d) => {
-      seen++;
-      // the stream's own bitrate from real segment payloads (bps)
-      const bytes = (d.frag?.stats?.total as number) || 0;
-      const dur = (d.frag?.duration as number) || 0;
-      if (bytes > 0 && dur > 0) {
-        const br = (bytes * 8) / dur;
-        streamBr = streamBr ? streamBr * 0.7 + br * 0.3 : br;
+  /* ── the unified failover walk ────────────────────────────────────────────
+   * DL transports first (daddylive), then SAME-CHANNEL alternates — for IPTV
+   * those are the CROSS-PLAYLIST entries (the same channel carried by Pluto /
+   * Samsung TV+ / Roku / Plex / the curated ladder pool). When everything has
+   * burned once, ONE fresh pass re-rolls the CDN dice (the edge flaps in
+   * 10-20s windows that recover on their own) — then the honest error screen.
+   * Family feeds (sameChannel === false) never auto-enter the chain: a silent
+   * channel swap was the beIN complaint; they stay explicit buttons. */
+  const findNextHop = useCallback(
+    (
+      cur: Playable
+    ): { kind: 'server'; server: { id: string; label: string; host: string } } | { kind: 'alternate'; alt: AltServer } | null => {
+      if (cur.kind === 'daddylive') {
+        const next = serversRef.current.find((s) => !triedRef.current.tried.has(s.id));
+        if (next) return { kind: 'server', server: next };
       }
-      if (seen <= 3) return; // fresh instance: bandwidthEstimate is still seeding
-      const p = loadPrefs();
-      if (p.quality !== -1) return; // manual mode — user is in charge
-      const est = hls.bandwidthEstimate || 0;
-      if (est <= 0) return;
-      const net = netRef.current;
-      // ⚠ 450k floor: the CDN's LATENCY (not throughput) collapses the ABR
-      // estimate on every flap — that must NOT hop the player onto the
-      // transcoded ladder (its input is the same CDN, plus a warmup stall).
-      // Only a genuinely starved link (sustained <450kbps) benefits.
-      if (est < 450_000) {
-        net.lows++;
-        net.highs = 0;
-      } else if (est > 1_600_000) {
-        net.highs++;
-        net.lows = 0;
-      } else {
-        net.lows = 0;
-        net.highs = 0;
-      }
-      const cur = playerRef.current;
-      const canTc = !!cur && (cur.kind === 'daddylive' || !!tcSrcRef.current) && tcCapRef.current;
-
-      if (tcHeightRef.current !== null) {
-        // inside the data-saver ladder: recover up, or drop a rung further down
-        if (net.highs >= 8 && loadPrefs().autoPicked) {
-          showToast('Connection improved — back to the native feed');
-          net.highs = 0;
-          updatePrefs({ autoPicked: false });
-          void exitDataSaverRef.current?.();
-        } else if (net.lows >= 6) {
-          const cur2 = tcHeightRef.current;
-          const next = cur2 > 360 ? 360 : cur2 > 244 ? 244 : 144;
-          if (next < cur2) {
-            showToast(`Slow connection — dropping to ${next}p data saver`);
-            net.lows = 0;
-            void selectDataSaverRef.current?.(next, { auto: true });
-          }
+      const alt = alternatesRef.current.find((a) => a.sameChannel !== false && !triedRef.current.tried.has(a.url));
+      if (alt) return { kind: 'alternate', alt };
+      // pass 2 — one fresh walk (CDN flaps recover within 10-20s windows)
+      if (triedRef.current.pass < 1 && alternatesRef.current.some((a) => a.sameChannel !== false)) {
+        triedRef.current = {
+          chId: cur.id,
+          tried: new Set(cur.kind === 'iptv' ? [cur.ref] : []),
+          pass: triedRef.current.pass + 1,
+        };
+        if (cur.kind === 'daddylive') {
+          const srv = serversRef.current.find((s) => !triedRef.current.tried.has(s.id));
+          if (srv) return { kind: 'server', server: srv };
         }
-        return;
+        const retry = alternatesRef.current.find((a) => a.sameChannel !== false && !triedRef.current.tried.has(a.url));
+        if (retry) return { kind: 'alternate', alt: retry };
       }
-
-      // native mode, single rendition (most DaddyLive channels): nothing for
-      // ABR to pick between — the only stable option is the transcode rung
-      // that fits the measured link. Sustained starvation only (8 frags ≈
-      // 40s+; CDN flaps are 10-20s and never qualify).
-      if ((hls.levels || []).length < 2 && streamBr > 0) {
-        starveRun = est < streamBr * 0.85 ? starveRun + 1 : 0;
-        if (starveRun >= 8 && canTc) {
-          const rung = est < 350_000 ? 144 : est < 700_000 ? 244 : est < 1_200_000 ? 360 : 480;
-          const nativeH = nativeHeightRef.current || 0;
-          // a rung at/above the native height gains nothing (never encode up)
-          if (nativeH === 0 || rung < nativeH - 30) {
-            showToast(`Slow connection — switching to ${rung}p for stability`);
-            starveRun = 0;
-            net.lows = 0;
-            void selectDataSaverRef.current?.(rung, { auto: true });
-            return;
-          }
-        }
-      }
-
-      // native mode, real ladder: the sticky ABR cap. Target = the highest
-      // rung the measured link holds with ~30% headroom.
-      if ((hls.levels || []).length > 1 && hls.autoLevelEnabled) {
-        const sorted = levelsByRate();
-        if (sorted.length > 1) {
-          let target = sorted[0].i;
-          for (const s of sorted) if (s.b <= est * 0.7) target = s.i;
-          const curCap = capIdx === -1 ? Number.MAX_SAFE_INTEGER : capIdx;
-          if (target > curCap) {
-            aboveRun++;
-            belowRun = 0;
-            if (aboveRun >= 6) {
-              applyCap(target);
-              aboveRun = 0;
-            }
-          } else if (target < curCap) {
-            belowRun++;
-            aboveRun = 0;
-            if (belowRun >= 3) {
-              applyCap(target);
-              belowRun = 0;
-            }
-          } else {
-            aboveRun = 0;
-            belowRun = 0;
-          }
-        }
-      }
-
-      // native mode: only a SUSTAINED, genuinely starved link hops down to a
-      // transcoded rung (6 consecutive low estimates ≈ 30s+ of real slowness —
-      // CDN flaps never qualify)
-      const lowestNative = (hls.levels || []).reduce((m, l) => Math.min(m, l.height || 9999), 9999);
-      if (net.lows >= 6 && canTc && lowestNative > 360) {
-        const rung = est < 320_000 ? 144 : 244;
-        showToast(`Slow connection — switching to ${rung}p data saver`);
-        net.lows = 0;
-        void selectDataSaverRef.current?.(rung, { auto: true });
-      }
-    });
-
-    // stability rule 2: a stall drops the cap one rung below what's playing.
-    // Repeated stalls keep stepping down (applyCap dedupes) — stability first;
-    // recovery up is the sticky-cap raise rule's job once the link measures good.
-    hls.on(Hls.Events.ERROR, (_e, d) => {
-      if (d.details !== 'bufferStalledError') return;
-      if (loadPrefs().quality !== -1) return; // manual mode — user is in charge
-      if (tcHeightRef.current !== null) return; // data-saver rung already active
-      if ((hls.levels || []).length > 1 && hls.autoLevelEnabled) {
-        const sorted = levelsByRate();
-        const playing = hls.currentLevel >= 0 ? hls.currentLevel : hls.loadLevel;
-        const pos = sorted.findIndex((s) => s.i === playing);
-        if (pos > 0) applyCap(sorted[pos - 1].i);
-      }
-    });
-  };
+      return null;
+    },
+    []
+  );
 
   /* ── resolve → attach hls → play ───────────────────────────────────────── */
   const load = useCallback(
@@ -681,11 +361,11 @@ export function PlayerOverlay() {
       // ⚠ alternate playables keep the ORIGINAL channel id, so hopping to a
       // multi-quality source never wipes the servers menu mid-session.
       if (triedRef.current.chId !== ch.id) {
-        triedRef.current = { chId: ch.id, tried: new Set() };
+        triedRef.current = { chId: ch.id, tried: new Set(), pass: 0 };
         setServers([]);
         setAlternates([]);
         setActiveServer('');
-        serversRef.current = DL_SERVERS;
+        serversRef.current = [...DL_SERVERS];
         alternatesRef.current = [];
         tcSrcRef.current = null;
         forceHevcRef.current = false; // a NEW channel re-evaluates its codec phase
@@ -788,30 +468,23 @@ export function PlayerOverlay() {
 
         if (!res.ok || !data.url) {
           // a failed resolve already burned through every mirror server-side —
-          // mark them tried so failover hops to alternates instead of retrying
+          // mark them tried so the walker hops to alternates instead of retrying
           if (ch.kind === 'daddylive') {
             for (const s of serversRef.current) triedRef.current.tried.add(s.id);
           }
-          // per-stream failover before giving up (original-repo mirror hopping):
-          // DL transports first, then SAME-CHANNEL alternates, then the honest
-          // error screen (family feeds are offered there as an explicit button
-          // — never auto-hopped: a silent channel swap was the beIN complaint)
+          // unified failover: DL transports, then cross-playlist/cross-source
+          // same-channel alternates (2 passes) — then the honest error screen
           const cur = playerRef.current || ch;
-          if (cur.kind === 'daddylive') {
-            const next = serversRef.current.find((s) => !triedRef.current.tried.has(s.id));
-            if (next) {
-              showToast(`Switching to ${next.label} (${next.host})…`);
-              await loadRef.current(cur, { server: next.id });
-              return;
-            }
+          const hop = findNextHop(cur);
+          if (hop?.kind === 'server') {
+            showToast(t('player.switchingServer', { label: hop.server.label, host: hop.server.host }));
+            await loadRef.current(cur, { server: hop.server.id });
+            return;
           }
-          {
-            const next = alternatesRef.current.find((a) => a.sameChannel !== false && !triedRef.current.tried.has(a.url));
-            if (next) {
-              showToast(`Trying ${next.sourceName}…`);
-              await loadRef.current(altPlayable(cur, next), { isAlternate: true });
-              return;
-            }
+          if (hop?.kind === 'alternate') {
+            showToast(t('player.tryingSource', { name: hop.alt.sourceName }));
+            await loadRef.current(altPlayable(cur, hop.alt), { isAlternate: true });
+            return;
           }
           throw new Error(data.message || 'Stream is offline or geo-blocked right now.');
         }
@@ -837,18 +510,9 @@ export function PlayerOverlay() {
         const video = videoRef.current;
         if (!video) return;
 
-        // DaddyLive iframe bypass — when the src is the dlive.sx/watch.php
-        // embed URL (chained iframe that ends at dembed.st/premiumtv/daddy.php),
-        // the iframe takes over playback. The DaddyLive chain handles the
-        // token + m3u8 fetches from the user's residential IP via the inner
-        // JW Player on dembed.st. Skip the hls.js init — the iframe renders
-        // in JSX instead of <video>.
-        if (
-          src.startsWith('https://dlive.sx/stream/stream-') ||
-          src.startsWith('https://dlive.sx/watch.php?') ||
-          src.startsWith('https://daddyliveplayer.st/premiumtv/daddy.php?') ||
-          src.startsWith('https://dembed.st/premiumtv/daddy.php?')
-        ) {
+        // DaddyLive iframe bypass — the embedded page takes over playback
+        // (the iframe renders in JSX instead of <video>).
+        if (isDlIframeSrc(src)) {
           setPhase('playing');
           setBuffering(false);
           return;
@@ -861,11 +525,6 @@ export function PlayerOverlay() {
         if (Hls.isSupported()) {
           // seed ABR with the browser's connection estimate so Auto starts on a
           // rung the link can actually sustain (instead of overshoot + stall).
-          // ⚠ the seed is 75% of the estimate and the start rung is picked from
-          // 60% of the budget: navigator.connection.downlink over-reports on
-          // flaky mobile links, and an overshooting START is exactly the
-          // "isn't working well" stall users see — better to open one rung low
-          // and let sustained measurements climb (the sticky-cap raise rule).
           const budget = connectionBudget();
           const hls = new Hls({
             // ⚠ lowLatencyMode MUST be false: with it on, hls.js's
@@ -882,7 +541,7 @@ export function PlayerOverlay() {
             ...(budget > 0 ? { abrEwmaDefaultEstimate: Math.max(400_000, budget * 0.75) } : {}),
           });
           hlsRef.current = hls;
-          // TEMP DEBUG — expose the live hls instance for E2E inspection
+          // expose the live hls instance for E2E inspection
           if (typeof window !== 'undefined') {
             (window as unknown as { __maxtvHls?: Hls }).__maxtvHls = hls;
           }
@@ -894,10 +553,9 @@ export function PlayerOverlay() {
               (hls.levels || []).map((l, i) => {
                 const resH = Number(String(l.attrs?.RESOLUTION ?? '').split('x')[1]) || 0;
                 // ⚠ manifest-declared heights ONLY — video.videoHeight here is
-                // the PREVIOUS channel's last decoded frame on a channel change
-                // (a 1080p → 720p hop leaked a phantom 1080p rung into the
-                // quality menu). The real height arrives via LEVEL_SWITCHED
-                // once THIS stream decodes a frame.
+                // the PREVIOUS channel's last decoded frame on a channel change.
+                // The real height arrives via LEVEL_SWITCHED once THIS stream
+                // decodes a frame.
                 const h = l.height || resH;
                 const k = Math.round((l.bitrate || 0) / 1000);
                 return { label: h ? `${h}p` : k > 0 ? `${k}k` : 'Source', level: i, height: h };
@@ -915,26 +573,21 @@ export function PlayerOverlay() {
             const canTc = (ch.kind === 'daddylive' || !!tcSrcRef.current) && tcCapRef.current;
 
             if (prefH === -1) {
-              // AUTO — connectivity-chosen: open on the best rung a
-              // CONSERVATIVE 60% of the estimated link can hold (the estimate
-              // over-reports; overshoot = the opening stall), then let the
-              // sticky-cap rules adapt up on sustained good measurements.
+              // AUTO — open on the best rung a CONSERVATIVE 60% of the
+              // estimated link can hold, then let the sticky-cap rules adapt.
               setCurrentQuality(-1);
               if (budget > 0 && hls.levels?.length) {
                 const safe = budget * 0.6;
-                const cap = safe < 350_000 ? 144 : safe < 500_000 ? 244 : safe < 750_000 ? 360 : safe < 1_400_000 ? 480 : safe < 2_800_000 ? 720 : 1080;
+                const capH = safe < 350_000 ? 144 : safe < 500_000 ? 244 : safe < 750_000 ? 360 : safe < 1_400_000 ? 480 : safe < 2_800_000 ? 720 : 1080;
                 let target = 0;
                 for (let i = 0; i < hls.levels.length; i++) {
                   const lh = hls.levels[i].height || 0;
-                  if (lh && lh <= cap) target = i;
+                  if (lh && lh <= capH) target = i;
                 }
                 hls.startLevel = target;
               }
               // the link is too slow for the native ladder → open transcoded.
               // ONLY when ladder heights are actually KNOWN (master playlists).
-              // Relay/media playlists report height 0 until fragments decode —
-              // downshifting there detoured every relay stream through the slow
-              // transcode warmup. Real FRAG_BUFFERED measurements decide instead.
               const ds = dataSaverForBudget(budget);
               const ladderKnown = levels.some((l) => l.height > 0);
               if (ds && canTc && ladderKnown && !levels.some((l) => l.height > 0 && l.height <= ds + 60)) {
@@ -952,8 +605,8 @@ export function PlayerOverlay() {
                 setCurrentQuality(idx);
               } else if (!tcCapRef.current) {
                 // no native rung at/below the preference and no transcode
-                // ladder (serverless) — pin the LOWEST rung instead of full
-                // auto, so a 480p preference never plays 1080p by accident
+                // ladder — pin the LOWEST rung so a 480p preference never
+                // plays 1080p by accident
                 const lowest = levels.filter((l) => l.height > 0).sort((a, b) => a.height - b.height)[0];
                 if (lowest) {
                   hls.currentLevel = lowest.level;
@@ -969,15 +622,8 @@ export function PlayerOverlay() {
             }
 
             // persisted data-saver preference the provider cannot satisfy
-            // natively (single rendition above the preferred height) → switch
-            // to the real-time transcode ladder. Skipped on deployments
-            // without ffmpeg — there we stay native (closest level or the
-            // single rendition) instead of hanging on a 503.
-            // ⚠ 2026-10-08: the SERVERLESS segment ladder tops at 480 — a
-            // >480 preference must never divert playback into a re-encode
-            // that ladder can't sustain (the "loads forever" report). Such
-            // picks stay on the native feed; the v4 prefs migration already
-            // resets them to Auto, this is the belt-and-suspenders guard.
+            // natively → switch to the real-time transcode ladder (with the
+            // serverless segment-ladder guards — >480 asks stay native).
             if (prefH > 0 && (DATA_SAVER_HEIGHTS as readonly number[]).includes(prefH)) {
               const hasNative = levels.some((l) => l.height > 0 && l.height <= prefH + 60);
               const segOnly = ch.kind === 'daddylive' && tcSegRef.current && !tcRelayRef.current;
@@ -988,16 +634,15 @@ export function PlayerOverlay() {
               }
               if (!hasNative && !servable && prefH > 480 && !hiPrefNoticeRef.current) {
                 hiPrefNoticeRef.current = true;
-                showToast(`${prefH}p isn't available on this channel — playing its native feed`);
+                showToast(t('player.prefUnavailable', { h: prefH }));
               }
               if (!hasNative && !tcCapRef.current && !tcNoticeRef.current) {
                 tcNoticeRef.current = true;
-                showToast('Data saver is unavailable on this server — playing the native feed');
+                showToast(t('player.dsUnavailableToast'));
               }
             }
 
-            // explicit alternate-rung pick (quality-menu "via <source>" hop) —
-            // pin the closest rung at/below the chosen height, one shot
+            // explicit alternate-rung pick — pin the closest rung, one shot
             const pin = pinHeightRef.current;
             pinHeightRef.current = null;
             if (pin && levels.length) {
@@ -1016,19 +661,16 @@ export function PlayerOverlay() {
             }
 
             video.muted = prefs.muted;
-            playWithFallback(video);
+            playWithFallbackRef.current?.(video);
           });
 
           // connectivity engine — Auto keeps following the measured bandwidth
-          // (shared with data-saver attachments — see attachNetWatcher)
           attachNetWatcher(hls);
           hls.on(Hls.Events.LEVEL_SWITCHED, (_e, d) => {
             // refresh labels — some CDNs only report resolution once fragments load
             const lvl = hls.levels?.[d.level];
             const resH = Number(String(lvl?.attrs?.RESOLUTION ?? '').split('x')[1]) || 0;
             // videoHeight is trustworthy ONLY once THIS stream decoded a frame
-            // (readyState ≥ 2) — right after a channel change it still shows
-            // the previous channel's frame size
             const vh = video.readyState >= 2 && video.currentTime > 0 ? video.videoHeight : 0;
             const h = lvl?.height || resH || vh;
             if (h) {
@@ -1047,11 +689,8 @@ export function PlayerOverlay() {
             }
           });
           hls.on(Hls.Events.ERROR, (_e, dRaw) => {
-            // deterministic codec rejections arrive NON-FATAL first — the MSE
-            // refused the codec when hls.js appended the init segment, and
-            // hls.js retries it forever (endless "Buffering…" on HEVC feeds
-            // in incapable browsers). Promote them so the codec-shaped
-            // handling below takes over immediately.
+            // deterministic codec rejections arrive NON-FATAL first — promote
+            // them so the codec-shaped handling below takes over immediately.
             const d =
               !dRaw.fatal &&
               dRaw.type === Hls.ErrorTypes.MEDIA_ERROR &&
@@ -1060,9 +699,7 @@ export function PlayerOverlay() {
                 : dRaw;
             if (!d.fatal) {
               // our relay/turbo endpoints mark off-air channels with 503 +
-              // x-offair. hls.js retries 5xx responses internally, which used
-              // to burn ~45s of "Buffering…" on a channel we already KNOW is
-              // dead — bail out to the honest off-air state immediately.
+              // x-offair — bail to the honest off-air state immediately.
               if (
                 d.type === Hls.ErrorTypes.NETWORK_ERROR &&
                 (d as { response?: { code?: number } }).response?.code === 503
@@ -1070,20 +707,25 @@ export function PlayerOverlay() {
                 setPhase('offair');
                 return;
               }
-              // transient CDN flap — hls.js is retrying under the deep retry
-              // budget; tell the user instead of showing a naked spinner
+              // transient CDN flap — hls.js is retrying under the deep budget
               if (
                 d.type === Hls.ErrorTypes.NETWORK_ERROR &&
                 Date.now() - lastReconnectToastRef.current > 6000
               ) {
                 lastReconnectToastRef.current = Date.now();
-                showToast('Reconnecting…');
+                showToast(t('player.reconnecting'));
               }
               return;
             }
-            if (d.type === Hls.ErrorTypes.NETWORK_ERROR && d.details === 'manifestLoadError') {
-              // our relay marks off-air channels with 503 x-offair — honest
-              // off-air, don't waste 6 server hops on a dead channel
+            if (
+              d.type === Hls.ErrorTypes.NETWORK_ERROR &&
+              (d.details === 'manifestLoadError' ||
+                d.details === 'manifestLoadTimeOut' ||
+                d.details === 'manifestParsingError')
+            ) {
+              // manifest-level failure — includes PARSING (upstream served an
+              // HTML error page as a "manifest"), which previously fell to the
+              // generic branch without the off-air/proxy checks.
               if ((d as { response?: { code?: number } }).response?.code === 503) {
                 setPhase('offair');
                 return;
@@ -1093,35 +735,28 @@ export function PlayerOverlay() {
               if (directPlayRef.current && proxiedSrcRef.current && !usedProxyFallbackRef.current) {
                 usedProxyFallbackRef.current = true;
                 directPlayRef.current = false;
-                showToast('Routing this stream through MaxTV…');
+                showToast(t('player.routing'));
                 setPhase('loading');
                 const pin = loadPrefs().quality;
-                attachSource(proxiedSrcRef.current, undefined, pin > 0 ? pin : undefined);
+                attachSourceRef.current?.(proxiedSrcRef.current, undefined, pin > 0 ? pin : undefined);
                 return;
               }
-              // per-stream server failover before declaring the stream dead
+              // unified failover walk (transports → cross-playlist alternates,
+              // 2 passes) before declaring the stream dead
               const cur = playerRef.current || ch;
-              if (cur.kind === 'daddylive') {
-                const next = serversRef.current.find((s) => !triedRef.current.tried.has(s.id));
-                if (next) {
-                  showToast(`Switching to ${next.label} (${next.host})…`);
-                  void loadRef.current(cur, { server: next.id });
-                  return;
-                }
+              const hop = findNextHop(cur);
+              if (hop?.kind === 'server') {
+                showToast(t('player.switchingServer', { label: hop.server.label, host: hop.server.host }));
+                void loadRef.current(cur, { server: hop.server.id });
+                return;
               }
-              {
-                // SAME-CHANNEL alternates only — a family feed never auto-enters
-                // the failover chain (silent channel swaps were the complaint);
-                // it's offered on the error screen as an explicit button
-                const next = alternatesRef.current.find((a) => a.sameChannel !== false && !triedRef.current.tried.has(a.url));
-                if (next) {
-                  showToast(`Trying ${next.sourceName}…`);
-                  void loadRef.current(altPlayable(cur, next), { isAlternate: true });
-                  return;
-                }
+              if (hop?.kind === 'alternate') {
+                showToast(t('player.tryingSource', { name: hop.alt.sourceName }));
+                void loadRef.current(altPlayable(cur, hop.alt), { isAlternate: true });
+                return;
               }
               setPhase('error');
-              setErrorMsg('Stream manifest is unreachable — the channel may be offline or region-blocked.');
+              setErrorMsg(t('player.manifestUnreachable'));
             } else if (
               d.type === Hls.ErrorTypes.NETWORK_ERROR &&
               (d.details === 'fragLoadError' || d.details === 'fragLoadTimeOut') &&
@@ -1135,13 +770,14 @@ export function PlayerOverlay() {
               if (directPlayRef.current && proxiedSrcRef.current && !usedProxyFallbackRef.current) {
                 usedProxyFallbackRef.current = true;
                 directPlayRef.current = false;
-                showToast('Routing this stream through MaxTV…');
+                showToast(t('player.routing'));
                 setPhase('loading');
                 const pin = loadPrefs().quality;
-                attachSource(proxiedSrcRef.current, undefined, pin > 0 ? pin : undefined);
+                attachSourceRef.current?.(proxiedSrcRef.current, undefined, pin > 0 ? pin : undefined);
                 return;
               }
-              // transient network trouble — one reconnect attempt, then failover
+              // transient network trouble — one reconnect attempt, then the
+              // unified failover walk
               const cur = playerRef.current || ch;
               const recon = (hlsRef.current as unknown as { _zillaRecon?: boolean }) || null;
               if (recon && !recon._zillaRecon) {
@@ -1149,34 +785,23 @@ export function PlayerOverlay() {
                 hls.startLoad();
                 return;
               }
-              if (cur.kind === 'daddylive') {
-                const next = serversRef.current.find((s) => !triedRef.current.tried.has(s.id));
-                if (next) {
-                  showToast(`Switching to ${next.label} (${next.host})…`);
-                  void loadRef.current(cur, { server: next.id });
-                  return;
-                }
+              const hop = findNextHop(cur);
+              if (hop?.kind === 'server') {
+                showToast(t('player.switchingServer', { label: hop.server.label, host: hop.server.host }));
+                void loadRef.current(cur, { server: hop.server.id });
+                return;
               }
-              {
-                // same-channel alternates only — family feeds are an explicit
-                // choice on the error screen, never a silent hop
-                const next = alternatesRef.current.find((a) => a.sameChannel !== false && !triedRef.current.tried.has(a.url));
-                if (next) {
-                  showToast(`Trying ${next.sourceName}…`);
-                  void loadRef.current(altPlayable(cur, next), { isAlternate: true });
-                  return;
-                }
+              if (hop?.kind === 'alternate') {
+                showToast(t('player.tryingSource', { name: hop.alt.sourceName }));
+                void loadRef.current(altPlayable(cur, hop.alt), { isAlternate: true });
+                return;
               }
               setPhase('error');
-              setErrorMsg(`Network error (${d.details}).`);
+              setErrorMsg(t('player.networkError', { detail: d.details || '' }));
             } else if (d.type === Hls.ErrorTypes.MEDIA_ERROR) {
-              // codec-shaped failures are DETERMINISTIC — the browser's MSE
-              // cannot decode this feed's codec (the DaddyLive HEVC flip:
-              // server-side we serve such feeds through so capable browsers
-              // play them, and incapable ones land here). recoverMediaError
-              // can never fix MSE support. Same-channel alternates auto-hop;
-              // with none left, the explicit HEVC choice panel takes over —
-              // NEVER a silent swap onto a brand-family feed (beIN 5 → XTRA).
+              // codec-shaped failures are DETERMINISTIC — same-channel
+              // alternates auto-hop; with none left, the explicit HEVC choice
+              // panel takes over — NEVER a silent swap onto a brand-family feed.
               const codecShaped =
                 d.details === 'bufferAppendError' ||
                 d.details === 'bufferAddCodecError' ||
@@ -1187,9 +812,7 @@ export function PlayerOverlay() {
                 const cur = playerRef.current;
                 const h = hlsRef.current as unknown as { _zillaAppendRecov?: boolean } | null;
                 // one plain reconnect PER CHANNEL first — append races can
-                // mimic codec errors (holes from discontinuity flushes); a
-                // fresh MSE usually clears those. A SECOND codec-shaped error
-                // on the same channel is deterministic (HEVC) → the panel.
+                // mimic codec errors; a fresh MSE usually clears those.
                 const recov = codecRecovRef.current;
                 if (
                   cur &&
@@ -1201,8 +824,8 @@ export function PlayerOverlay() {
                 ) {
                   h._zillaAppendRecov = true;
                   recov.count += 1;
-                  showToast('Stream hiccup — reconnecting');
-                  triedRef.current = { chId: cur.id, tried: new Set() };
+                  showToast(t('player.hiccup'));
+                  triedRef.current = { chId: cur.id, tried: new Set(), pass: 0 };
                   void loadRef.current(cur);
                   return;
                 }
@@ -1210,7 +833,7 @@ export function PlayerOverlay() {
                   if (cur.kind === 'iptv') triedRef.current.tried.add(cur.ref);
                   const next = alternatesRef.current.find((a) => a.sameChannel !== false && !triedRef.current.tried.has(a.url));
                   if (next) {
-                    showToast(`Codec not supported here — trying ${next.sourceName}…`);
+                    showToast(t('player.codecHop', { name: next.sourceName }));
                     void loadRef.current(altPlayable(cur, next), { isAlternate: true });
                     return;
                   }
@@ -1223,10 +846,7 @@ export function PlayerOverlay() {
                 setPhase('hevc');
                 return;
               }
-              // append/codec buffer errors mean the SourceBuffer state itself
-              // is corrupted (holes from discontinuity flushes racing in-flight
-              // appends) — recoverMediaError cannot clear it. Reload the whole
-              // channel: fresh relay session + fresh MSE = clean slate.
+              // corrupted SourceBuffer state — reload the whole channel
               const h = hlsRef.current as unknown as { _zillaAppendRecov?: boolean; _zillaMediaRecov?: number } | null;
               const appendBroken =
                 d.details === 'bufferAppendError' ||
@@ -1238,17 +858,17 @@ export function PlayerOverlay() {
                 if (cur && h && !h._zillaAppendRecov && recov.chId === cur.id && recov.count < 1) {
                   h._zillaAppendRecov = true;
                   recov.count += 1;
-                  showToast('Stream hiccup — reconnecting');
-                  triedRef.current = { chId: cur.id, tried: new Set() };
+                  showToast(t('player.hiccup'));
+                  triedRef.current = { chId: cur.id, tried: new Set(), pass: 0 };
                   void loadRef.current(cur);
                   return;
                 }
                 setPhase('error');
-                setErrorMsg('Media decode error.');
+                setErrorMsg(t('player.mediaError'));
                 return;
               }
-              // recovery ladder for other media errors:
-              // recoverMediaError → swapAudioCodec+recover → fresh reload → error
+              // recovery ladder: recoverMediaError → swapAudioCodec+recover →
+              // fresh reload → error
               if (h && !h._zillaMediaRecov) {
                 h._zillaMediaRecov = 1;
                 try {
@@ -1270,24 +890,24 @@ export function PlayerOverlay() {
                 h._zillaMediaRecov = 3;
                 const cur = playerRef.current;
                 if (cur) {
-                  showToast('Stream hiccup — reconnecting');
-                  triedRef.current = { chId: cur.id, tried: new Set() };
+                  showToast(t('player.hiccup'));
+                  triedRef.current = { chId: cur.id, tried: new Set(), pass: 0 };
                   void loadRef.current(cur);
                   return;
                 }
               }
               setPhase('error');
-              setErrorMsg('Media decode error.');
+              setErrorMsg(t('player.mediaError'));
             } else {
               setPhase('error');
-              setErrorMsg(`Playback error (${d.details}).`);
+              setErrorMsg(t('player.playbackError', { detail: d.details || '' }));
             }
           });
         } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
           // Safari native HLS
           video.src = src;
           video.muted = prefs.muted;
-          playWithFallback(video);
+          playWithFallbackRef.current?.(video);
         }
       } catch (e) {
         if (gen !== loadGenRef.current) return; // closed/superseded — stay quiet
@@ -1295,22 +915,23 @@ export function PlayerOverlay() {
         setErrorMsg((e as Error).message || 'Failed to resolve stream.');
       }
     },
-    [showToast]
+    [showToast, t, findNextHop]
   );
+  useEffect(() => {
+    loadRef.current = load;
+  }, [load]);
 
   loadRef.current = load;
 
   // keep the player ref in sync for the hls error handler / failover engine
-  // (in an effect — never update other components during render)
   useEffect(() => {
     playerRef.current = player;
   }, [player]);
 
   // reload the stream only when the channel ACTUALLY changes. The store's
-  // enrichPlayable patches the open player (logo backfill for Recently
-  // watched) — a new object identity with the SAME channel. Treating those
-  // as channel changes re-resolved and re-attached the stream in a loop
-  // (visible as endless Resolving/Buffering flashes mid-playback).
+  // enrichPlayable patches the open player (logo backfill) — a new object
+  // identity with the SAME channel. Treating those as channel changes
+  // re-resolved and re-attached the stream in a loop.
   const loadKeyRef = useRef('');
   useEffect(() => {
     if (!playerOpen || !player) return;
@@ -1321,8 +942,7 @@ export function PlayerOverlay() {
   }, [playerOpen, player]);
 
   // cleanup on close — destroy hls AND invalidate any in-flight resolve so
-  // closing during "Resolving stream…" is instant (the stale load can never
-  // write player state afterwards)
+  // closing during "Resolving stream…" is instant
   useEffect(() => {
     if (!playerOpen) {
       loadGenRef.current++;
@@ -1380,17 +1000,13 @@ export function PlayerOverlay() {
   /* ── Settings-menu sync — apply quality changes made while playing ───────── */
   useEffect(() => {
     return onPrefsChange((p, patch) => {
-      // Only react to actual QUALITY changes. Incidental patches (volume,
-      // autoPicked, perfMode…) used to re-enter selectDataSaver/exitDataSaver
-      // and could mutually recurse with the player's own pref writes.
+      // Only react to actual QUALITY changes (incidental patches used to
+      // re-enter selectDataSaver/exitDataSaver and mutually recurse).
       if (patch && patch.quality === undefined) return;
       const hls = hlsRef.current;
       if (p.quality === -1) {
-        // back to Auto: unpin and leave any auto data-saver rung
         if (hls && hls.levels?.length && tcHeightRef.current === null) hls.nextLevel = -1;
         setCurrentQuality(-1);
-        // an EXPLICIT Auto pick exits data-saver; an autoPicked rung stays
-        // (the connectivity engine keeps its low-bandwidth choice)
         if (tcHeightRef.current !== null && !p.autoPicked) void exitDataSaverRef.current?.();
         return;
       }
@@ -1402,14 +1018,10 @@ export function PlayerOverlay() {
         idx = below?.i ?? -1;
       }
       if (idx >= 0 && tcHeightRef.current === null) {
-        // smooth switch — nextLevel swaps rung at the next segment boundary
-        // without flushing the live buffer (no stall on a settings pick)
-        hls.nextLevel = idx;
+        hls.nextLevel = idx; // smooth switch at the next segment boundary
         setCurrentQuality(idx);
       } else if ((DATA_SAVER_HEIGHTS as readonly number[]).includes(p.quality)) {
-        // guard: never re-enter for a rung that is ALREADY active (the player
-        // itself just set it — selectDataSaver persists quality before this
-        // event lands; without the guard the two mutual-call forever)
+        // guard: never re-enter a rung that is ALREADY active
         if (tcHeightRef.current !== p.quality) {
           void selectDataSaverRef.current?.(p.quality);
         }
@@ -1417,17 +1029,13 @@ export function PlayerOverlay() {
     });
   }, []);
 
-  /* ── content-mismatch guard (the football→F1 fix, layer 3) ─────────────
-   * DaddyLive events list *network* channels and a network can preempt
-   * (DAZN Spain → F1 on grand-prix weekends). After a few seconds of play
-   * we grab a frame and let the vision model check the sport; on mismatch
-   * we offer a one-click hop to the event's next feed. */
+  /* ── content-mismatch guard (the football→F1 fix, layer 3) ───────────── */
   useEffect(() => {
     if (phase !== 'playing' || !player || player.kind !== 'daddylive') return;
     if (!player.category || player.category === 'other') return;
     if (mismatchChecked.current === player.id) return;
 
-    const t = setTimeout(async () => {
+    const tm = setTimeout(async () => {
       const v = videoRef.current;
       if (!v || v.videoWidth === 0 || v.readyState < 2) return;
       mismatchChecked.current = player.id;
@@ -1453,7 +1061,7 @@ export function PlayerOverlay() {
       }
     }, 9000);
 
-    return () => clearTimeout(t);
+    return () => clearTimeout(tm);
   }, [phase, player]);
 
   /** hop to the event's next feed (mismatch banner + feed cycler) */
@@ -1463,10 +1071,10 @@ export function PlayerOverlay() {
     const next = altFeeds[(idx + 1) % altFeeds.length] || altFeeds[0];
     if (next && next.id !== player.id) {
       setMismatch(null);
-      showToast(`Switching to ${next.name.split(' — ')[1] || 'next feed'}…`);
+      showToast(t('player.switchingTo', { name: next.name.split(' — ')[1] || next.name }));
       openPlayer(next, altFeeds);
     }
-  }, [altFeeds, player, openPlayer, showToast]);
+  }, [altFeeds, player, openPlayer, showToast, t]);
 
   /* ── live-edge drift watcher ───────────────────────────────────────────── */
   useEffect(() => {
@@ -1485,9 +1093,9 @@ export function PlayerOverlay() {
     setControlsVisible(true);
     if (hideTimer.current) clearTimeout(hideTimer.current);
     hideTimer.current = setTimeout(() => {
-      if (phase === 'playing' && !surfOpen && !showQualityMenu && !showServersMenu) setControlsVisible(false);
+      if (phase === 'playing' && !surfOpen && !showQualityMenu && !showServersMenu && !showStats) setControlsVisible(false);
     }, 3200);
-  }, [phase, surfOpen, showQualityMenu, showServersMenu]);
+  }, [phase, surfOpen, showQualityMenu, showServersMenu, showStats]);
 
   useEffect(() => {
     poke();
@@ -1518,10 +1126,8 @@ export function PlayerOverlay() {
   }, [nextChannel, player, openPlayer]);
 
   /* ── video actions ──────────────────────────────────────────────────────── */
-  /** Unmute helper — the #1 tap-for-sound pitfall is a ZERO volume: unmuting
-   *  a silent-volume video still produces silence, so the button looks dead.
-   *  Every unmute path funnels through here and lifts a 0 volume back to an
-   *  audible default (0.75). */
+  /** Unmute helper — a ZERO volume makes the unmute button look dead. Every
+   *  unmute path funnels through here and lifts a 0 volume back to 0.75. */
   const soundOn = useCallback((v: HTMLVideoElement) => {
     if (v.volume === 0 || Number.isNaN(v.volume)) {
       v.volume = 0.75;
@@ -1531,10 +1137,8 @@ export function PlayerOverlay() {
     setMuted(false);
   }, []);
 
-  /** play() with the browser-autoplay fallback (freestream-tv pattern): when
-   *  unmuted autoplay is blocked the stream would sit paused forever ("stuck
-   *  buffering" → off-air watchdog). Fall back to MUTED playback and surface
-   *  the tap-for-sound button — the standard YouTube-style behavior. */
+  /** play() with the browser-autoplay fallback: when unmuted autoplay is
+   *  blocked, fall back to MUTED playback + the tap-for-sound button. */
   const playWithFallback = useCallback((v: HTMLVideoElement) => {
     v.play().catch(() => {
       v.muted = true;
@@ -1544,6 +1148,8 @@ export function PlayerOverlay() {
       });
     });
   }, []);
+  const playWithFallbackRef = useRef(playWithFallback);
+  playWithFallbackRef.current = playWithFallback;
 
   const togglePlay = useCallback(() => {
     const v = videoRef.current;
@@ -1600,145 +1206,137 @@ export function PlayerOverlay() {
       } else if (document.pictureInPictureEnabled) {
         await v.requestPictureInPicture();
       } else {
-        showToast('Picture-in-picture is not supported here');
+        showToast(t('player.pipUnsupported'));
       }
     } catch {
-      showToast('Picture-in-picture unavailable for this stream');
+      showToast(t('player.pipUnavailable'));
     }
-  }, [showToast]);
+  }, [showToast, t]);
 
   /* ── data-saver ladder (real-time transcode) ────────────────────────── */
 
-  /** attach a fresh hls instance to a source URL without re-resolving.
-   *  `level` pins a native quality once the manifest parses; `pinHeight` pins
-   *  native quality once the manifest parses; `pinHeight` pins the closest
-   *  rung at/below a HEIGHT (used by alternate-rung hops and the direct→proxy
-   * fallback, where level indices aren't known until the manifest parses). */
-  const attachSource = useCallback((src: string, level?: number, pinHeight?: number) => {
-    const video = videoRef.current;
-    if (!video) return;
-    if (hlsRef.current) {
-      hlsRef.current.destroy();
-      hlsRef.current = null;
-    }
-    const prefs = loadPrefs();
-    video.volume = prefs.volume;
-    video.muted = prefs.muted;
-    if (Hls.isSupported()) {
-      // &h= ladder src → ride 5 segments back with a deep buffer (the encode
-      // needs lead time); native srcs keep the profile-tuned edge distance
-      const ladder = /\/api\/turbo\?.*\bh=\d+/.test(src);
-      const hls = new Hls({
-        // see the main load() — LL mode off or hls.js plays 2× catch-up
-        lowLatencyMode: false,
-        enableWorker: true,
-        ...hlsPerfConfig(loadPrefs().perfMode),
-        ...(ladder ? LADDER_HLS_CONFIG : null),
-        ...RESILIENT_LOAD_POLICIES,
-      });
-      hlsRef.current = hls;
-      // TEMP DEBUG — expose the live hls instance for E2E inspection
-      if (typeof window !== 'undefined') {
-        (window as unknown as { __maxtvHls?: Hls }).__maxtvHls = hls;
+  /** attach a fresh hls instance to a source URL without re-resolving. */
+  const attachSource = useCallback(
+    (src: string, level?: number, pinHeight?: number) => {
+      const video = videoRef.current;
+      if (!video) return;
+      if (hlsRef.current) {
+        hlsRef.current.destroy();
+        hlsRef.current = null;
       }
-      hls.loadSource(src);
-      hls.attachMedia(video);
-      // connectivity engine on data-saver attachments too — this is the only
-      // place recovery ("back to native") and rung-hopping can fire from while
-      // transcoding
-      attachNetWatcher(hls);
-      hls.on(Hls.Events.MANIFEST_PARSED, () => {
-        if (typeof level === 'number' && level >= 0 && hls.levels?.[level]) {
-          hls.currentLevel = level;
-        } else if (pinHeight && hls.levels?.length) {
-          let best = -1;
-          let bestH = 0;
-          hls.levels.forEach((l, i) => {
-            const h = l.height || 0;
-            if (h > 0 && h <= pinHeight + 60 && h > bestH) {
-              bestH = h;
-              best = i;
+      const prefs = loadPrefs();
+      video.volume = prefs.volume;
+      video.muted = prefs.muted;
+      if (Hls.isSupported()) {
+        // &h= ladder src → ride 5 segments back with a deep buffer (the encode
+        // needs lead time); native srcs keep the profile-tuned edge distance
+        const ladder = /\/api\/turbo\?.*\bh=\d+/.test(src);
+        const hls = new Hls({
+          // see load() — LL mode off or hls.js plays 2× catch-up
+          lowLatencyMode: false,
+          enableWorker: true,
+          ...hlsPerfConfig(loadPrefs().perfMode),
+          ...(ladder ? LADDER_HLS_CONFIG : null),
+          ...RESILIENT_LOAD_POLICIES,
+        });
+        hlsRef.current = hls;
+        // expose the live hls instance for E2E inspection
+        if (typeof window !== 'undefined') {
+          (window as unknown as { __maxtvHls?: Hls }).__maxtvHls = hls;
+        }
+        hls.loadSource(src);
+        hls.attachMedia(video);
+        // connectivity engine on data-saver attachments too — this is the only
+        // place recovery ("back to native") and rung-hopping can fire from
+        // while transcoding
+        attachNetWatcher(hls);
+        hls.on(Hls.Events.MANIFEST_PARSED, () => {
+          if (typeof level === 'number' && level >= 0 && hls.levels?.[level]) {
+            hls.currentLevel = level;
+          } else if (pinHeight && hls.levels?.length) {
+            let best = -1;
+            let bestH = 0;
+            hls.levels.forEach((l, i) => {
+              const h = l.height || 0;
+              if (h > 0 && h <= pinHeight + 60 && h > bestH) {
+                bestH = h;
+                best = i;
+              }
+            });
+            if (best >= 0) {
+              hls.currentLevel = best;
+              setCurrentQuality(best);
             }
-          });
-          if (best >= 0) {
-            hls.currentLevel = best;
-            setCurrentQuality(best);
           }
-        }
-        playWithFallback(video);
-      });
-      hls.on(Hls.Events.ERROR, (_e, d) => {
-        if (!d.fatal) return;
-        if (d.details === 'manifestLoadError' || (d.type === Hls.ErrorTypes.NETWORK_ERROR && (d as { response?: { code?: number } }).response?.code === 503)) {
-          // only bounce back to native when we're actually IN data-saver mode —
-          // calling exitDataSaver from a failing NATIVE restore would recurse
-          if (tcHeightRef.current !== null) {
-            showToast('Data-saver stream unavailable — back to the native feed');
-            void exitDataSaverRef.current?.();
+          playWithFallback(video);
+        });
+        hls.on(Hls.Events.ERROR, (_e, d) => {
+          if (!d.fatal) return;
+          if (d.details === 'manifestLoadError' || (d.type === Hls.ErrorTypes.NETWORK_ERROR && (d as { response?: { code?: number } }).response?.code === 503)) {
+            // only bounce back to native when we're actually IN data-saver
+            // mode — calling exitDataSaver from a failing NATIVE restore
+            // would recurse
+            if (tcHeightRef.current !== null) {
+              showToast(t('player.dsStreamUnavailable'));
+              void exitDataSaverRef.current?.();
+            }
           }
-        }
-      });
-    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-      video.src = src;
-      video.play().catch(() => {});
-    }
-  }, [showToast]);
+        });
+      } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+        video.src = src;
+        video.play().catch(() => {});
+      }
+    },
+    [showToast, t, attachNetWatcher]
+  );
+  const attachSourceRef = useRef(attachSource);
+  attachSourceRef.current = attachSource;
 
   /** switch to a transcoded rendition (144p → 1080p) of the current stream.
-   *  opts.auto marks a connectivity-engine pick — keeps the user's Auto choice. */
+   *  opts.auto marks a connectivity-engine pick — keeps the user's Auto. */
   const selectDataSaver = useCallback(
     (height: number, opts: { auto?: boolean } = {}) => {
       const cur = playerRef.current;
       if (!cur) return;
-      // deployments without ffmpeg have no ladder — stay native (the settings
-      // menu / connectivity engine can still ask; one notice per page load)
+      // deployments without ffmpeg have no ladder — stay native (one notice
+      // per page load)
       if (!tcCapRef.current) {
         if (opts.auto !== true && !tcNoticeRef.current) {
           tcNoticeRef.current = true;
-          showToast('Data saver is unavailable on this server — playing the native feed');
+          showToast(t('player.dsUnavailableToast'));
         }
         return;
       }
       const h0 = (DATA_SAVER_HEIGHTS as readonly number[]).includes(height) ? height : 360;
       setShowQualityMenu(false);
-      // segment ladder (serverless): tops at 480 — encoding 720/1080 runs
-      // slower than realtime on a 1-vCPU isolate (5-7s+ per ~6s segment), so
-      // those rungs are no longer offered and a >480 ask can only arrive
-      // from a stale persisted preference. Serving it anyway (clamped to
-      // 480) re-encoded a 408p source through the slow per-segment pipeline
-      // for nothing — the 2026-10-08 "loads constantly since the last
-      // version" report. Refuse, reset the pref to Auto, stay native: the
-      // passthrough already plays the source's full height untouched.
-      const useSegLadder =
-        cur.kind === 'daddylive' && tcSegRef.current && !tcRelayRef.current;
+      // segment ladder (serverless): tops at 480 — refuse >480 asks (stale
+      // persisted preferences), reset to Auto, stay native.
+      const useSegLadder = cur.kind === 'daddylive' && tcSegRef.current && !tcRelayRef.current;
       if (useSegLadder && h0 > 480) {
-        showToast(`${h0}p re-encoding can't run smoothly here — Auto (native feed) restored`);
+        showToast(t('player.segRefuse', { h: h0 }));
         updatePrefs({ quality: -1, autoPicked: false });
         return;
       }
       const h = h0;
       // never encode UP: a rung STRICTLY above the native feed's height can
-      // only lose quality and burn CPU (1080p ask on a 720p-only source).
-      // ⚠ exit data-saver BEFORE updatePrefs — the settings-sync effect echoes
-      // quality picks back into this function whenever the live hls instance
-      // can't satisfy them natively; restoring the native instance first (or
-      // pinning its level) lets the echo resolve there instead of re-entering.
+      // only lose quality and burn CPU.
+      // ⚠ exit data-saver BEFORE updatePrefs — the settings-sync effect
+      // echoes quality picks back into this function; restoring the native
+      // instance first lets the echo resolve there instead of re-entering.
       const nh = nativeHeightRef.current;
       if (opts.auto !== true && nh > 0 && h > nh + 60) {
         if (tcHeightRef.current !== null) {
-          showToast(`Native feed is already ${nh}p — switching back to it`);
+          showToast(t('player.nativeIsHp', { h: nh }));
           void exitDataSaverRef.current?.();
         } else {
-          showToast(`This channel tops out at ${nh}p — playing it natively`);
+          showToast(t('player.topsAt', { h: nh }));
         }
         updatePrefs({ quality: h, autoPicked: false });
         return;
       }
       // ⚠ set the ref BEFORE updatePrefs — savePrefs dispatches the prefs
       // event SYNCHRONOUSLY, and the settings-sync effect re-enters
-      // selectDataSaver for data-saver heights unless it can see the rung is
-      // already active. Setting it after the update caused infinite mutual
-      // recursion (RangeError: Maximum call stack size exceeded).
+      // selectDataSaver unless it can see the rung is already active.
       setTcHeight(h);
       tcHeightRef.current = h; // synchronous for cross-callback checks
       setCurrentQuality(-2); // marks the data-saver selection in the chip
@@ -1758,18 +1356,15 @@ export function PlayerOverlay() {
             ? `/api/transcode?src=${encodeURIComponent(tcSrcRef.current.src)}&r=${encodeURIComponent(tcSrcRef.current.r)}&s=${encodeURIComponent(tcSrcRef.current.s)}`
             : null;
       if (!base) {
-        showToast('Data saver is unavailable for this channel');
+        showToast(t('player.dsUnavailableChannel'));
         return;
       }
-      showToast(`Data saver: ${h}p — lighter stream, less bandwidth`);
+      showToast(t('player.dsEngaged', { h }));
       setPhase('loading');
       attachSource(`${base}${useSegLadder ? '' : `&height=${h}`}&mode=m3u8`);
 
       // learn the source's real height in the background (single-rendition
       // media playlists don't declare it — the server ffprobes a segment).
-      // With it: later rung picks hit the no-upscale guard above, and a rung
-      // that is ALREADY strictly above the source self-heals back to native.
-      // (Skipped on the segment ladder — its rungs are clamped ≤480 anyway.)
       const gen = loadGenRef.current;
       if (!useSegLadder) {
         void fetch(`${base}&height=${h}&mode=probe`)
@@ -1780,16 +1375,15 @@ export function PlayerOverlay() {
             if (sh <= 0) return;
             nativeHeightRef.current = Math.max(nativeHeightRef.current, sh);
             if (tcHeightRef.current !== null && tcHeightRef.current > sh + 60) {
-              showToast(`This channel tops out at ${sh}p — back to the native feed`);
+              showToast(t('player.topsAtBack', { h: sh }));
               void exitDataSaverRef.current?.();
             }
           })
           .catch(() => {});
       }
     },
-    [attachSource, showToast]
+    [attachSource, showToast, t]
   );
-  const selectDataSaverRef = useRef<((h: number, opts?: { auto?: boolean }) => void) | null>(null);
   useEffect(() => {
     selectDataSaverRef.current = selectDataSaver;
   }, [selectDataSaver]);
@@ -1807,22 +1401,15 @@ export function PlayerOverlay() {
       attachSource(src);
     }
   }, [attachSource]);
-  const exitDataSaverRef = useRef<(() => void) | null>(null);
   useEffect(() => {
     exitDataSaverRef.current = exitDataSaver;
   }, [exitDataSaver]);
-
-  /** ref mirror of tcHeight for hls event closures */
-  const tcHeightRef = useRef<number | null>(null);
-  useEffect(() => {
-    tcHeightRef.current = tcHeight;
-  }, [tcHeight]);
 
   const setLevel = useCallback(
     (level: number) => {
       setShowQualityMenu(false);
       // persist the preference so every future stream opens at this quality
-      const label = level === -1 ? 'Auto' : quality.find((q) => q.level === level)?.label ?? '';
+      const label = level === -1 ? t('player.auto') : quality.find((q) => q.level === level)?.label ?? '';
       const height = level === -1 ? -1 : parseInt(label, 10) || -1;
       updatePrefs({ quality: height, autoPicked: false });
       if (tcHeight !== null) {
@@ -1835,20 +1422,19 @@ export function PlayerOverlay() {
           setPhase('loading');
           attachSource(src, level >= 0 ? level : undefined);
         }
-        showToast(level === -1 ? 'Quality: Auto — most stable for your connection' : `Quality: ${label} — saved as your default`);
+        showToast(level === -1 ? t('player.qualityAutoToast') : t('player.qualityToast', { label }));
         return;
       }
       const hls = hlsRef.current;
       if (!hls) return;
       // ⚠ nextLevel, not currentLevel: an immediate switch flushes the whole
-      // live buffer and stalls playback ("lags when changing quality") — the
-      // smooth path switches at the next segment boundary as the buffered
-      // window plays out. -1 (Auto) rides the same path back to ABR.
+      // live buffer and stalls playback — the smooth path switches at the
+      // next segment boundary as the buffered window plays out.
       hls.nextLevel = level;
       setCurrentQuality(level);
-      showToast(level === -1 ? 'Quality: Auto — most stable for your connection' : `Quality: ${label} — saved as your default`);
+      showToast(level === -1 ? t('player.qualityAutoToast') : t('player.qualityToast', { label }));
     },
-    [quality, showToast, tcHeight, attachSource]
+    [quality, showToast, tcHeight, attachSource, t]
   );
 
   /* ── per-stream server switching (original-repo feature) ───────────── */
@@ -1856,7 +1442,7 @@ export function PlayerOverlay() {
     const cur = playerRef.current;
     if (!cur) return;
     // fresh attempt: forget which servers/alternates already burned out
-    triedRef.current = { chId: cur.id, tried: new Set() };
+    triedRef.current = { chId: cur.id, tried: new Set(), pass: 0 };
     void loadRef.current(cur);
   }, []);
 
@@ -1866,10 +1452,10 @@ export function PlayerOverlay() {
       if (!cur || cur.kind !== 'daddylive') return;
       setShowServersMenu(false);
       const srv = serversRef.current.find((s) => s.id === serverId);
-      if (srv) showToast(`Switching to ${srv.label} (${srv.host})…`);
+      if (srv) showToast(t('player.switchingServer', { label: srv.label, host: srv.host }));
       void loadRef.current(cur, { server: serverId });
     },
-    [showToast]
+    [showToast, t]
   );
 
   const switchAlternate = useCallback(
@@ -1879,15 +1465,13 @@ export function PlayerOverlay() {
       setShowServersMenu(false);
       setAltUrl(alt.url);
       if (cur.kind === 'daddylive') setActiveServer('');
-      showToast(`Switching to ${alt.sourceName}…`);
+      showToast(t('player.switchingTo', { name: alt.sourceName }));
       void loadRef.current(altPlayable(cur, alt), { isAlternate: true });
     },
-    [showToast]
+    [showToast, t]
   );
 
-  /** the HEVC panel's "play the HEVC feed anyway" — suppresses the gate for
-   *  this channel and reloads it (browsers with partial support may still
-   *  play; a true failure lands on the codec error path honestly) */
+  /** the HEVC panel's "play the HEVC feed anyway" */
   const playHevcAnyway = useCallback(() => {
     forceHevcRef.current = true;
     setHevcBlock(null);
@@ -1895,9 +1479,7 @@ export function PlayerOverlay() {
     if (cur) void loadRef.current(cur);
   }, []);
 
-  /** quality-menu pick of an alternate-source rung ("1080p · via beIN XTRA"):
-   *  hop to that source and pin the chosen height once its manifest parses —
-   *  the multi-quality engine for single-rendition DaddyLive channels. */
+  /** quality-menu pick of an alternate-source rung ("1080p · via beIN XTRA") */
   const pickAltRung = useCallback(
     (alt: AltServer, h: number) => {
       const cur = playerRef.current;
@@ -1907,10 +1489,10 @@ export function PlayerOverlay() {
       pinHeightRef.current = h;
       setAltUrl(alt.url);
       if (cur.kind === 'daddylive') setActiveServer('');
-      showToast(`Switching to ${alt.sourceName} — ${h}p`);
+      showToast(t('player.altRungToast', { source: alt.sourceName, h }));
       void loadRef.current(altPlayable(cur, alt), { isAlternate: true });
     },
-    [showToast]
+    [showToast, t]
   );
 
   /** leave an alternate source — back to the channel's live servers */
@@ -1920,7 +1502,7 @@ export function PlayerOverlay() {
     setShowServersMenu(false);
     setAltUrl(null);
     // fresh walk of the transport ladder, starting at the default server
-    triedRef.current = { chId: cur.id, tried: new Set() };
+    triedRef.current = { chId: cur.id, tried: new Set(), pass: 0 };
     void loadRef.current(cur);
   }, []);
 
@@ -1929,12 +1511,12 @@ export function PlayerOverlay() {
     const url = `${location.origin}/?ch=${encodeURIComponent(encodePlayable(player))}`;
     try {
       await navigator.clipboard.writeText(url);
-      showToast('Link copied — open it anywhere to resume this channel');
+      showToast(t('player.linkCopied'));
     } catch {
       location.href = url.replace(location.origin, '');
-      showToast('Share link opened');
+      showToast(t('player.shareOpened'));
     }
-  }, [player, showToast]);
+  }, [player, showToast, t]);
 
   /* ── keyboard shortcuts (Pluto TV remote-style) ─────────────────────────── */
   useEffect(() => {
@@ -1943,7 +1525,8 @@ export function PlayerOverlay() {
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
       switch (e.key) {
         case 'Escape':
-          if (surfOpen) setSurfOpen(false);
+          if (showStats) setShowStats(false);
+          else if (surfOpen) setSurfOpen(false);
           else if (showQualityMenu) setShowQualityMenu(false);
           else if (showServersMenu) setShowServersMenu(false);
           else closePlayer();
@@ -1965,6 +1548,10 @@ export function PlayerOverlay() {
         case 'p':
         case 'P':
           void togglePip();
+          break;
+        case 'i':
+        case 'I':
+          setShowStats((v) => !v);
           break;
         case 's':
         case 'S':
@@ -2010,8 +1597,8 @@ export function PlayerOverlay() {
               if (digitTimer.current) clearTimeout(digitTimer.current);
               digitTimer.current = setTimeout(() => {
                 const n = parseInt(nd, 10);
-                // read the live list from the ref — calling openPlayer inside a
-                // state updater would update other components during render
+                // read the live list from the ref — calling openPlayer inside
+                // a state updater would update other components during render
                 const list = surfRef.current;
                 if (n >= 1 && n <= list.length) {
                   const target = list[n - 1];
@@ -2027,14 +1614,13 @@ export function PlayerOverlay() {
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [playerOpen, surfOpen, showQualityMenu, showServersMenu, closePlayer, togglePlay, toggleMute, toggleFullscreen, togglePip, zapPrev, zapNext, poke, player, openPlayer]);
+  }, [playerOpen, surfOpen, showQualityMenu, showServersMenu, showStats, closePlayer, togglePlay, toggleMute, toggleFullscreen, togglePip, zapPrev, zapNext, poke, player, openPlayer]);
 
   /** best multi-quality alternate (tallest probed ladder) — its rungs render
    *  directly in the quality menu as "via <source>" entries. ⚠ must live
    *  BEFORE the playerOpen early-return — hooks may not sit behind it.
-   *  ⚠ SAME-CHANNEL only: a brand-family sibling (beIN 1 → beIN XTRA free
-   *  feed) must never masquerade as a quality — picking 1080p would change
-   *  the channel (2026-10-02 field report). */
+   *  ⚠ SAME-CHANNEL only: a brand-family sibling must never masquerade as a
+   *  quality — picking 1080p would change the channel. */
   const ladderAlt = useMemo(() => {
     const withL = alternates.filter((a) => a.sameChannel !== false && a.ladder && a.ladder.length);
     if (!withL.length) return null;
@@ -2046,39 +1632,48 @@ export function PlayerOverlay() {
 
   if (!playerOpen || !player) return null;
 
+  /* ── derived view state ─────────────────────────────────────────────────── */
   const qualityLabel =
     tcHeight !== null
-      ? `${autoDs ? 'Auto · ' : ''}${tcHeight}p · Data saver`
+      ? `${autoDs ? `${t('player.auto')} · ` : ''}${tcHeight}p · ${t('player.dsChip')}`
       : currentQuality === -1
-        ? `Auto${activeHeight ? ` · ${activeHeight}p` : ''}`
-        : quality.find((q) => q.level === currentQuality)?.label || (activeHeight ? `${activeHeight}p` : 'Auto');
+        ? `${t('player.auto')}${activeHeight ? ` · ${activeHeight}p` : ''}`
+        : quality.find((q) => q.level === currentQuality)?.label || (activeHeight ? `${activeHeight}p` : t('player.auto'));
   const singleQuality = quality.length <= 1 && tcHeight === null;
-  const serverOptions = player.kind === 'daddylive' ? servers.length ? servers : DL_SERVERS : [];
-  const hasServerChoices =
-    player.kind === 'daddylive' ? serverOptions.length > 0 : alternates.length > 0;
+  const serverOptions: ServerOption[] =
+    player.kind === 'daddylive' ? (servers.length ? servers : ([...DL_SERVERS] as ServerOption[])) : [];
+  const hasServerChoices = player.kind === 'daddylive' ? serverOptions.length > 0 : alternates.length > 0;
   const canDataSaver =
     (player.kind === 'daddylive' && (tcCap || tcSeg)) ||
     (player.kind !== 'daddylive' && !!tcSrcRef.current && tcCap);
   /** heights offered on the data-saver ladder. Serverless segment ladder:
    *  144–480 ONLY — encoding 720/1080 runs slower than realtime on a
-   *  1-vCPU isolate, so those rungs became constant-loading traps for
-   *  anyone who picked one (2026-10-08 field report: "everything loads
-   *  since the last version; before it I watched an entire match without
-   *  loading"). Full 720p/1080p still reach the menu the SMOOTH ways: as
-   *  native hls levels when the source manifest carries them, and via the
-   *  "More qualities" alternate sources. The continuous relay (self-hosted)
-   *  keeps the full list — its ffmpeg pipeline handles any height. */
+   *  1-vCPU isolate, so those rungs became constant-loading traps. Full
+   *  720p/1080p still reach the menu the SMOOTH ways: as native hls levels
+   *  when the source manifest carries them, and via the "More qualities"
+   *  alternate sources. */
   const segLadder = player.kind === 'daddylive' && tcSeg && !tcRelayRef.current;
-  const dsHeights: readonly number[] = segLadder
-    ? ([144, 244, 360, 480] as const)
-    : DATA_SAVER_HEIGHTS;
+  const dsHeights: readonly number[] = segLadder ? [144, 244, 360, 480] : DATA_SAVER_HEIGHTS;
+  const familyAlt =
+    alternates.find((a) => a.sameChannel === false && a.ladder?.length) ||
+    alternates.find((a) => a.sameChannel === false);
+  /** transport line for the stats overlay — sampled live (refs, not state) */
+  const getTransportLabel = (): string => {
+    if (tcHeightRef.current !== null) return t('stats.dataSaver', { h: tcHeightRef.current });
+    if (player.kind === 'daddylive') {
+      const srv = serversRef.current.find((s) => s.id === activeServer) || DL_SERVERS.find((s) => s.id === activeServer);
+      return srv ? `${srv.label} · ${srv.host}` : 'DaddyLive';
+    }
+    return directPlayRef.current ? t('stats.directCdn') : t('stats.proxied');
+  };
+  const surfFmtAgo = (ts: number) => fmtAgo(ts, t);
 
   return (
     <div
       className="fixed inset-0 z-50 bg-black"
       role="dialog"
       aria-modal="true"
-      aria-label={`Player — ${player.name}`}
+      aria-label={t('player.playerFor', { name: player.name })}
       onMouseMove={poke}
       onTouchStart={poke}
     >
@@ -2090,19 +1685,9 @@ export function PlayerOverlay() {
         )}
       >
         {/* ── DaddyLive iframe embed ──────────────────────────────────────── */}
-        {/* When the resolved src is the daddyliveplayer.st embed URL, the
-            DaddyLive CDN's anti-bot can't be bypassed from a serverless IP.
-            Instead, iframe-embed the page directly. The iframe's JW Player
-            runs in the user's browser (residential IP) — the token + m3u8
-            fetches all happen from the user's IP with Origin set correctly
-            by the iframe's URL. daddy.php?id=N has no X-Frame-Options, so
-            embedding is allowed. */}
-        {nativeSrcRef.current?.startsWith('https://dlive.sx/stream/stream-') ||
-        nativeSrcRef.current?.startsWith('https://dlive.sx/watch.php?') ||
-        nativeSrcRef.current?.startsWith('https://daddyliveplayer.st/premiumtv/daddy.php?') ||
-        nativeSrcRef.current?.startsWith('https://dembed.st/premiumtv/daddy.php?') ? (
+        {isDlIframeSrc(nativeSrcRef.current) ? (
           <iframe
-            src={nativeSrcRef.current}
+            src={nativeSrcRef.current ?? ''}
             className="absolute inset-0 h-full w-full border-0"
             allow="autoplay; fullscreen; encrypted-media; picture-in-picture"
             allowFullScreen
@@ -2136,7 +1721,7 @@ export function PlayerOverlay() {
 
         {/* digit entry chip (Pluto-style channel numbers) */}
         {digits && (
-          <div className="absolute left-4 top-16 flex h-12 w-16 items-center justify-center rounded-xl border border-zilla-yellow/60 bg-black/80 text-2xl font-black text-zilla-yellow">
+          <div className="absolute start-4 top-16 flex h-12 w-16 items-center justify-center rounded-xl border border-zilla-yellow/60 bg-black/80 text-2xl font-black text-zilla-yellow">
             {digits}
           </div>
         )}
@@ -2148,6 +1733,17 @@ export function PlayerOverlay() {
           </div>
         )}
 
+        {/* ── stats overlay ("stats for nerds") ─────────────────────────── */}
+        <StatsOverlay
+          t={t}
+          open={showStats && controlsVisible}
+          isDaddyLive={player.kind === 'daddylive'}
+          getTransportLabel={getTransportLabel}
+          hlsRef={hlsRef}
+          videoRef={videoRef}
+          onClose={() => setShowStats(false)}
+        />
+
         {/* ── top gradient bar ──────────────────────────────────────────────────── */}
         <div
           className={cn(
@@ -2158,7 +1754,7 @@ export function PlayerOverlay() {
           <div className="flex items-start justify-between gap-3">
             <div className="flex min-w-0 items-center gap-3">
               <span className="inline-flex shrink-0 items-center gap-1 rounded-md bg-zilla-red px-2 py-1 text-[11px] font-black uppercase tracking-wide text-white">
-                <span className="live-dot h-1.5 w-1.5 rounded-full bg-white" /> Live
+                <span className="live-dot h-1.5 w-1.5 rounded-full bg-white" /> {t('common.live')}
               </span>
               <div className="min-w-0">
                 <h2 className="truncate text-base font-extrabold text-white drop-shadow sm:text-lg">
@@ -2177,14 +1773,12 @@ export function PlayerOverlay() {
                 <button
                   onClick={cycleFeed}
                   className="flex h-9 items-center gap-1.5 rounded-full border border-white/15 bg-black/50 px-3 text-[11px] font-black uppercase text-white/85 backdrop-blur transition-colors hover:text-white"
-                  title={`Switch feed — ${altFeeds.length} feeds for this event`}
-                  aria-label="Switch to the next feed for this event"
+                  title={t('player.switchFeedTitle', { n: altFeeds.length })}
+                  aria-label={t('player.switchFeed')}
                 >
-                  <svg viewBox="0 0 24 24" className="h-3.5 w-3.5 fill-current" aria-hidden>
-                    <path d="M7 7h10v3l4-4-4-4v3H5v6h2V7zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2v4z" />
-                  </svg>
+                  <span className="h-3.5 w-3.5">{Icon.swap}</span>
                   <span className="hidden sm:inline">
-                    Feed {altFeeds.findIndex((f) => f.id === player.id) + 1}/{altFeeds.length}
+                    {t('player.feed', { i: altFeeds.findIndex((f) => f.id === player.id) + 1, n: altFeeds.length })}
                   </span>
                 </button>
               )}
@@ -2194,16 +1788,16 @@ export function PlayerOverlay() {
                   'flex h-9 w-9 items-center justify-center rounded-full border border-white/15 bg-black/50 backdrop-blur transition-colors',
                   isFav ? 'text-zilla-yellow' : 'text-white/70 hover:text-white'
                 )}
-                title="Favorite (adds to Your favorites)"
-                aria-label="Toggle favorite"
+                title={t('player.favorite')}
+                aria-label={t('player.favorite')}
               >
                 <span className="h-4 w-4">{Icon.star}</span>
               </button>
               <button
                 onClick={() => void share()}
                 className="flex h-9 w-9 items-center justify-center rounded-full border border-white/15 bg-black/50 text-white/70 backdrop-blur transition-colors hover:text-white"
-                title="Copy share link"
-                aria-label="Share channel"
+                title={t('player.share')}
+                aria-label={t('player.share')}
               >
                 <span className="h-4 w-4">{Icon.share}</span>
               </button>
@@ -2215,148 +1809,54 @@ export function PlayerOverlay() {
                     setShowServersMenu(false);
                   }}
                   className="flex h-9 items-center gap-1 rounded-full border border-white/15 bg-black/50 px-3 text-[11px] font-black uppercase text-white/85 backdrop-blur transition-colors hover:text-white"
-                  title="Video quality"
-                  aria-label="Video quality"
+                  title={t('player.quality')}
+                  aria-label={t('player.quality')}
                 >
                   {qualityLabel}
                 </button>
                 {showQualityMenu && (
-                  <div className="styled-scrollbar absolute right-0 top-11 max-h-[70vh] w-48 overflow-y-auto rounded-xl border border-zilla-line bg-zilla-bg/95 shadow-2xl backdrop-blur">
-                    <p className="border-b border-zilla-line/60 px-3.5 py-2 text-[9px] font-black uppercase tracking-widest text-zilla-dim">
-                      Stream quality
-                    </p>
-                    <button
-                      onClick={() => setLevel(-1)}
-                      className={cn(
-                        'flex w-full items-center justify-between px-3.5 py-2.5 text-xs font-bold transition-colors hover:bg-white/10',
-                        currentQuality === -1 && tcHeight === null ? 'text-zilla-yellow' : 'text-zilla-text'
-                      )}
-                    >
-                      Auto {currentQuality === -1 && tcHeight === null && <span>✓</span>}
-                    </button>
-                    <p className="px-3.5 pb-1.5 text-[10px] font-medium leading-snug text-zilla-dim">
-                      Picks the most stable quality for your connection — starts safe, climbs when the
-                      link proves it can hold more, drops instantly on stalls.
-                    </p>
-                    {quality.map((q) => (
-                      <button
-                        key={q.level}
-                        onClick={() => setLevel(q.level)}
-                        className={cn(
-                          'flex w-full items-center justify-between px-3.5 py-2.5 text-xs font-bold transition-colors hover:bg-white/10',
-                          currentQuality === q.level && tcHeight === null ? 'text-zilla-yellow' : 'text-zilla-text'
-                        )}
-                      >
-                        {q.label} {currentQuality === q.level && tcHeight === null && <span>✓</span>}
-                      </button>
-                    ))}
-                    {singleQuality && ladderRungs.length === 0 && (
-                      <p className="px-3.5 py-1.5 text-[10px] font-medium leading-snug text-zilla-dim">
-                        This channel's provider serves a single quality. When another source carries it
-                        with a real ladder, its rungs appear here automatically.
-                      </p>
-                    )}
-
-                    {ladderAlt && ladderRungs.length > 0 && (
-                      <>
-                        <p className="border-t border-zilla-line/60 px-3.5 py-2 text-[9px] font-black uppercase tracking-widest text-zilla-dim">
-                          More qualities · via {ladderAlt.sourceName}
-                        </p>
-                        {ladderRungs
-                          .slice()
-                          .reverse()
-                          .map((h) => (
-                            <button
-                              key={`${ladderAlt.id}-${h}`}
-                              onClick={() => pickAltRung(ladderAlt, h)}
-                              className="flex w-full items-center justify-between px-3.5 py-2.5 text-xs font-bold text-zilla-text transition-colors hover:bg-white/10"
-                            >
-                              <span>
-                                {h}p
-                                {RUNG_HINTS[h] && (
-                                  <span className="ml-1.5 text-[9px] font-bold text-zilla-dim">{RUNG_HINTS[h]}</span>
-                                )}
-                              </span>
-                              <span className="text-[9px] font-bold text-zilla-dim">{ladderAlt.sourceName}</span>
-                            </button>
-                          ))}
-                        <p className="px-3.5 py-2 text-[10px] font-medium leading-snug text-zilla-dim">
-                          Same channel on {ladderAlt.sourceName}, with a real quality ladder — picking a
-                          rung switches there and pins your choice.
-                        </p>
-                      </>
-                    )}
-
-                    {(player.kind === 'daddylive' || !!tcSrcRef.current) && !canDataSaver && ladderRungs.length === 0 && (
-                      <>
-                        <p className="border-t border-zilla-line/60 px-3.5 py-2 text-[9px] font-black uppercase tracking-widest text-zilla-dim">
-                          Quality ladder · Data saver
-                        </p>
-                        <p className="px-3.5 pb-2 pt-1 text-[10px] font-medium leading-snug text-zilla-dim">
-                          Real-time re-encoding isn't available on this hosting — multi-quality comes from
-                          the source ladders above instead.
-                        </p>
-                      </>
-                    )}
-
-                    {canDataSaver && (
-                      <>
-                        <p className="border-t border-zilla-line/60 px-3.5 py-2 text-[9px] font-black uppercase tracking-widest text-zilla-dim">
-                          Quality ladder · Data saver
-                        </p>
-                        {dsHeights.map((h) => (
-                          <button
-                            key={h}
-                            onClick={() => selectDataSaver(h)}
-                            className={cn(
-                              'flex w-full items-center justify-between px-3.5 py-2.5 text-xs font-bold transition-colors hover:bg-white/10',
-                              tcHeight === h ? 'text-zilla-yellow' : 'text-zilla-text'
-                            )}
-                          >
-                            <span>
-                              {h}p
-                              {RUNG_HINTS[h] && (
-                                <span className="ml-1.5 text-[9px] font-bold text-zilla-dim">{RUNG_HINTS[h]}</span>
-                              )}
-                            </span>
-                            {tcHeight === h && <span>✓</span>}
-                          </button>
-                        ))}
-                        {tcHeight !== null && (
-                          <button
-                            onClick={() => setLevel(-1)}
-                            className="w-full px-3.5 py-2 text-left text-[10px] font-bold text-zilla-yellow/80 transition-colors hover:text-zilla-yellow"
-                          >
-                            ← back to the native feed
-                          </button>
-                        )}
-                        <p className="px-3.5 py-2 text-[10px] font-medium leading-snug text-zilla-dim">
-                          {segLadder
-                            ? 'Re-encoded live to save bandwidth — built for slow connections. Full 720p/1080p plays natively whenever the source carries them.'
-                            : 'Any height, re-encoded in real time to save bandwidth — perfect for slow connections or capping quality.'}
-                        </p>
-                      </>
-                    )}
-
-                    <p className="border-t border-zilla-line/60 px-3.5 py-2 text-[10px] font-medium leading-snug text-zilla-dim">
-                      Your choice is saved and applied to every channel.
-                    </p>
-                  </div>
+                  <QualityMenu
+                    t={t}
+                    quality={quality}
+                    currentQuality={currentQuality}
+                    tcHeight={tcHeight}
+                    canDataSaver={canDataSaver}
+                    dsHeights={dsHeights}
+                    ladderAlt={ladderAlt}
+                    ladderRungs={ladderRungs}
+                    singleQuality={singleQuality}
+                    segLadder={segLadder}
+                    canLadderTranscode={player.kind === 'daddylive' || !!tcSrcRef.current}
+                    onSetLevel={setLevel}
+                    onSelectDataSaver={(h) => selectDataSaver(h)}
+                    onPickAltRung={pickAltRung}
+                  />
                 )}
               </div>
               <button
+                onClick={() => setShowStats((v) => !v)}
+                className={cn(
+                  'flex h-9 w-9 items-center justify-center rounded-full border border-white/15 bg-black/50 backdrop-blur transition-colors',
+                  showStats ? 'text-zilla-yellow' : 'text-white/70 hover:text-white'
+                )}
+                title={t('stats.open')}
+                aria-label={t('stats.open')}
+              >
+                <span className="h-4 w-4">{Icon.stats}</span>
+              </button>
+              <button
                 onClick={() => void togglePip()}
                 className="hidden h-9 w-9 items-center justify-center rounded-full border border-white/15 bg-black/50 text-white/70 backdrop-blur transition-colors hover:text-white sm:flex"
-                title="Picture-in-picture (P)"
-                aria-label="Picture in picture"
+                title={t('player.pipLabel')}
+                aria-label={t('player.pipLabel')}
               >
                 <span className="h-4 w-4">{Icon.pip}</span>
               </button>
               <button
                 onClick={closePlayer}
                 className="flex h-9 w-9 items-center justify-center rounded-full bg-zilla-yellow text-black transition-transform hover:scale-105"
-                title="Close (Esc)"
-                aria-label="Close player"
+                title={t('player.closePlayer')}
+                aria-label={t('player.closePlayer')}
               >
                 <span className="h-4.5 w-4.5">{Icon.close}</span>
               </button>
@@ -2364,196 +1864,36 @@ export function PlayerOverlay() {
           </div>
         </div>
 
-        {/* ── state overlays (resolving / loading) ─────────────────────────────── */}
-        {(phase === 'resolving' || phase === 'loading') && (
-          <div className="pointer-events-none absolute inset-0 z-10 flex flex-col items-center justify-center gap-3 bg-black/60">
-            <div className="h-12 w-12 animate-spin rounded-full border-[3px] border-white/15 border-t-zilla-yellow" />
-            <p className="text-sm font-bold text-white/70">
-              {phase === 'resolving' ? 'Resolving stream…' : 'Buffering…'}
-            </p>
-            <button
-              onClick={closePlayer}
-              className="pointer-events-auto mt-1 rounded-full border border-white/25 bg-white/10 px-5 py-2 text-[11px] font-black uppercase tracking-wide text-white transition-colors hover:bg-white/20"
-            >
-              Cancel
-            </button>
-          </div>
-        )}
+        {/* ── state overlays (resolving / loading / off-air / error / HEVC) ── */}
+        <StateOverlays
+          t={t}
+          phase={phase}
+          errorMsg={errorMsg}
+          autoAdvSecs={autoAdvSecs}
+          nextName={nextChannel()?.name}
+          hasServerChoices={hasServerChoices}
+          altFeedsCount={altFeeds.length}
+          familyAlt={familyAlt}
+          hevcBlock={hevcBlock}
+          canSegLadder={player.kind === 'daddylive' && tcSeg}
+          mismatch={mismatch}
+          onCancelAutoAdv={() => cancelAutoAdvRef.current?.()}
+          onRetry={retryStream}
+          onOpenServers={() => {
+            setShowServersMenu(true);
+            setSurfOpen(false);
+            setShowQualityMenu(false);
+          }}
+          onBrowse={() => setSurfOpen(true)}
+          onClose={closePlayer}
+          onSelectDataSaver480={() => selectDataSaver(480)}
+          onSwitchAlternate={switchAlternate}
+          onPlayHevcAnyway={playHevcAnyway}
+          onSwitchFeed={cycleFeed}
+          onDismissMismatch={() => setMismatch(null)}
+        />
 
-        {(phase === 'offair' || phase === 'error') && (
-          <div
-            className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-4 bg-black/85 px-6 text-center"
-            onPointerDown={() => cancelAutoAdvRef.current?.()}
-          >
-            <div
-              className={cn(
-                'flex h-14 w-14 items-center justify-center rounded-full',
-                phase === 'offair' ? 'bg-zilla-yellow/15 text-zilla-yellow' : 'bg-zilla-red/20 text-zilla-red'
-              )}
-            >
-              {phase === 'offair' ? (
-                <svg viewBox="0 0 24 24" className="h-7 w-7 fill-current" aria-hidden>
-                  <path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm1 5h-2v6h2V7zm0 8h-2v2h2v-2z" />
-                </svg>
-              ) : (
-                <svg viewBox="0 0 24 24" className="h-7 w-7 fill-current" aria-hidden>
-                  <path d="M12 2 1 21h22L12 2zm1 14h-2v2h2v-2zm0-7h-2v5h2V9z" />
-                </svg>
-              )}
-            </div>
-            <div>
-              <p className="text-base font-extrabold text-white">
-                {phase === 'offair' ? 'This channel is off-air right now' : 'Stream unavailable'}
-              </p>
-              <p className="mx-auto mt-1 max-w-md text-sm font-medium text-white/60">
-                {phase === 'offair'
-                  ? '24/7 feeds activate when their live event starts. Surf to another channel —'
-                  : errorMsg || 'The channel may be geo-blocked from your region.'}
-              </p>
-              {autoAdvSecs !== null && (
-                <p className="mt-2 text-sm font-black text-zilla-yellow">
-                  Up next in {autoAdvSecs}s — {nextChannel()?.name}
-                </p>
-              )}
-            </div>
-            <div className="flex flex-wrap items-center justify-center gap-2">
-              <button
-                onClick={retryStream}
-                className="rounded-full bg-zilla-yellow px-5 py-2.5 text-xs font-black uppercase tracking-wide text-black hover:bg-zilla-yellow-soft"
-              >
-                Retry
-              </button>
-              {/* related family feed — an EXPLICIT choice (labeled as a different
-                  channel), never an automatic hop that silently swaps channels */}
-              {(() => {
-                const fam =
-                  alternates.find((a) => a.sameChannel === false && a.ladder?.length) ||
-                  alternates.find((a) => a.sameChannel === false);
-                return fam ? (
-                  <button
-                    onClick={() => switchAlternate(fam)}
-                    className="rounded-full border border-zilla-yellow/50 bg-zilla-yellow/10 px-5 py-2.5 text-xs font-black uppercase tracking-wide text-zilla-yellow hover:bg-zilla-yellow/20"
-                    title={`A related channel from the same network — not ${player.name}`}
-                  >
-                    Watch {fam.name} instead
-                  </button>
-                ) : null;
-              })()}
-              {hasServerChoices && (
-                <button
-                  onClick={() => {
-                    setShowServersMenu(true);
-                    setSurfOpen(false);
-                    setShowQualityMenu(false);
-                  }}
-                  className="rounded-full border border-white/25 bg-white/10 px-5 py-2.5 text-xs font-black uppercase tracking-wide text-white hover:bg-white/20"
-                >
-                  Switch server
-                </button>
-              )}
-              {autoAdvSecs !== null && (
-                <button
-                  onClick={() => cancelAutoAdvRef.current?.()}
-                  className="rounded-full border border-white/25 bg-white/10 px-5 py-2.5 text-xs font-black uppercase tracking-wide text-white hover:bg-white/20"
-                >
-                  Cancel auto-switch
-                </button>
-              )}
-              <button
-                onClick={() => setSurfOpen(true)}
-                className="rounded-full border border-white/25 bg-white/10 px-5 py-2.5 text-xs font-black uppercase tracking-wide text-white hover:bg-white/20"
-              >
-                Browse channels
-              </button>
-              {altFeeds.length > 1 && (
-                <button
-                  onClick={() => setSurfOpen(true)}
-                  className="rounded-full border border-white/25 bg-white/10 px-5 py-2.5 text-xs font-black uppercase tracking-wide text-white hover:bg-white/20"
-                >
-                  Try another feed ({altFeeds.length})
-                </button>
-              )}
-              <button
-                onClick={closePlayer}
-                className="rounded-full border border-white/25 bg-white/10 px-5 py-2.5 text-xs font-black uppercase tracking-wide text-white hover:bg-white/20"
-              >
-                Close
-              </button>
-            </div>
-          </div>
-        )}
-
-        {/* ── HEVC-phase choice panel ─────────────────────────────────────
-            The channel is LIVE but broadcasting in a codec this browser can't
-            decode. Never a silent swap onto a related feed — the user picks. */}
-        {hevcBlock && phase === 'hevc' && (
-          <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-4 bg-black/88 px-6 text-center">
-            <div className="flex h-14 w-14 items-center justify-center rounded-full bg-zilla-yellow/15 text-zilla-yellow">
-              <svg viewBox="0 0 24 24" className="h-7 w-7 fill-current" aria-hidden>
-                <path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm1 5h-2v6h2V7zm0 8h-2v2h2v-2z" />
-              </svg>
-            </div>
-            <div>
-              <p className="text-base font-extrabold text-white">
-                {player.name} is live — in a format this browser can&apos;t play
-              </p>
-              <p className="mx-auto mt-1 max-w-md text-sm font-medium text-white/60">
-                The channel is currently broadcasting in HEVC (a modern video codec). Play it
-                converted to 480p right here, or open MaxTV in Safari, Edge, or on a phone — those
-                play it natively.
-              </p>
-            </div>
-            <div className="flex flex-wrap items-center justify-center gap-2">
-              {player.kind === 'daddylive' && tcSeg && (
-                <button
-                  onClick={() => selectDataSaver(480)}
-                  className="rounded-full bg-emerald-400 px-5 py-2.5 text-xs font-black uppercase tracking-wide text-black hover:bg-emerald-300"
-                  title="The server converts this channel to H.264 at 480p in real time — same channel, same content"
-                >
-                  Play at 480p
-                  <span className="ml-1.5 font-bold normal-case tracking-normal opacity-70">
-                    (converted)
-                  </span>
-                </button>
-              )}
-              {hevcBlock.family && (
-                <button
-                  onClick={() => switchAlternate(hevcBlock.family!)}
-                  className="rounded-full bg-zilla-yellow px-5 py-2.5 text-xs font-black uppercase tracking-wide text-black hover:bg-zilla-yellow-soft"
-                  title={`A related free channel from the same network — not ${player.name}`}
-                >
-                  Watch {hevcBlock.family.name} instead
-                  <span className="ml-1.5 font-bold normal-case tracking-normal opacity-70">
-                    (different channel)
-                  </span>
-                </button>
-              )}
-              <button
-                onClick={playHevcAnyway}
-                className="rounded-full border border-white/25 bg-white/10 px-5 py-2.5 text-xs font-black uppercase tracking-wide text-white hover:bg-white/20"
-              >
-                Try playing anyway
-              </button>
-              <button
-                onClick={retryStream}
-                className="rounded-full border border-white/25 bg-white/10 px-5 py-2.5 text-xs font-black uppercase tracking-wide text-white hover:bg-white/20"
-              >
-                Retry
-              </button>
-              <button
-                onClick={closePlayer}
-                className="rounded-full border border-white/25 bg-white/10 px-5 py-2.5 text-xs font-black uppercase tracking-wide text-white hover:bg-white/20"
-              >
-                Close
-              </button>
-            </div>
-          </div>
-        )}
-
-        {/* tap for sound — z-30 sits it ABOVE the bottom control bar (whose
-            ~120px gradient box used to swallow taps on the lower half of this
-            button — “the tap for sound button doesn't work”); bottom-32 lifts
-            it fully clear of the bar so every pixel is tappable */}
+        {/* tap for sound — z-30 above the bottom bar; bottom-32 clears the bar */}
         {phase === 'playing' && muted && controlsVisible && (
           <button
             onClick={() => {
@@ -2565,72 +1905,17 @@ export function PlayerOverlay() {
             }}
             className="absolute bottom-32 left-1/2 z-30 -translate-x-1/2 rounded-full bg-zilla-yellow px-6 py-3 text-xs font-black uppercase tracking-wide text-black shadow-2xl transition-transform hover:scale-105 hover:bg-zilla-yellow-soft"
           >
-            Tap for sound
+            {t('player.tapSound')}
           </button>
-        )}
-
-        {/* content-mismatch banner — “this feed is showing motorsport” (z-30:
-            the top bar's gradient box must not swallow its buttons) */}
-        {mismatch && phase === 'playing' && (
-          <div className="absolute left-1/2 top-16 z-30 w-[92vw] max-w-lg -translate-x-1/2 rounded-xl border border-zilla-yellow/40 bg-black/90 p-3.5 shadow-2xl backdrop-blur">
-            <div className="flex items-start gap-3">
-              <span className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-zilla-yellow/15 text-zilla-yellow">
-                <svg viewBox="0 0 24 24" className="h-4 w-4 fill-current" aria-hidden>
-                  <path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm1 5h-2v6h2V7zm0 8h-2v2h2v-2z" />
-                </svg>
-              </span>
-              <div className="min-w-0 flex-1">
-                <p className="text-xs font-extrabold text-zilla-text">
-                  This feed is showing {mismatch.sport.replace(/_/g, ' ')} right now
-                </p>
-                <p className="mt-0.5 text-[11px] font-medium text-zilla-dim">
-                  Network channels sometimes preempt matches. Hop to another feed for this event.
-                </p>
-                <div className="mt-2 flex flex-wrap gap-2">
-                  {altFeeds.length > 1 ? (
-                    <button
-                      onClick={cycleFeed}
-                      className="rounded-full bg-zilla-yellow px-4 py-1.5 text-[11px] font-black uppercase tracking-wide text-black hover:bg-zilla-yellow-soft"
-                    >
-                      Switch feed
-                    </button>
-                  ) : (
-                    <button
-                      onClick={() => {
-                        setMismatch(null);
-                        setSurfOpen(true);
-                      }}
-                      className="rounded-full bg-zilla-yellow px-4 py-1.5 text-[11px] font-black uppercase tracking-wide text-black hover:bg-zilla-yellow-soft"
-                    >
-                      Browse channels
-                    </button>
-                  )}
-                  <button
-                    onClick={() => setMismatch(null)}
-                    className="rounded-full border border-white/20 bg-white/10 px-4 py-1.5 text-[11px] font-black uppercase tracking-wide text-white/80 hover:bg-white/20"
-                  >
-                    Keep watching
-                  </button>
-                </div>
-              </div>
-              <button
-                onClick={() => setMismatch(null)}
-                className="shrink-0 rounded-full p-1 text-zilla-dim hover:text-zilla-text"
-                aria-label="Dismiss"
-              >
-                <span className="h-3.5 w-3.5">{Icon.close}</span>
-              </button>
-            </div>
-          </div>
         )}
 
         {/* go-live chip (behind the live edge) */}
         {phase === 'playing' && liveBehind && (
           <button
             onClick={goLive}
-            className="absolute right-4 top-20 z-30 flex items-center gap-1.5 rounded-full bg-zilla-red px-3.5 py-2 text-[11px] font-black uppercase tracking-wide text-white shadow-xl"
+            className="absolute end-4 top-20 z-30 flex items-center gap-1.5 rounded-full bg-zilla-red px-3.5 py-2 text-[11px] font-black uppercase tracking-wide text-white shadow-xl"
           >
-            <span className="live-dot h-1.5 w-1.5 rounded-full bg-white" /> Go live
+            <span className="live-dot h-1.5 w-1.5 rounded-full bg-white" /> {t('player.goLive')}
           </button>
         )}
 
@@ -2644,10 +1929,10 @@ export function PlayerOverlay() {
           {/* live progress line */}
           <div className="mb-3 flex items-center gap-3">
             <div className="relative h-1 flex-1 overflow-hidden rounded-full bg-white/15">
-              <div className="absolute inset-y-0 left-0 w-full bg-gradient-to-r from-zilla-red to-zilla-yellow" />
+              <div className="absolute inset-y-0 start-0 w-full bg-gradient-to-r from-zilla-red to-zilla-yellow" />
             </div>
             <span className="shrink-0 text-[10px] font-black uppercase tracking-widest text-zilla-red">
-              ● live
+              ● {t('common.live')}
             </span>
           </div>
 
@@ -2656,24 +1941,24 @@ export function PlayerOverlay() {
               <button
                 onClick={togglePlay}
                 className="flex h-10 w-10 items-center justify-center rounded-full bg-white/10 text-white transition-colors hover:bg-white/20"
-                title="Play / pause (Space)"
-                aria-label="Play or pause"
+                title={t('player.playPause')}
+                aria-label={t('player.playPause')}
               >
                 <span className="h-4.5 w-4.5">{phase === 'playing' ? Icon.pause : Icon.play}</span>
               </button>
               <button
                 onClick={zapPrev}
                 className="flex h-10 w-10 items-center justify-center rounded-full bg-white/10 text-white transition-colors hover:bg-white/20"
-                title="Previous channel (←)"
-                aria-label="Previous channel"
+                title={t('player.prevChannel')}
+                aria-label={t('player.prevChannel')}
               >
                 <span className="h-4.5 w-4.5">{Icon.prev}</span>
               </button>
               <button
                 onClick={zapNext}
                 className="flex h-10 w-10 items-center justify-center rounded-full bg-white/10 text-white transition-colors hover:bg-white/20"
-                title="Next channel (→)"
-                aria-label="Next channel"
+                title={t('player.nextChannel')}
+                aria-label={t('player.nextChannel')}
               >
                 <span className="h-4.5 w-4.5">{Icon.next}</span>
               </button>
@@ -2683,8 +1968,8 @@ export function PlayerOverlay() {
                 <button
                   onClick={toggleMute}
                   className="flex h-10 w-10 items-center justify-center rounded-full text-white/85 transition-colors hover:text-white"
-                  title="Mute (M)"
-                  aria-label="Toggle mute"
+                  title={t('player.toggleMute')}
+                  aria-label={t('player.toggleMute')}
                 >
                   <span className="h-5 w-5">{muted || volume === 0 ? Icon.volumeOff : Icon.volumeHi}</span>
                 </button>
@@ -2711,9 +1996,8 @@ export function PlayerOverlay() {
                     }
                   }}
                   onPointerUp={() => {
-                    // a tap on the far-left of the slider sets 0 → muted; a
-                    // SECOND tap slightly right must audibly unmute (and a
-                    // drag straight back from 0 lifts the mute live)
+                    // a second tap slightly right of a 0-volume tap must
+                    // audibly unmute (a drag back from 0 lifts the mute live)
                     const v = videoRef.current;
                     if (v && v.volume > 0 && v.muted) {
                       v.muted = false;
@@ -2722,7 +2006,7 @@ export function PlayerOverlay() {
                   }}
                   style={{ ['--fill' as string]: `${(muted ? 0 : volume) * 100}%` }}
                   className="slider-zilla w-0 opacity-0 transition-all duration-300 group-hover:w-24 group-hover:opacity-100 sm:w-16 sm:opacity-100"
-                  aria-label="Volume"
+                  aria-label={t('player.volume')}
                 />
               </div>
             </div>
@@ -2740,205 +2024,26 @@ export function PlayerOverlay() {
                     'flex h-10 items-center gap-2 rounded-full px-4 text-[11px] font-black uppercase tracking-wide transition-colors',
                     showServersMenu ? 'bg-zilla-yellow text-black' : 'bg-white/10 text-white hover:bg-white/20'
                   )}
-                  title="Switch streaming server (S)"
-                  aria-label="Switch streaming server"
+                  title={t('player.switchServerTitle')}
+                  aria-label={t('player.switchServerTitle')}
                 >
                   <span className="h-4 w-4">{Icon.server}</span>
-                  Servers
+                  {t('player.servers')}
                 </button>
                 {showServersMenu && (
-                  <div className="absolute bottom-12 right-0 w-72 max-w-[86vw] overflow-hidden rounded-xl border border-zilla-line bg-zilla-bg/97 shadow-2xl backdrop-blur">
-                    <p className="border-b border-zilla-line/60 px-4 py-2.5 text-[9px] font-black uppercase tracking-widest text-zilla-dim">
-                      Streaming servers
-                      {player.kind === 'daddylive'
-                        ? ` · ${serverOptions.length + Math.max(0, alternates.length)} available`
-                        : ` · ${1 + alternates.length} available`}
-                    </p>
-                    <div className="styled-scrollbar max-h-72 overflow-y-auto">
-                      {player.kind === 'daddylive' ? (
-                        <>
-                          {altUrl && (
-                            <button
-                              onClick={backToLiveServers}
-                              className="flex w-full items-center gap-2 border-b border-zilla-line/60 px-4 py-2.5 text-left transition-colors hover:bg-white/5"
-                            >
-                              <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-white/10 text-[10px] font-black text-zilla-dim">
-                                ↩
-                              </span>
-                              <span className="min-w-0 flex-1">
-                                <span className="block truncate text-xs font-bold text-zilla-yellow">
-                                  Back to live servers
-                                </span>
-                                <span className="block truncate text-[10px] font-medium text-zilla-dim">
-                                  {player.name} · DaddyLive transports
-                                </span>
-                              </span>
-                            </button>
-                          )}
-                          {serverOptions.map((s) => {
-                            const isActive = (altUrl === null || altUrl === undefined) && (activeServer === s.id || (!s.id && activeServer === s.host));
-                            return (
-                              <button
-                                key={s.id}
-                                onClick={() => switchServer(s.id)}
-                                className={cn(
-                                  'flex w-full items-center gap-3 px-4 py-2.5 text-left transition-colors hover:bg-white/5',
-                                  isActive && 'bg-zilla-yellow/10'
-                                )}
-                              >
-                                <span
-                                  className={cn(
-                                    'flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-[10px] font-black',
-                                    isActive ? 'bg-zilla-yellow text-black' : 'bg-white/10 text-zilla-dim'
-                                  )}
-                                >
-                                  {s.label.replace(/\D/g, '') || '•'}
-                                </span>
-                                <span className="min-w-0 flex-1">
-                                  <span
-                                    className={cn(
-                                      'block truncate text-xs font-bold',
-                                      isActive ? 'text-zilla-yellow' : 'text-zilla-text'
-                                    )}
-                                  >
-                                    {s.label}
-                                  </span>
-                                  <span className="block truncate text-[10px] font-medium text-zilla-dim">{s.host}</span>
-                                </span>
-                                {isActive && (
-                                  <span className="shrink-0 rounded-full bg-zilla-yellow/20 px-2 py-0.5 text-[9px] font-black uppercase text-zilla-yellow">
-                                    active
-                                  </span>
-                                )}
-                              </button>
-                            );
-                          })}
-                          {alternates.length > 0 && (
-                            <>
-                              <p className="border-y border-zilla-line/60 bg-white/[0.03] px-4 py-2 text-[9px] font-black uppercase tracking-widest text-zilla-dim">
-                                More sources · multi-quality
-                              </p>
-                              {alternates.map((alt) => {
-                                const isActive = altUrl === alt.url;
-                                return (
-                                  <button
-                                    key={alt.id}
-                                    onClick={() => switchAlternate(alt)}
-                                    className={cn(
-                                      'flex w-full items-center gap-3 px-4 py-2.5 text-left transition-colors hover:bg-white/5',
-                                      isActive && 'bg-zilla-yellow/10'
-                                    )}
-                                  >
-                                    {alt.logo ? (
-                                      <img
-                                        src={logoSrc(alt.logo, alt.name)}
-                                        alt=""
-                                        loading="lazy"
-                                        className="h-7 w-11 shrink-0 rounded object-contain"
-                                      />
-                                    ) : (
-                                      <span className="flex h-7 w-11 shrink-0 items-center justify-center rounded bg-white/5 text-[10px] font-black text-zilla-dim">
-                                        TV
-                                      </span>
-                                    )}
-                                    <span className="min-w-0 flex-1">
-                                      <span className="block truncate text-xs font-bold text-zilla-text">
-                                        {alt.sourceName}
-                                        {isActive && <span className="ml-1.5 text-zilla-yellow">· playing</span>}
-                                      </span>
-                                      <span className="block truncate text-[10px] font-medium text-zilla-dim">
-                                        {alt.name}
-                                        {alt.sameChannel === false
-                                          ? ' · different feed'
-                                          : alt.ladder?.length
-                                            ? ` · ${alt.ladder[0]}–${alt.ladder[alt.ladder.length - 1]}p ladder`
-                                            : alt.source === 'worldsports'
-                                              ? ' · real quality ladder'
-                                              : ''}
-                                      </span>
-                                    </span>
-                                    {alt.sameChannel === false ? (
-                                      <span className="shrink-0 rounded-full bg-white/10 px-2 py-0.5 text-[9px] font-black uppercase text-zilla-dim">
-                                        other feed
-                                      </span>
-                                    ) : (
-                                      (alt.ladder?.length || alt.source === 'worldsports') && (
-                                        <span className="shrink-0 rounded-full bg-zilla-yellow/15 px-2 py-0.5 text-[9px] font-black uppercase text-zilla-yellow/90">
-                                          {alt.ladder?.length
-                                            ? `${alt.ladder[0]}–${alt.ladder[alt.ladder.length - 1]}p`
-                                            : 'HD↑'}
-                                        </span>
-                                      )
-                                    )}
-                                  </button>
-                                );
-                              })}
-                            </>
-                          )}
-                          <p className="px-4 py-2 text-[10px] font-medium leading-snug text-zilla-dim">
-                            Server 1 (Smart cache) pre-buffers the stream through MaxTV — the smoothest
-                            ride, and the default on cloud hosting. Server 2 (Direct CDN) streams
-                            straight through with no middle layer; Edge direct skips mirror parsing for
-                            the lowest latency.
-                            {alternates.length > 0
-                              ? ' Sources under “More sources” carry this channel elsewhere — same-channel ones also lend their quality rungs to the quality menu; entries marked “other feed” are related channels.'
-                              : ' DaddyLive streams ship a single quality; pick a multi-quality source when one appears here.'}
-                          </p>
-                        </>
-                      ) : (
-                        <>
-                          <div className="flex w-full items-center gap-3 px-4 py-2.5">
-                            <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-zilla-yellow text-[10px] font-black text-black">
-                              ●
-                            </span>
-                            <span className="min-w-0 flex-1">
-                              <span className="block truncate text-xs font-bold text-zilla-yellow">
-                                {player.source || 'Current source'}
-                              </span>
-                              <span className="block truncate text-[10px] font-medium text-zilla-dim">Playing now</span>
-                            </span>
-                          </div>
-                          {alternates.map((alt, ai) => {
-                            const sameSource = alt.sourceName === (player.source || '');
-                            return (
-                              <button
-                                key={alt.id}
-                                onClick={() => switchAlternate(alt)}
-                                className="flex w-full items-center gap-3 px-4 py-2.5 text-left transition-colors hover:bg-white/5"
-                              >
-                                {alt.logo ? (
-                                  <img
-                                    src={logoSrc(alt.logo, alt.name)}
-                                    alt=""
-                                    loading="lazy"
-                                    className="h-7 w-11 shrink-0 rounded object-contain"
-                                  />
-                                ) : (
-                                  <span className="flex h-7 w-11 shrink-0 items-center justify-center rounded bg-white/5 text-[10px] font-black text-zilla-dim">
-                                    TV
-                                  </span>
-                                )}
-                                <span className="min-w-0 flex-1">
-                                  <span className="block truncate text-xs font-bold text-zilla-text">
-                                    {sameSource ? `Alternate stream ${ai + 2}` : alt.sourceName}
-                                  </span>
-                                  <span className="block truncate text-[10px] font-medium text-zilla-dim">
-                                    {sameSource ? 'Same channel, different stream URL' : alt.name}
-                                    {alt.health === 'ok' ? ' · healthy' : alt.health === 'geo' ? ' · may be geo-blocked' : ''}
-                                  </span>
-                                </span>
-                              </button>
-                            );
-                          })}
-                          {alternates.length === 0 && (
-                            <p className="px-4 py-3 text-[10px] font-medium leading-snug text-zilla-dim">
-                              No other source carries this channel right now.
-                            </p>
-                          )}
-                        </>
-                      )}
-                    </div>
-                  </div>
+                  <ServersMenu
+                    t={t}
+                    isDaddylive={player.kind === 'daddylive'}
+                    serverOptions={serverOptions}
+                    alternates={alternates}
+                    activeServer={activeServer}
+                    altUrl={altUrl}
+                    channelName={player.name}
+                    channelSource={player.source}
+                    onSwitchServer={switchServer}
+                    onSwitchAlternate={switchAlternate}
+                    onBackToLiveServers={backToLiveServers}
+                  />
                 )}
               </div>
 
@@ -2953,17 +2058,17 @@ export function PlayerOverlay() {
                   'flex h-10 items-center gap-2 rounded-full px-4 text-[11px] font-black uppercase tracking-wide transition-colors',
                   surfOpen ? 'bg-zilla-yellow text-black' : 'bg-white/10 text-white hover:bg-white/20'
                 )}
-                title="Browse channels — type a channel number anytime"
-                aria-label="Open channel guide"
+                title={t('player.guideTitle')}
+                aria-label={t('player.guide')}
               >
                 <span className="h-4 w-4">{Icon.tv}</span>
-                Channels
+                {t('player.channelsGroup').replace('٢٤/٧', '24/7')}
               </button>
               <button
                 onClick={toggleFullscreen}
                 className="flex h-10 w-10 items-center justify-center rounded-full bg-white/10 text-white transition-colors hover:bg-white/20"
-                title="Fullscreen (F)"
-                aria-label="Toggle fullscreen"
+                title={t('player.toggleFullscreen')}
+                aria-label={t('player.toggleFullscreen')}
               >
                 <span className="h-5 w-5">{isFullscreen ? Icon.fullscreenExit : Icon.fullscreen}</span>
               </button>
@@ -2971,115 +2076,26 @@ export function PlayerOverlay() {
           </div>
 
           <p className="mt-2 hidden text-center text-[10px] font-medium text-white/40 sm:block">
-            Space play · M mute · F fullscreen · P pip · S servers · ←/→ change channel · type a number to jump · Esc close
+            {t('player.keysHint')}
           </p>
         </div>
 
         {/* ── channel-surf sidebar (Pluto TV guide) ──────────────────────────── */}
-        <div
-          className={cn(
-            'styled-scrollbar absolute inset-y-0 right-0 z-10 w-80 max-w-[86vw] overflow-y-auto border-l border-zilla-line bg-zilla-bg/97 backdrop-blur-xl transition-transform duration-300',
-            surfOpen ? 'translate-x-0' : 'translate-x-full'
-          )}
-        >
-          <div className="sticky top-0 z-10 flex items-center justify-between border-b border-zilla-line bg-zilla-bg/95 px-4 py-3 backdrop-blur">
-            <p className="text-xs font-black uppercase tracking-wider text-zilla-text">Channel guide</p>
-            <button
-              onClick={() => setSurfOpen(false)}
-              className="flex h-7 w-7 items-center justify-center rounded-full bg-white/10 text-zilla-dim hover:text-zilla-text"
-              aria-label="Close guide"
-            >
-              <span className="h-3.5 w-3.5">{Icon.close}</span>
-            </button>
-          </div>
-
-          {[
-            { key: 'feeds', label: 'Feeds for this event', items: surf.filter((s) => s.group === 'feeds') },
-            { key: 'live', label: 'Live now', items: surf.filter((s) => s.group === 'live') },
-            { key: 'channels', label: '24/7 channels', items: surf.filter((s) => s.group === 'channels') },
-          ]
-            .filter((g) => g.items.length > 0)
-            .map((g, gi) => (
-              <div key={g.key} className="pb-2">
-                <p className="px-4 pb-1.5 pt-3 text-[10px] font-black uppercase tracking-widest text-zilla-dim">
-                  {g.label} · {g.items.length}
-                </p>
-                {g.items.map((item, i) => {
-                  const num = gi === 0 ? i + 1 : surf.indexOf(item) + 1;
-                  const active = item.id === player?.id;
-                  return (
-                    <button
-                      key={`${item.kind}-${item.ref}-${i}`}
-                      onClick={() => {
-                        switchTo(item, g.key === 'feeds' ? altFeeds : undefined);
-                        setSurfOpen(false);
-                      }}
-                      className={cn(
-                        'flex w-full items-center gap-2.5 px-3 py-2 text-left transition-colors',
-                        active ? 'bg-zilla-yellow/15' : 'hover:bg-white/5'
-                      )}
-                    >
-                      <span className="w-6 shrink-0 text-center text-[10px] font-black text-zilla-dim">
-                        {num}
-                      </span>
-                      {item.logo ? (
-                        <img
-                          src={logoSrc(item.logo, item.name)}
-                          alt=""
-                          loading="lazy"
-                          className="h-8 w-12 shrink-0 rounded object-contain"
-                        />
-                      ) : (
-                        <span className="flex h-8 w-12 shrink-0 items-center justify-center rounded bg-white/5 text-[10px] font-black text-zilla-dim">
-                          {item.group === 'live' ? '●' : 'TV'}
-                        </span>
-                      )}
-                      <span className="min-w-0 flex-1">
-                        <span
-                          className={cn(
-                            'block truncate text-xs font-bold',
-                            active ? 'text-zilla-yellow' : 'text-zilla-text'
-                          )}
-                        >
-                          {item.name}
-                        </span>
-                        <span className="block truncate text-[10px] font-medium text-zilla-dim">
-                          {item.group === 'live'
-                            ? `${item.sub || ''} ${item.startedAt ? '· ' + fmtAgo(item.startedAt) : ''}`
-                            : item.source || 'Always on'}
-                        </span>
-                      </span>
-                      {item.group === 'live' && (
-                        <span className="shrink-0 rounded bg-zilla-red px-1.5 py-0.5 text-[9px] font-black uppercase text-white">
-                          live
-                        </span>
-                      )}
-                    </button>
-                  );
-                })}
-              </div>
-            ))}
-
-          {surf.length === 0 && (
-            <div className="flex flex-col items-center gap-3 px-4 py-10">
-              <div className="h-8 w-8 animate-spin rounded-full border-[3px] border-zilla-line border-t-zilla-yellow" />
-              <p className="text-xs font-bold text-zilla-dim">Loading the guide…</p>
-            </div>
-          )}
-        </div>
+        <SurfSidebar
+          t={t}
+          open={surfOpen}
+          surf={surf}
+          activeId={player?.id}
+          altFeeds={altFeeds}
+          fmtAgo={surfFmtAgo}
+          onSwitchTo={(item, feeds) => switchTo(item, feeds)}
+          onAddToGrid={(item) => {
+            const ok = addPane(item);
+            showToast(ok ? t('player.addedToGrid') : t('player.gridFull'));
+          }}
+          onClose={() => setSurfOpen(false)}
+        />
       </div>
     </div>
   );
-}
-
-interface MatchLike {
-  id: string;
-  title: string;
-  league: string;
-  startTime: number;
-  channels: { id: string; name: string; logo?: string }[];
-  team1Logo?: string;
-  team2Logo?: string;
-  leagueLogo?: string;
-  channelLogo?: string;
 }

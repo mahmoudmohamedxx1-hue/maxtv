@@ -10,6 +10,7 @@ import { CategoryPills } from './CategoryPills';
 import { BigMatchCard } from './BigMatchCard';
 import { PlaylistZone } from './PlaylistZone';
 import { cn } from '@/lib/utils';
+import { useT } from '@/lib/locale';
 
 interface ScheduleResponse {
   live: MatchCardData[];
@@ -118,20 +119,21 @@ export function SportsTab({
   onOpenSearch: () => void;
 }) {
   const { favorites, recents, toggleFavorite, openPlayer } = useTV();
-  const [schedule, setSchedule] = useState<ScheduleResponse | null>(null);
-  const [channels, setChannels] = useState<Channel247[] | null>(null);
+  const { t } = useT();
+  const [schedule, setSchedule] = useState<ScheduleResponse | null>(() => {
+    // ── instant paint: last session's lineup renders while the fresh one loads
+    //    (lazy init — no setState-in-effect cascade; try/catch makes the
+    //    localStorage read SSR-safe)
+    const s = readSnapshot<ScheduleResponse>(SCHEDULE_SNAPSHOT_KEY);
+    return s && s.total > 0 ? s : null;
+  });
+  const [channels, setChannels] = useState<Channel247[] | null>(() => {
+    const c = readSnapshot<Channel247[]>(CHANNELS_SNAPSHOT_KEY);
+    return c && c.length ? c : null;
+  });
   const [sportFilter, setSportFilter] = useState('all');
   const [error, setError] = useState('');
   const scheduleTried = useRef(false);
-
-  // ── instant paint: last session's lineup renders while the fresh one loads
-  //    (MUST run before the fetch effect so the first paint has content)
-  useEffect(() => {
-    const s = readSnapshot<ScheduleResponse>(SCHEDULE_SNAPSHOT_KEY);
-    if (s && s.total > 0) setSchedule(s);
-    const c = readSnapshot<Channel247[]>(CHANNELS_SNAPSHOT_KEY);
-    if (c && c.length) setChannels(c);
-  }, []);
 
   // ── progressive load: schedule FIRST (hero + match rows render immediately),
   //    channels second — a slow/failing channel index must never blank the page.
@@ -348,7 +350,7 @@ export function SportsTab({
         <div className="hero-gradient flex min-h-[19rem] items-center justify-center border-b border-zilla-line">
           <div className="flex flex-col items-center gap-3">
             <div className="h-10 w-10 animate-spin rounded-full border-[3px] border-zilla-line border-t-zilla-yellow" />
-            <p className="text-sm font-bold text-zilla-dim">Syncing live sports schedule…</p>
+            <p className="text-sm font-bold text-zilla-dim">{t('sports.syncing')}</p>
           </div>
         </div>
       ) : (
@@ -386,8 +388,8 @@ export function SportsTab({
         {/* big championships ahead — Premier League, La Liga & co */}
         {schedule && bigMatches.length > 0 && (
           <ContentRow
-            title="Big matches ahead"
-            subtitle="Premier League · La Liga · Serie A · Bundesliga · Champions League & more"
+            title={t('sports.bigMatches')}
+            subtitle={t('sports.bigMatchesSub')}
           >
             {bigMatches.map((m) => (
               <BigMatchCard
@@ -404,8 +406,8 @@ export function SportsTab({
         {/* live now */}
         {liveMatches.length > 0 && (
           <ContentRow
-            title="Live now"
-            subtitle={`${liveMatches.length} events streaming right now`}
+            title={t('sports.liveNow')}
+            subtitle={t('sports.liveNowSub', { n: liveMatches.length })}
             seeAll
           >
             {liveMatches.map((m) => (
@@ -418,7 +420,7 @@ export function SportsTab({
         {schedule && (
           <PlaylistZone
             emoji="⚽"
-            title="Football"
+            title={t('sports.football')}
             matches={footballList}
             onPlay={({ channelId, channelName, match }) => playFeed(match, channelId, channelName)}
             onRemind={remind}
@@ -430,7 +432,7 @@ export function SportsTab({
         {schedule && (
           <PlaylistZone
             emoji="🏈"
-            title="American Football"
+            title={t('sports.americanFootball')}
             matches={amFootballList}
             onPlay={({ channelId, channelName, match }) => playFeed(match, channelId, channelName)}
             onRemind={remind}
@@ -441,8 +443,8 @@ export function SportsTab({
         {/* beIN Sports network — dedicated football-first rail, Arabic feeds lead */}
         {beinChannels.length > 0 && (
           <ContentRow
-            title="beIN Sports"
-            subtitle={`${beinChannels.filter((c) => c.kind === 'daddylive').length} verified networks — Arabic MENA football feeds first · every channel health-checked`}
+            title={t('sports.bein')}
+            subtitle={t('sports.beinSub', { n: beinChannels.filter((c) => c.kind === 'daddylive').length })}
           >
             {beinChannels.map((c) => (
               <ChannelCard
@@ -458,8 +460,8 @@ export function SportsTab({
         {/* World Sports — multi-quality networks rail (real ABR ladders) */}
         {worldChannels.length > 0 && (
           <ContentRow
-            title="World Sports"
-            subtitle={`${worldChannels.length} multi-quality networks — pick any quality from 360p to 1080p in the player · every stream verified`}
+            title={t('sports.world')}
+            subtitle={t('sports.worldSub', { n: worldChannels.length })}
           >
             {worldChannels.slice(0, 40).map((c) => (
               <ChannelCard
@@ -474,7 +476,7 @@ export function SportsTab({
 
         {/* favorites */}
         {favSports.length > 0 && (
-          <ContentRow title="Your favorites" subtitle="Saved sports channels & reminders">
+          <ContentRow title={t('sports.yourFavorites')} subtitle={t('sports.yourFavoritesSub')}>
             {favSports.map((c) => (
               <ChannelCard key={c.id} channel={c} onPlay={onPlayChannel} badge="★" />
             ))}
@@ -483,7 +485,7 @@ export function SportsTab({
 
         {/* recents */}
         {recentSports.length > 0 && (
-          <ContentRow title="Recently watched" subtitle="Jump back in">
+          <ContentRow title={t('sports.recentlyWatched')} subtitle={t('sports.recentlyWatchedSub')}>
             {recentSports.map((c) => (
               <ChannelCard key={`r-${c.id}`} channel={c} onPlay={onPlayChannel} />
             ))}
@@ -495,12 +497,12 @@ export function SportsTab({
           <div className="mb-2.5 flex flex-wrap items-end justify-between gap-2 px-4 sm:px-6 lg:px-10">
             <div>
               <h2 className="text-lg font-black uppercase tracking-tight text-zilla-text sm:text-xl">
-                24/7 Sports channels
+                {t('sports.channels247')}
               </h2>
               <p className="mt-0.5 text-xs font-medium text-zilla-dim">
                 {ch247.length > 0
-                  ? `${ch247.length} always-on sports networks · ESPN, Sky Sports, beIN, Willow & more`
-                  : 'Loading the always-on sports networks…'}
+                  ? t('sports.channels247Sub', { n: ch247.length })
+                  : t('sports.channels247Loading')}
               </p>
             </div>
           </div>
@@ -534,8 +536,8 @@ export function SportsTab({
           .map(([sport, ms]) => (
             <ContentRow
               key={sport}
-              title={`${SPORT_EMOJI[sport] || '📡'} ${sport.replace(/_/g, ' ')} live`}
-              subtitle={`${ms.length} live ${sport.replace(/_/g, ' ')} events`}
+              title={`${SPORT_EMOJI[sport] || '📡'} ${t('sports.sportLive', { sport: sport.replace(/_/g, ' ') })}`}
+              subtitle={t('sports.sportLiveSub', { n: ms.length, sport: sport.replace(/_/g, ' ') })}
             >
               {ms.map((m) => (
                 <MatchCard key={m.id} match={m} onPlay={(id, name) => playFeed(m, id, name)} />
@@ -545,7 +547,7 @@ export function SportsTab({
 
         {/* upcoming */}
         {upcoming.length > 0 && (
-          <ContentRow title="Upcoming events" subtitle="Kick off soon — times shown in your timezone">
+          <ContentRow title={t('sports.upcoming')} subtitle={t('sports.upcomingSub')}>
             {upcoming.map((m) => (
               <MatchCard key={m.id} match={m} onPlay={(id, name) => playFeed(m, id, name)} />
             ))}
@@ -556,11 +558,11 @@ export function SportsTab({
         {schedule && liveMatches.length === 0 && (
           <div className="px-4 py-10 text-center sm:px-6 lg:px-10">
             <p className="text-4xl">🏟️</p>
-            <p className="mt-3 text-base font-extrabold text-zilla-text">No live events right now</p>
+            <p className="mt-3 text-base font-extrabold text-zilla-text">{t('sports.noLive')}</p>
             <p className="mx-auto mt-1 max-w-sm text-sm font-medium text-zilla-dim">
-              The schedule refreshes every minute — check the 24/7 channels above or{' '}
+              {t('sports.emptyHint')}{' '}
               <button onClick={onOpenSearch} className="font-bold text-zilla-yellow hover:underline">
-                search for a channel
+                {t('sports.searchLink')}
               </button>
               .
             </p>
