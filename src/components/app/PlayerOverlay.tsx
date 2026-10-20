@@ -2106,7 +2106,7 @@ export function PlayerOverlay() {
             className="absolute inset-0 h-full w-full border-0"
             allow="autoplay; fullscreen; encrypted-media; picture-in-picture"
             allowFullScreen
-            referrerPolicy="no-referrer"
+            sandbox="allow-scripts allow-same-origin allow-presentation allow-forms"
             title="DaddyLive Stream"
           />
         ) : (
