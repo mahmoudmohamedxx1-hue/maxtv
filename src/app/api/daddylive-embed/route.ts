@@ -1,17 +1,15 @@
 // ── /api/daddylive-embed — server-side proxy that strips ads from the DaddyLive embed page ──
 //
 // Fetches dembed.st/premiumtv/daddy.php?id=N server-side (no Sec-Fetch-Dest → 200),
-// strips ONLY external ad scripts (by domain), keeps the page's inline JS intact,
-// rewrites the token fetch to a same-origin proxy, and serves a clean page.
-
-import { NextResponse } from 'next/server';
+// strips ONLY external ad scripts (by domain), injects function overrides so the
+// page thinks it's embedded (bypasses isEmbedded/inAdSandbox checks), rewrites
+// the token fetch to a same-origin proxy, and serves a clean page.
 
 export const dynamic = 'force-dynamic';
 export const maxDuration = 30;
 
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36';
 
-// Known ad/analytics domains to strip (by URL match in <script src="...">)
 const AD_DOMAINS = [
   'thirstacock', 'llvpn', 'profitableratecpmnetwork', 'histats',
   'scatteramarth', 'doubleclick', 'googlesyndication', 'taboola',
@@ -64,9 +62,8 @@ export async function GET(req: Request) {
     let html = await res.text();
 
     // ── Strip ONLY external ad scripts (by domain) ──────────────────
-    // Don't strip inline scripts — the page's main JS (JW Player setup,
-    // token logic, m3u8 URL) is inline and obfuscated with _0x vars.
-    // Only remove <script src="..."> tags from known ad domains.
+    // Don't strip inline scripts — the page's main JS is inline and
+    // contains the JW Player setup, token logic, and m3u8 URL.
     for (const domain of AD_DOMAINS) {
       const re = new RegExp(
         `<script[^>]*src=["'][^"']*${domain}[^"']*["'][^>]*><\\/script>`,
@@ -75,20 +72,20 @@ export async function GET(req: Request) {
       html = html.replace(re, '');
     }
 
-    // Remove <noscript> ad fallbacks
-    html = html.replace(/<noscript>[\s\S]*?<\/noscript>/gi, '');
+    // ── Inject function overrides BEFORE the page's main JS ──────────
+    // Override isEmbedded() to return true (page thinks it's in an iframe)
+    // Override inAdSandbox() to return false (page thinks it's not sandboxed)
+    // This prevents blockPlayer('This player only works when embedded.')
+    // and blockPlayer('Remove sandbox') from firing.
+    const overrideScript = `<script>
+      window.isEmbedded = function() { return true; };
+      window.inAdSandbox = function() { return false; };
+    </script>`;
 
-    // ── Strip sandbox/ad-block detection checks ──────────────────────
-    // Remove the isEmbedded() + inAdSandbox() blockPlayer calls so the
-    // page doesn't block when loaded from maxtvs.vercel.app.
-    html = html.replace(
-      /if\s*\(\s*!isEmbedded\(\)\s*\)\s*\{[\s\S]*?blockPlayer[\s\S]*?\}/g,
-      ''
-    );
-    html = html.replace(
-      /else\s*if\s*\(\s*inAdSandbox\(\)\s*\)\s*\{[\s\S]*?blockPlayer[\s\S]*?\}/g,
-      ''
-    );
+    // Inject the override script right before the FIRST inline <script> tag
+    // (which is the page's main JS). Using a marker that appears before
+    // the main JS — the </style> tag at the end of the CSS section.
+    html = html.replace('</style>', '</style>' + overrideScript, 1);
 
     // ── Rewrite token fetch URL to same-origin proxy ─────────────────
     // The page's JS has: fetch(EDGE + '/api/playlist-token?slug=' + ...)
