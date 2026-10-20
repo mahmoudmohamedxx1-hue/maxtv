@@ -157,27 +157,22 @@ export async function GET(req: Request) {
     const mirrorParam = serverDef?.mirror ? `&m=${serverDef.mirror}` : '';
     let url: string;
 
-    // ── DaddyLive iframe bypass ───────────────────────────────────────────
-    // The DaddyLive CDN edge (edge.cowedd4855ws.sbs) 403's all datacenter IPs
-    // (Vercel serverless in every region, Vercel edge runtime, Cloudflare
-    // Workers, public CORS proxies, 300+ free HTTP proxies — all tested).
-    // It ALSO has a token endpoint at /api/playlist-token?slug=premiumN that
-    // returns a token bound to the requester's IP — but only when the Origin
-    // is `https://daddyliveplayer.st`. The m3u8 fetch needs `?t=<TOKEN>` and
-    // succeeds ONLY from a residential IP (the IP the token was bound to).
+    // ── DaddyLive native transport (2026-10-20 rework) ─────────────────────
+    // The premium edge (edge.cowedd4855ws.sbs) gates playlists behind an
+    // Origin allowlist + an IP-bound token — NOT a datacenter-IP block, as
+    // previously diagnosed (the old proxies simply never sent an Origin
+    // header). dledge.ts now fetches token+manifest as a pair from the SAME
+    // serverless invocation (same egress IP), verified working from
+    // datacenter IPs. DaddyLive channels therefore play through the NATIVE
+    // transports again — no dlive.sx iframe, no popunder ads, and the
+    // player's own quality menu / PiP / shortcuts all work.
     //
-    // daddyliveplayer.st/premiumtv/daddy.php?id=N has NO X-Frame-Options, so
-    // we can iframe-embed it. When iframe-embedded, the page's JW Player +
-    // custom hls.js LiveLoader run in the USER'S BROWSER (residential IP) —
-    // the token fetch and m3u8/segment fetches all happen from the user's IP
-    // with Origin=daddyliveplayer.st (the iframe's URL sets it correctly).
-    // For DaddyLive channels, we return this iframe URL directly instead of
-    // the (blocked) /api/turbo or /api/hls URL. The player renders an iframe.
-    const DADDYLIVE_EMBED_PREFIX = 'https://dlive.sx/stream/stream-';
-    const isDaddyLiveChannel = /^\d+$/.test(channel);
-    if (isDaddyLiveChannel && !isRelay) {
-      url = `${DADDYLIVE_EMBED_PREFIX}${encodeURIComponent(channel)}.php`;
-    } else if (isTurbo) {
+    // (The old iframe chain MaxTV → dlive.sx/stream/stream-N.php →
+    // dembed.st/premiumtv/daddy.php ran the DaddyLive JW Player in the
+    // user's browser — which DID play, but shipped Adsterra/llvpn/
+    // thirstacock popunder ads that could not be neutralized from the
+    // embedder side. It remains as a dead fallback in PlayerOverlay.)
+    if (isTurbo) {
       url = `/api/turbo?channel=${encodeURIComponent(channel)}${mirrorParam}&mode=m3u8`;
     } else if (isRelay) {
       url = `/api/live?channel=${encodeURIComponent(channel)}${mirrorParam}&mode=m3u8`;

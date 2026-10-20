@@ -8,6 +8,7 @@
 import { UA, isBlockedHost, signUrl } from './resolve';
 import { unwrapSegment } from './uncloak';
 import { fetchTolerant } from './tls-fetch';
+import { isDaddyLiveEdgeManifest, fetchDaddyLivePlaylist } from './dledge';
 
 const SEGMENT_EXT = /\.(ts|m4s|mp4|aac|mp3|vtt|srt|webvtt|cmfa|cmfv|cmaf|jpg|jpeg|png)(\?|$)/i;
 
@@ -232,6 +233,37 @@ export async function proxyHlsRequest(
         bodyBytes: warmHit,
       };
     }
+  }
+
+  // ── DaddyLive premium edge: paired token+manifest fetch ─────────────────
+  // The edge gates playlists behind an Origin allowlist + an IP-bound token
+  // (see dledge.ts). The plain upstreamFetch below sends neither, so it
+  // would 403. Fetch the token and the manifest from THIS invocation (same
+  // egress IP) and run the result through the normal rewrite/warm pipeline.
+  if (!range && isDaddyLiveEdgeManifest(target)) {
+    const dl = await fetchDaddyLivePlaylist(target);
+    if (dl?.ok && dl.body) {
+      const rewritten = rewritePlaylist(dl.body, target, referer);
+      return {
+        status: 200,
+        headers: {
+          'access-control-allow-origin': '*',
+          'cache-control': 'no-store',
+          'content-type': 'application/vnd.apple.mpegurl',
+          'x-dl-token': 'paired',
+        },
+        body: rewritten,
+      };
+    }
+    if (dl && (dl.status === 404 || dl.status === 410)) {
+      return {
+        status: dl.status,
+        headers: { 'content-type': 'text/plain', 'x-upstream-status': String(dl.status) },
+        body: `upstream ${dl.status}`,
+      };
+    }
+    // transient pair failure → fall through to the legacy fetch so the
+    // /api/hls recovery layer (re-resolve + retry) can kick in
   }
 
   const res = await upstreamFetch(target, referer, range);

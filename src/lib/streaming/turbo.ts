@@ -40,6 +40,7 @@
 import { resolveDaddyLiveStream } from '@/lib/sports/daddylive';
 import { unwrapSegment } from './uncloak';
 import { UA } from './resolve';
+import { isDaddyLiveEdgeManifest, fetchDaddyLivePlaylist } from './dledge';
 import { ffmpegAbsent, ffmpegExecutable, SERVERLESS } from './ffmpeg-cap';
 import { spawn } from 'child_process';
 import fs from 'fs';
@@ -1101,6 +1102,13 @@ function proxiedUrl(url: string, referer: string): string {
 }
 
 async function fetchText(url: string, referer: string): Promise<string | null> {
+  // DaddyLive premium edge: the playlist needs a paired Origin+token fetch
+  // (see dledge.ts) — the plain Referer-only fetch below gets 403'd.
+  if (isDaddyLiveEdgeManifest(url)) {
+    const dl = await fetchDaddyLivePlaylist(url);
+    if (dl?.ok && dl.body) return dl.body;
+    return null;
+  }
   try {
     const target = proxiedUrl(url, referer);
     const res = await fetch(target, {

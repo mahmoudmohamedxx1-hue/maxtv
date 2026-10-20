@@ -10,6 +10,7 @@ import * as cheerio from 'cheerio';
 import type { SportsMatch, SportsChannelRef, ResolvedStream } from '../types';
 import { normalizeSport, splitLeague, stripEmojis, decodeEntities, isEventStream, DEAD_DL_CHANNEL_IDS } from './categories';
 import { rankScheduleFeeds, type FeedHealth } from './feeds';
+import { fetchDaddyLivePlaylist, setDlEdgeHost } from '../streaming/dledge';
 
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36';
@@ -725,7 +726,10 @@ async function tryRoute(
     // learn the live CDN edge so runtime health probes hit the right host
     try {
       const h = new URL(result.url).hostname;
-      if (/^edge\.|\.sbs$|\.st$/.test(h) && h !== new URL(PLAYER_CDN).hostname) cdnEdge.host = h;
+      if (/^edge\.|\.sbs$|\.st$/.test(h) && h !== new URL(PLAYER_CDN).hostname) {
+        cdnEdge.host = h;
+        setDlEdgeHost(h);
+      }
     } catch { /* ignore */ }
     return {
       ...result,
@@ -740,9 +744,10 @@ async function resolveUncached(
   channelId: string,
   pin: RouteId | null
 ): Promise<(ResolvedStream & { server?: string; serverId?: string }) | null> {
-  if (pin === 'edge') {
-    // deterministic edge manifest — no page parsing at all; the benchmark's
-    // fastest and most stable route (falls through to the race when down)
+  // edge-first: the deterministic manifest path + paired token fetch is the
+  // fastest and most stable route (2 GETs, zero page parsing). Falls through
+  // to the mirror-page race when the edge is down.
+  if (/^\d+$/.test(channelId)) {
     const edge = await tryEdgeDirect(channelId);
     if (edge) return edge;
   }
@@ -771,23 +776,19 @@ async function resolveUncached(
   return null;
 }
 
-/** direct manifest probe on the learned CDN edge — survives mirror outages */
+/** direct manifest probe on the learned CDN edge — survives mirror outages.
+ *  The edge gates playlists behind Origin + an IP-bound token (dledge.ts),
+ *  so the verification goes through the paired fetcher — a bare Referer-only
+ *  fetch would 403 and mark every channel dead. */
 async function tryEdgeDirect(
   channelId: string
 ): Promise<(ResolvedStream & { server?: string; serverId?: string }) | null> {
+  if (!/^\d+$/.test(channelId)) return null;
   const referer = `${PLAYER_CDN}/premiumtv/daddy.php?id=${channelId}`;
   const url = `https://${cdnEdge.host}/premium${channelId}/index.m3u8`;
-  try {
-    const res = await fetch(url, {
-      headers: { 'User-Agent': UA, Referer: referer, Accept: '*/*' },
-      signal: AbortSignal.timeout(5000),
-      redirect: 'follow',
-    });
-    if (res.ok) {
-      return { url, referer, strategy: 'edge-direct', server: cdnEdge.host, serverId: 'edge' };
-    }
-  } catch {
-    /* edge down too */
+  const dl = await fetchDaddyLivePlaylist(url, { attempts: 2, timeoutMs: 5000 });
+  if (dl?.ok && dl.body && dl.body.includes('#EXTM3U')) {
+    return { url, referer, strategy: 'edge-direct', server: cdnEdge.host, serverId: 'edge' };
   }
   return null;
 }
@@ -811,17 +812,17 @@ async function probeOne(id: string): Promise<boolean> {
   // three strikes — the CDN edges flap (round-robin nodes + connection
   // throttling on bursts), so one or two failed GETs prove nothing.
   // A clean 404/410 is definitive and skips the retries.
-  for (let attempt = 0; attempt < 3; attempt++) {
+  // v2: the premium edge needs a paired Origin+token fetch (dledge.ts) —
+  // a bare GET would 403 on EVERY channel and empty the rails. The paired
+  // fetcher retries internally, which covers the flap budget.
+  for (let attempt = 0; attempt < 2; attempt++) {
     if (attempt > 0) await new Promise((r) => setTimeout(r, 500 + Math.random() * 500));
-    try {
-      const res = await fetch(`https://${cdnEdge.host}/premium${id}/index.m3u8`, {
-        headers: { 'User-Agent': UA, Referer: `${PLAYER_CDN}/` },
-        signal: AbortSignal.timeout(3500),
-        redirect: 'follow',
-      });
-      if (res.ok) return true;
-      if (res.status === 404 || res.status === 410) return false;
-    } catch { /* network hiccup → retry */ }
+    const dl = await fetchDaddyLivePlaylist(`https://${cdnEdge.host}/premium${id}/index.m3u8`, {
+      attempts: 2,
+      timeoutMs: 3500,
+    });
+    if (dl?.ok) return true;
+    if (dl && (dl.status === 404 || dl.status === 410)) return false;
   }
   return false;
 }

@@ -20,6 +20,50 @@ export async function GET(req: Request) {
   const { searchParams } = new URL(req.url);
   const target = searchParams.get('url');
   const referer = searchParams.get('referer');
+  const origin = searchParams.get('origin');
+
+  // ── DaddyLive paired token+manifest mode ─────────────────────────────
+  // dlslug=premium<N>&dlpath=/premium<N>/index.m3u8 → fetch the playlist
+  // token AND the manifest from THIS single edge invocation (same egress
+  // IP — the token is IP-bound, see src/lib/streaming/dledge.ts) and return
+  // the manifest body. Used by the streaming layer as a fallback egress
+  // when the serverless runtime's own IPs are refused by the edge.
+  const dlSlug = searchParams.get('dlslug');
+  const dlPath = searchParams.get('dlpath');
+  if (dlSlug && dlPath && /^premium\d+$/.test(dlSlug) && dlPath.startsWith('/')) {
+    try {
+      const edge = 'https://edge.cowedd4855ws.sbs';
+      const dlHeaders = {
+        'User-Agent': UA,
+        Accept: '*/*',
+        Origin: 'https://dembed.st',
+        Referer: 'https://dembed.st/',
+      };
+      const tokRes = await fetch(`${edge}/api/playlist-token?slug=${encodeURIComponent(dlSlug)}`, {
+        headers: dlHeaders,
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!tokRes.ok) return new Response(`token ${tokRes.status}`, { status: 502, headers: { 'content-type': 'text/plain', 'access-control-allow-origin': '*' } });
+      const tok = ((await tokRes.json()) as { token?: string }).token;
+      if (!tok) return new Response('no token', { status: 502, headers: { 'content-type': 'text/plain', 'access-control-allow-origin': '*' } });
+      const sep = dlPath.includes('?') ? '&' : '?';
+      const manRes = await fetch(`${edge}${dlPath}${sep}t=${encodeURIComponent(tok)}`, {
+        headers: dlHeaders,
+        signal: AbortSignal.timeout(8000),
+      });
+      const body = await manRes.text();
+      return new Response(body, {
+        status: manRes.status,
+        headers: {
+          'content-type': manRes.headers.get('content-type') || 'application/vnd.apple.mpegurl',
+          'access-control-allow-origin': '*',
+          'cache-control': 'no-store',
+        },
+      });
+    } catch (e) {
+      return new Response(`dl pair error: ${(e as Error).message}`, { status: 502, headers: { 'content-type': 'text/plain', 'access-control-allow-origin': '*' } });
+    }
+  }
 
   if (!target || !/^https?:\/\//i.test(target)) {
     return new Response('bad url', {
@@ -36,6 +80,10 @@ export async function GET(req: Request) {
     const headers: HeadersInit = {
       'User-Agent': UA,
       'Accept': '*/*',
+      // Origin passthrough — the DaddyLive premium edge (and a growing set
+      // of ad-funded CDNs) 403 any request whose Origin is not on its
+      // allowlist; a bare Referer is not enough.
+      ...(origin && /^https?:\/\//i.test(origin) ? { Origin: origin } : {}),
     };
     if (referer) headers['Referer'] = referer;
     if (range) headers['Range'] = range;
