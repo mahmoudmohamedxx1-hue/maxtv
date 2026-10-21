@@ -286,10 +286,20 @@ export function attachSegPrefetch(hls: Hls): void {
     }
     // fresh level (quality switch join): prefetch the ride band the switch
     // will land on — the join fragment itself plus the segments above it,
-    // so the encode lead-time is spent BEFORE the flushed playhead arrives
+    // so the encode lead-time is spent BEFORE the flushed playhead arrives.
+    // THROUGH THE TIP (no end bound): warmBandSwitch flushes the playhead to
+    // live-edge−12s of the SOURCE buffer, but the rung's encode lags the
+    // Source edge, so the landing position can be the rung's very TIP.
+    // Measured 2026-10-22 (ch92, 360p pick): the band stopped at tip−1 —
+    // hls.js JOINED that one, then its TIP request 404'd on a cold isolate
+    // → retry backoff on an empty buffer → 22s stall cascade + ABR crash.
+    // NEWEST-FIRST: the top of the band is both the likeliest landing spot
+    // and the only segment that can still be mid-encode — it must win the
+    // first MAX_CONCURRENT slots; the deeper ride positions fill in after.
     const ride = isTurboRung(level) ? 5 : 3;
     const join = Math.max(0, frags.length - ride);
-    prefetchUrls(frags.slice(Math.max(0, join - 1), join + AHEAD + 1).map((f) => f.url));
+    const band = frags.slice(Math.max(0, join - 1)).reverse();
+    prefetchUrls(band.map((f) => f.url));
   };
 
   hls.on(Hls.Events.FRAG_BUFFERED, (_e, d) => {
