@@ -1172,6 +1172,34 @@ export function PlayerOverlay() {
     return () => clearInterval(iv);
   }, [phase, ladderMaster]);
 
+  /* ── ladder live-edge watchdog (stale-position deadlock) ───────────────────
+   * Rung switches mid-stream leave the flushed playhead parked BEHIND the new
+   * rung's window — the Source rung lists only the live 4-6 segments, so a
+   * playhead that fell 30s+ behind finds NO fragment at its position and
+   * hls.js waits forever with an empty buffer (measured frozen 65s+ on
+   * production). Nothing else recovers that state: the playlists advance, the
+   * polls succeed, but no frag ever matches. The watchdog detects exactly
+   * that shape — starved (readyState≤2), zero buffered, far behind the
+   * seekable end — and jumps the playhead to the live edge, where the new
+   * rung delivers immediately. Live sports: the edge is where the match is. */
+  useEffect(() => {
+    if (phase !== 'playing' || !ladderMaster) return;
+    const iv = setInterval(() => {
+      const v = videoRef.current;
+      if (!v || v.readyState > 2 || v.buffered.length || !v.seekable.length) return;
+      const end = v.seekable.end(v.seekable.length - 1);
+      if (Number.isFinite(end) && end - v.currentTime > 25 && v.currentTime >= 0) {
+        try {
+          v.currentTime = Math.max(0, end - 1.5);
+          setLiveBehind(false);
+        } catch {
+          /* seekable not ready — next tick retries */
+        }
+      }
+    }, 3_000);
+    return () => clearInterval(iv);
+  }, [phase, ladderMaster]);
+
   /* ── live-edge drift watcher ───────────────────────────────────────────── */
   useEffect(() => {
     if (phase !== 'playing') return;
