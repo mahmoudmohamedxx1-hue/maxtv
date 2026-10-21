@@ -145,6 +145,8 @@ export class TurboSession {
   private hevcFromStart = false;
   private lastNewAt = Date.now();
   private startup = true;
+  /** segment-URL generation counter (see pass() restart detection) */
+  private gen = 0;
   lastServed = Date.now();
   createdAt = Date.now();
 
@@ -165,6 +167,13 @@ export class TurboSession {
 
   get isDead(): boolean {
     return this.dead;
+  }
+
+  /** URL generation — bumps on upstream restarts (see pass()); rides on
+   *  /api/turbo segment URLs as &g= so the edge cache never bridges a
+   *  restart with stale same-n bytes. */
+  get generation(): number {
+    return this.gen;
   }
 
   /** Has the source been sniffed and is it safe for direct browser playback?
@@ -326,6 +335,15 @@ export class TurboSession {
         return ts;
       }
     }
+    // ⤴ 2026-10-22 "stops to load every 3-5s on ANY quality": an sn BELOW the
+    // upstream floor that isn't in this instance's cache is unfetchable — the
+    // upstream listing has scrolled past it and only a sibling isolate's
+    // memory ever held it. Burning the 2s second-chance kick on that dead ask
+    // stretched every cross-instance miss into a multi-second 404 (measured
+    // 2.3-6.7s in prod), which hls.js then retried with backoff while the
+    // buffer drained. Fail FAST — the client prefetcher (lead-time retries)
+    // and the s-maxage edge cache make the recovery cheap.
+    if (this.lastUpFloor > 0 && n < this.lastUpFloor) return null;
     // cold-start second chance — only while we're still inside hls.js's
     // time-to-first-byte budget (no point retrying after a 12s segment hang)
     if (Date.now() - t0 < 4_000) {
@@ -454,15 +472,21 @@ export class TurboSession {
     this.tcWarmAt.set(h, now);
     const w = this.windowRange(true);
     if (!w) return;
-    // WARMS THE PLAYER'S RIDE BAND, not the window tip: the ladder player
-    // joins liveSyncDurationCount (5) segments behind the newest listed
-    // segment, so warming [len-count-2, len-2] covers the join position and
-    // the segments above it. Every later segment slides down through that
-    // band on successive polls — riding 5 back means each one is warmed
-    // ~2 polls (≈12s) BEFORE the playhead reaches it: the lead time a cold
-    // encode needs to stay invisible instead of stalling the buffer.
+    // WARMS THE PLAYER'S RIDE BAND, not just the window tip: the ladder
+    // player joins liveSyncDurationCount (5) segments behind the newest
+    // listed segment, so the band must cover the join position and the
+    // segments above it. Every later segment slides down through that band
+    // on successive polls — riding 5 back means each one is warmed ~2 polls
+    // (≈12s) BEFORE the playhead reaches it: the lead time a cold encode
+    // needs to stay invisible instead of stalling the buffer.
+    // ⤴ 2026-10-22: the band now extends THROUGH the tip (len-1) — the
+    // client prefetcher reaches 2-4 segments past the playhead, and with
+    // s-maxage edge caching (see /api/turbo mode=seg) the first encode of a
+    // segment is the only one ANY client ever pays for: warming the tip
+    // early means the bytes are already at the edge before anyone's
+    // playhead (or prefetch) arrives.
     const from = Math.max(0, w.list.length - count - 2);
-    const to = Math.max(from, w.list.length - 2);
+    const to = w.list.length;
     const sns = w.list.slice(from, to).map((x) => x.sn);
     for (const sn of sns) {
       const key = `${this.key}|${sn}:${h}`;
@@ -538,6 +562,11 @@ export class TurboSession {
       let restarted = false;
       if (upMseq !== null && this.lastUpMseq !== null && upMseq < this.lastUpMseq) {
         restarted = true;
+        // ⤴ segment-URL generation bump: ns recycle across upstream restarts
+        // (fresh content reuses old sn numbers). The edge cache (s-maxage on
+        // /api/turbo mode=seg) keys on the full URL — minting a fresh &g=
+        // after a restart makes stale pre-restart bytes unreachable.
+        this.gen++;
         this.lastSn = 0;
         this.segs.clear();
         this.windowSns = [];

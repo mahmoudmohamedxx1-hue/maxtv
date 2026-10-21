@@ -19,37 +19,18 @@
 // + unwraps + serves, i.e. the exact legacy behavior. Per-segment fallback,
 // zero player-visible difference beyond the speed.
 //
+// 2026-10-22: the loader ALSO serves segments prefetched by seg-prefetch.ts
+// (ladder rung + Source URLs) straight from the in-page cache — a prefetched
+// segment reaches hls.js with ZERO network on the critical path.
+//
 // Non-segdl URLs (manifests, turbo-transcoded rungs, every other source)
-// pass straight through to the default XhrLoader untouched.
+// pass straight through to the default XhrLoader untouched (except the
+// prefetch-cache check, which is URL-keyed and misses them harmlessly).
 
 import Hls from 'hls.js';
 import { unwrapSegmentBrowser } from '@/lib/player/uncloak-browser';
-
-const SEGDL_MARK = '/api/segdl?u=';
-
-/** CDN hosts whose segments are CORS-readable and cloaked — the direct path
- *  only engages for these (the segdl route allowlists the same hosts
- *  server-side, so client and server fallback agree on what's eligible). */
-const DIRECT_HOSTS = ['tiktokcdn-us.com', 'tiktokcdn.com', 'tiktokcdn-eu.com', 'tiktokv.us'];
-
-function isDirectHost(u: string): boolean {
-  try {
-    const h = new URL(u).hostname.toLowerCase();
-    return DIRECT_HOSTS.some((d) => h === d || h.endsWith(`.${d}`));
-  } catch {
-    return false;
-  }
-}
-
-/** extract ?u= from a same-origin /api/segdl URL (works for relative and
- *  absolute forms — hls.js resolves playlist URLs against the page) */
-function segdlTarget(url: string): string | null {
-  const i = url.indexOf(SEGDL_MARK);
-  if (i === -1) return null;
-  const q = url.slice(i + SEGDL_MARK.length);
-  const u = new URLSearchParams(q).get('u') || decodeURIComponent(q.split('&')[0]);
-  return /^https?:\/\//i.test(u) ? u : null;
-}
+import { SEGDL_MARK, isDirectHost, segdlTarget } from './cdn-direct';
+import { takeCachedSegment } from './seg-prefetch';
 
 /* ── direct-path circuit breaker ──────────────────────────────────────────────
  * When the direct path genuinely can't deliver (CDN drops CORS, a restrictive
@@ -75,6 +56,27 @@ function recordDirect(ok: boolean): void {
   }
 }
 
+/** is the CDN-direct path currently usable? (exported so the player can ride
+ *  deeper when it's dead — the server fallback needs the runway) */
+export function directPathHealthy(): boolean {
+  return directPathOpen();
+}
+
+/** minimal LoaderStats-shaped object for an instantly-served segment */
+function instantStats(bytes: number, start: number) {
+  return {
+    aborted: false,
+    loaded: bytes,
+    retry: 0,
+    total: bytes,
+    chunkCount: 1,
+    bwEstimate: 0,
+    loading: { start, first: start, end: start },
+    parsing: { start, first: start, end: start },
+    buffering: { start, first: start, end: start },
+  };
+}
+
 /* eslint-disable @typescript-eslint/no-explicit-any — hls.js loader types are
    structural; we mirror the LoaderCallbacks/LoaderStats shapes by hand. */
 
@@ -91,6 +93,16 @@ export class UncloakDirectLoader extends (Hls.DefaultConfig.loader as any) {
     // carry the /api/segdl?u= mark, so the URL check stays the real gate.
     const ctxType: string = context?.type || '';
     const isFragmentLoad = ctxType === 'fragment' || ctxType.endsWith('fragment');
+    if (isFragmentLoad) {
+      // 2026-10-22: prefetched segment (ladder rungs + Source) → serve from
+      // the in-page cache with zero network on the playhead's critical path
+      const cached = takeCachedSegment(url);
+      if (cached && cached.length >= 188) {
+        const now = performance.now();
+        callbacks.onSuccess({ url: context.url, data: cached }, instantStats(cached.length, now), context, null);
+        return;
+      }
+    }
     if (isFragmentLoad && url.includes(SEGDL_MARK) && directPathOpen()) {
       const target = segdlTarget(url);
       if (target && isDirectHost(target) && typeof DecompressionStream !== 'undefined') {

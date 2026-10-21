@@ -54,7 +54,8 @@ import {
   probeTcCap,
 } from './player/utils';
 import { createNetWatcher } from './player/createNetWatcher';
-import { UncloakDirectLoader } from './player/uncloak-loader';
+import { UncloakDirectLoader, directPathHealthy } from './player/uncloak-loader';
+import { attachSegPrefetch } from './player/seg-prefetch';
 import { QualityMenu } from './player/QualityMenu';
 import { ServersMenu } from './player/ServersMenu';
 import { SurfSidebar } from './player/SurfSidebar';
@@ -771,6 +772,10 @@ export function PlayerOverlay() {
 
           // connectivity engine — Auto keeps following the measured bandwidth
           attachNetWatcher(hls);
+          // 2026-10-22 stall fix — background segment prefetch (ladder rungs
+          // + Source): decouple fetch time from play time so cold-isolate
+          // 404s and slow fallbacks never sit on the playhead's critical path
+          attachSegPrefetch(hls);
           hls.on(Hls.Events.LEVEL_SWITCHED, (_e, d) => {
             // ┚ rung-adaptive ride distance (ladder masters): turbo rungs are
             // encode-bound at the live edge (4-7s per 5s segment on a 1-vCPU
@@ -781,9 +786,15 @@ export function PlayerOverlay() {
             if (ladderMasterRef.current && hls.levels) {
               const lvl = hls.levels[d.level];
               const turboRung = !!lvl && (lvl.height || 0) > 0 && !/raw=1/.test((lvl.url || []).join(''));
+              // ⤴ 2026-10-22: when the CDN-direct path is dead (breaker open
+              // — restrictive networks / CDN CORS flaps) every Source segment
+              // rides the server fallback at 1.6-2.7s each; the prefetcher's
+              // parallelism holds the throughput, and the deeper ride gives
+              // that margin room to breathe instead of hugging the edge.
+              const dead = !directPathHealthy();
               const cfg = hls.config as { liveSyncDurationCount?: number; maxBufferLength?: number };
-              cfg.liveSyncDurationCount = turboRung ? 5 : 3;
-              cfg.maxBufferLength = turboRung ? 45 : 30;
+              cfg.liveSyncDurationCount = turboRung ? 5 : dead ? 5 : 3;
+              cfg.maxBufferLength = turboRung ? 45 : dead ? 45 : 30;
             }
             // refresh labels — some CDNs only report resolution once fragments load
             const lvl = hls.levels?.[d.level];
@@ -1460,6 +1471,8 @@ export function PlayerOverlay() {
         // place recovery ("back to native") and rung-hopping can fire from
         // while transcoding
         attachNetWatcher(hls);
+        // 2026-10-22 stall fix — background segment prefetch (see load())
+        attachSegPrefetch(hls);
         hls.on(Hls.Events.MANIFEST_PARSED, () => {
           if (typeof level === 'number' && level >= 0 && hls.levels?.[level]) {
             hls.currentLevel = level;

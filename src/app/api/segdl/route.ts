@@ -74,8 +74,12 @@ export async function GET(req: Request) {
       status: 200,
       headers: {
         'access-control-allow-origin': '*',
-        // immutable content — let every CDN layer cache the fallback too
-        'cache-control': 'public, max-age=3600',
+        // immutable content — browser-cachable, and s-maxage makes the Vercel
+        // edge cache shared: every viewer whose direct-CDN path fails lands
+        // here, and the first fetch parks the unwrapped TS at the edge for
+        // the rest (segment URLs are the CDN's own immutable signed URLs —
+        // no recycle risk, unlike /api/turbo's sn-keyed URLs).
+        'cache-control': 'public, max-age=3600, s-maxage=3600',
         'content-type': 'video/mp2t',
         'accept-ranges': 'none',
       },

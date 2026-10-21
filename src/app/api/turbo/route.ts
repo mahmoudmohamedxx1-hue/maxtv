@@ -132,8 +132,18 @@ export async function GET(req: Request) {
       status: 200,
       headers: {
         'content-type': 'video/mp2t',
-        // segment ns recycle across restarts — never let a browser cache them
-        'cache-control': 'no-store',
+        // ⤴ 2026-10-22 EDGE-CACHED SEGMENTS: Vercel load-balances /api/turbo
+        // across isolates, and only the isolate that ENCODED a rung segment
+        // could serve it — cross-isolate requests 404'd after 2-7s of futile
+        // work (measured in prod: the ride position itself 404ing was the
+        // "stops to load every 3-5s on ANY quality" root cause). With
+        // s-maxage the FIRST successful encode parks at Vercel's edge and
+        // every later request — any isolate, any viewer — is an instant
+        // cache hit. max-age=0 keeps the BROWSER honest (ns recycle across
+        // upstream restarts; the &g= generation param keeps the EDGE honest
+        // — see the m3u8 rewriter below). 25s covers the ride band's
+        // lifetime (~25-30s behind the tip) with margin for recycle safety.
+        'cache-control': 'public, max-age=0, s-maxage=25',
         'access-control-allow-origin': '*',
       },
     });
@@ -182,6 +192,7 @@ export async function GET(req: Request) {
       p.set('mode', 'seg');
       p.set('n', String(n));
       p.set('h', String(h)); // sanitized ladder height — never a dead >480 ask
+      p.set('g', String(session.generation)); // edge-cache generation (restart-safe)
       return `/api/turbo?${p.toString()}`;
     };
     const text = raw
@@ -248,6 +259,7 @@ export async function GET(req: Request) {
     p.set('mode', 'seg');
     p.set('n', String(n));
     p.delete('h'); // native passthrough — no ladder height to carry
+    p.set('g', String(session.generation)); // edge-cache generation (restart-safe)
     return `/api/turbo?${p.toString()}`;
   };
   const text = raw
