@@ -1515,27 +1515,21 @@ export function PlayerOverlay() {
    * targets always flush (encode-bound rungs must show the pick NOW);
    * the CDN-direct Source rides the boundary smoothly on a shallow buffer. */
   const warmBandSwitch = useCallback(
-    (hlsL: Hls, level: number, turboTarget: boolean) => {
+    (hlsL: Hls, level: number) => {
       const v = videoRef.current;
       const ahead = v && v.buffered.length ? v.buffered.end(v.buffered.length - 1) - v.currentTime : 0;
-      const seekToEdge = () => {
-        if (!v || !v.seekable.length || ahead <= 14) return;
+      if (ahead > 14 && v && v.seekable.length) {
         const end = v.seekable.end(v.seekable.length - 1);
-        if (!Number.isFinite(end)) return;
-        try {
-          v.currentTime = Math.max(0, end - 12);
-        } catch {
-          /* seekable not ready — plain flush below still switches */
+        if (Number.isFinite(end)) {
+          try {
+            v.currentTime = Math.max(0, end - 12);
+          } catch {
+            /* seekable not ready — the flush below still switches */
+          }
         }
-      };
-      if (turboTarget) {
-        seekToEdge();
         hlsL.currentLevel = level; // flush NOW at the edge-aligned position
-      } else if (ahead > 20) {
-        seekToEdge();
-        hlsL.currentLevel = level;
       } else {
-        hlsL.nextLevel = level; // shallow buffer — smooth boundary switch
+        hlsL.nextLevel = level; // shallow — seamless boundary switch
       }
     },
     []
@@ -1568,14 +1562,25 @@ export function PlayerOverlay() {
         const pick = exact || below;
         if (pick) {
           setShowQualityMenu(false);
-          // buffer-aware switch: a deep buffer would delay a nextLevel switch
-          // by the whole runway (up to a minute) — flush instead so a manual
-          // data-saver pick takes effect NOW. TURBO rungs are encode-bound:
-          // flush THROUGH the warm band (see warmBandSwitch) or the playhead
-          // lands outside the rung's live window and stalls to a freeze.
+          // edge-aligned rung switch (see warmBandSwitch): deep runway →
+          // seek to the live-edge band + flush (pick shows NOW); shallow →
+          // seamless boundary switch (the target rung's session warms up
+          // BEHIND the still-playing buffer instead of a black screen).
+          // PREWARM: fire the rung's playlist once so whichever isolate
+          // serves it starts its turbo session + warm band immediately —
+          // hls.js only polls the new level at the switch boundary, and a
+          // cold-isolate warmup (5-15s) must never be paid in front of a
+          // drained buffer.
           const lvlUrls = (hlsL.levels[pick.i]?.url || []).join('');
-          const turboTarget = !/raw=1/.test(lvlUrls);
-          warmBandSwitch(hlsL, pick.i, turboTarget);
+          if (!/raw=1/.test(lvlUrls)) {
+            try {
+              const u = new URL(lvlUrls, window.location.origin);
+              void fetch(u.toString(), { cache: 'no-store' }).catch(() => {});
+            } catch {
+              /* prewarm is best-effort */
+            }
+          }
+          warmBandSwitch(hlsL, pick.i);
           setCurrentQuality(pick.i);
           // persist the NATIVE preference when the pick was the Source rung
           updatePrefs({ quality: pick.src ? 0 : height, autoPicked: !!opts.auto });
@@ -1718,17 +1723,16 @@ export function PlayerOverlay() {
       }
       const hls = hlsRef.current;
       if (!hls) return;
-      // buffer-aware switch: nextLevel rides the boundary smoothly on a
-      // shallow buffer; a deep runway would hide the pick for up to a minute —
-      // flush instead (brief blip, immediate effect — what a manual pick
-      // means). TURBO rungs are encode-bound: flush THROUGH the warm band
-      // (see warmBandSwitch) so the pick takes effect now without stalling.
+      // edge-aligned rung switch on ladder masters (see warmBandSwitch):
+      // deep runway → live-edge seek + flush; shallow → boundary ride.
+      // Non-ladder sources keep the classic buffer-aware behavior.
       const lvlUrls = level >= 0 && hls.levels?.[level] ? (hls.levels[level].url || []).join('') : '';
-      const turboTarget =
-        ladderMasterRef.current && level >= 0 && (hls.levels?.[level]?.height || 0) > 0 && !/raw=1/.test(lvlUrls);
-      const srcOnLadder = ladderMasterRef.current && level >= 0 && /raw=1/.test(lvlUrls);
-      if (level >= 0 && (turboTarget || srcOnLadder)) {
-        warmBandSwitch(hls, level, !!turboTarget);
+      const ladderRung =
+        ladderMasterRef.current &&
+        level >= 0 &&
+        ((hls.levels?.[level]?.height || 0) > 0 || /raw=1/.test(lvlUrls));
+      if (level >= 0 && ladderRung) {
+        warmBandSwitch(hls, level);
       } else {
         const vid = videoRef.current;
         const ahead =
