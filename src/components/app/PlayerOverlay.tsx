@@ -712,6 +712,19 @@ export function PlayerOverlay() {
           // connectivity engine — Auto keeps following the measured bandwidth
           attachNetWatcher(hls);
           hls.on(Hls.Events.LEVEL_SWITCHED, (_e, d) => {
+            // ┚ rung-adaptive ride distance (ladder masters): turbo rungs are
+            // encode-bound at the live edge (4-7s per 5s segment on a 1-vCPU
+            // isolate) — they need the deep 5-segment ride + 45s buffer for
+            // encode lead. The Source rung is CDN-direct (sub-second segments)
+            // and keeps the ultra-low 3/30 posture. hls.js reads both config
+            // keys live, so mutating per-switch is safe.
+            if (ladderMasterRef.current && hls.levels) {
+              const lvl = hls.levels[d.level];
+              const turboRung = !!lvl && (lvl.height || 0) > 0 && !/raw=1/.test((lvl.url || []).join(''));
+              const cfg = hls.config as { liveSyncDurationCount?: number; maxBufferLength?: number };
+              cfg.liveSyncDurationCount = turboRung ? 5 : 3;
+              cfg.maxBufferLength = turboRung ? 45 : 30;
+            }
             // refresh labels — some CDNs only report resolution once fragments load
             const lvl = hls.levels?.[d.level];
             const resH = Number(String(lvl?.attrs?.RESOLUTION ?? '').split('x')[1]) || 0;
