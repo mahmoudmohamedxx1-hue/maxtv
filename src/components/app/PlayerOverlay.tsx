@@ -131,6 +131,10 @@ export function PlayerOverlay() {
   /** the NATIVE feed's real height (0 unknown) — the transcode ladder never
    *  encodes UP: a request at/above it stays on the untouched native feed */
   const nativeHeightRef = useRef(0);
+  /** the ladder Source rung's hls level index — label-independent identity
+   *  (the entry relabels "Source" → "720p"/"1080p" once the height is known,
+   *  so the label can no longer be used to find it) */
+  const srcLevelRef = useRef<number | null>(null);
   const loadRef = useRef<(ch: Playable, opts?: { server?: string; isAlternate?: boolean }) => Promise<void>>(async () => {});
   /** servers/alternate urls already tried for the current channel (+ which
    *  failover PASS we're on — see findNextHop) */
@@ -359,6 +363,7 @@ export function PlayerOverlay() {
       setActiveHeight(0);
       setTcHeight(null);
       nativeHeightRef.current = 0; // learned again from the native manifest
+      srcLevelRef.current = null; // re-identified at the next MANIFEST_PARSED
       if (!opts.isAlternate) setAltUrl(null); // playing a DL server / fresh channel
       pinHeightRef.current = null; // one-shot alternate-rung pin
       proxiedSrcRef.current = null;
@@ -587,15 +592,62 @@ export function PlayerOverlay() {
                 // the top. Identify it by its raw=1 variant URL, never by index.
                 const lvlUrl = (l.url || []).join('') || '';
                 const isSrc = isLadder && /raw=1/.test(lvlUrl);
-                const label = isSrc ? 'Source' : h ? `${h}p` : k > 0 ? `${k}k` : 'Source';
-                return { label, level: i, height: h };
+                // native label when the master declared RESOLUTION (the
+                // server probes the channel's real height) or the client-side
+                // probe already taught us — the user sees "720p"/"1080p",
+                // the native quality, instead of a mystery "Source"
+                const label = isSrc
+                  ? h > 0
+                    ? `${h}p`
+                    : 'Source'
+                  : h
+                    ? `${h}p`
+                    : k > 0
+                      ? `${k}k`
+                      : 'Source';
+                return { label, level: i, height: h, src: isSrc };
               });
             const seen = new Set<string>();
             const levels = buildLevels().filter((l) => (seen.has(l.label) ? false : seen.add(l.label)));
             setQuality(levels.map(({ label, level }) => ({ label, level })));
+            // remember the Source rung's level index — label-independent
+            // identity for persistence and 'Source' preference restores
+            // (the label becomes "720p"/"1080p" once the height is known)
+            const srcEntry = levels.find((l) => l.src);
+            if (srcEntry) srcLevelRef.current = srcEntry.level;
+            // learn the native height when the master declares it — powers
+            // the no-upscale guards and native-ask mapping in selectDataSaver
+            if (srcEntry?.height && srcEntry.height > 0) {
+              nativeHeightRef.current = Math.max(nativeHeightRef.current, srcEntry.height);
+            }
+            // ladder master without RESOLUTION on the Source rung (cold
+            // isolate) — ask the server for the channel's real height in the
+            // background and relabel the menu entry once it answers. Also
+            // seeds the per-isolate server cache, so future masters carry
+            // RESOLUTION natively.
+            if (isLadder && !srcEntry?.height) {
+              const chId = src.match(/[?&]ch=(\d+)/)?.[1] || '';
+              if (chId) {
+                const gen = loadGenRef.current;
+                void fetch(`/api/turbo?channel=${chId}&mode=native`, { cache: 'no-store' })
+                  .then((r) => (r.ok ? (r.json() as Promise<{ h?: number }>) : null))
+                  .then((d) => {
+                    if (gen !== loadGenRef.current) return; // channel changed meanwhile
+                    const h = d?.h || 0;
+                    if (h <= 0) return;
+                    nativeHeightRef.current = Math.max(nativeHeightRef.current, h);
+                    setQuality((prev) =>
+                      prev.some((q) => q.label === `${h}p`)
+                        ? prev
+                        : prev.map((q) => (q.label === 'Source' ? { ...q, label: `${h}p` } : q))
+                    );
+                  })
+                  .catch(() => {});
+              }
+            }
             // remember the native feed's best height — the ladder never encodes up.
             // ⚠ ladder masters: the turbo rungs (144-480) are NOT the native
-            // height — only LEVEL_SWITCHED on the Source rung teaches the truth.
+            // height — only the Source rung (handled above) teaches the truth.
             if (!isLadder) {
               const knownH = levels.map((l) => l.height).filter((h) => h > 0);
               if (knownH.length) {
@@ -632,13 +684,21 @@ export function PlayerOverlay() {
               }
             } else if (prefH === 0 && levels.length > 0) {
               // 'Source' preference — pin the NATIVE rung (identified by its
-              // raw=1 URL — hls.js sorts levels, so "top" is NOT the Source)
-              const srcIdx = levels.findIndex((l) => l.label === 'Source');
+              // raw=1 URL — hls.js sorts levels, so "top" is NOT the Source;
+              // the srcLevelRef survives the "Source"→"720p" relabel)
+              const srcIdx = srcEntry ? srcEntry.level : levels.length - 1;
               const pin = srcIdx >= 0 ? srcIdx : levels.length - 1;
               hls.currentLevel = pin;
               setCurrentQuality(pin);
             } else if (prefH > 0 && levels.length > 1) {
-              let idx = levels.find((l) => l.height === prefH)?.level ?? -1;
+              // a persisted native-height pick (the Source entry relabeled
+              // "720p"/"1080p" persists as its height) must pin the Source
+              // rung, not fall through to the 480 turbo rung below it
+              const nativeAsk =
+                !!srcEntry && (prefH === srcEntry.height || prefH >= (nativeHeightRef.current || Infinity) - 60);
+              let idx = nativeAsk
+                ? srcEntry.level
+                : levels.find((l) => l.height === prefH)?.level ?? -1;
               if (idx === -1) {
                 const below = levels.filter((l) => l.height > 0 && l.height <= prefH).sort((a, b) => b.height - a.height)[0];
                 idx = below?.level ?? -1;
@@ -733,7 +793,12 @@ export function PlayerOverlay() {
             const h = lvl?.height || resH || vh;
             if (h) {
               setActiveHeight(h);
-              if (tcHeightRef.current === null) {
+              // ⚠ on ladder masters only the SOURCE rung teaches the native
+              // height — turbo rungs (144-480) are transcodes, and learning
+              // e.g. 144 from an early ABR landing would corrupt the
+              // native-ask threshold in selectDataSaver/setLevel
+              const isSrcRung = !!ladderMasterRef.current && d.level === srcLevelRef.current;
+              if (tcHeightRef.current === null && (!ladderMasterRef.current || isSrcRung)) {
                 nativeHeightRef.current = Math.max(nativeHeightRef.current, h);
               }
               setQuality((prev) => {
@@ -1083,8 +1148,19 @@ export function PlayerOverlay() {
         }
         return;
       }
-      const levels = hls.levels.map((l, i) => ({ i, h: l.height || 0 }));
-      let idx = levels.find((l) => l.h === p.quality)?.i ?? -1;
+      const levels = hls.levels.map((l, i) => ({
+        i,
+        h: l.height || 0,
+        src: /raw=1/.test((l.url || []).join('')),
+      }));
+      // a persisted native-height pick (the relabeled Source entry persists
+      // as its height) must re-pin the Source rung, not the 480 turbo rung
+      const srcLvl = levels.find((l) => l.src);
+      const nativeAsk =
+        !!srcLvl && (p.quality === srcLvl.h || p.quality >= (nativeHeightRef.current || Infinity) - 60);
+      let idx = nativeAsk
+        ? srcLvl.i
+        : levels.find((l) => l.h === p.quality)?.i ?? -1;
       if (idx === -1) {
         const below = levels.filter((l) => l.h > 0 && l.h <= p.quality).sort((a, b) => b.h - a.h)[0];
         idx = below?.i ?? -1;
@@ -1426,6 +1502,45 @@ export function PlayerOverlay() {
   const attachSourceRef = useRef(attachSource);
   attachSourceRef.current = attachSource;
 
+  /** ladder rung switch without the stall — edge-aligned. Both directions
+   *  need it: a playhead riding deep on one rung is often OUTSIDE the other
+   * rung's servable window (the Source playlist lists only the live 4-6
+   * segments; the turbo warm band sits 2-7 segments back), so a plain flush
+   * at the current position stalls — hls.js waits forever with an empty
+   * buffer and the live-edge watchdog only recovers it after a 25s+ freeze
+   * (the "quality picks load so much" report). Jump the playhead to the
+   * live edge - ~12s FIRST — still inside the CURRENT rung's buffer, so the
+   * seek is instant — then flush: the first fragment request lands where
+   * the target rung actually has (or can instantly get) bytes. TURBO
+   * targets always flush (encode-bound rungs must show the pick NOW);
+   * the CDN-direct Source rides the boundary smoothly on a shallow buffer. */
+  const warmBandSwitch = useCallback(
+    (hlsL: Hls, level: number, turboTarget: boolean) => {
+      const v = videoRef.current;
+      const ahead = v && v.buffered.length ? v.buffered.end(v.buffered.length - 1) - v.currentTime : 0;
+      const seekToEdge = () => {
+        if (!v || !v.seekable.length || ahead <= 14) return;
+        const end = v.seekable.end(v.seekable.length - 1);
+        if (!Number.isFinite(end)) return;
+        try {
+          v.currentTime = Math.max(0, end - 12);
+        } catch {
+          /* seekable not ready — plain flush below still switches */
+        }
+      };
+      if (turboTarget) {
+        seekToEdge();
+        hlsL.currentLevel = level; // flush NOW at the edge-aligned position
+      } else if (ahead > 20) {
+        seekToEdge();
+        hlsL.currentLevel = level;
+      } else {
+        hlsL.nextLevel = level; // shallow buffer — smooth boundary switch
+      }
+    },
+    []
+  );
+
   /** switch to a transcoded rendition (144p → 1080p) of the current stream.
    *  opts.auto marks a connectivity-engine pick — keeps the user's Auto.
    *  ⚠ v1.3 LADDER SOURCES: the rungs are native hls levels — this maps to
@@ -1438,23 +1553,34 @@ export function PlayerOverlay() {
       // ladder master — the rung already exists as a level: switch in place
       const hlsL = hlsRef.current;
       if (ladderMasterRef.current && hlsL && hlsL.levels?.length) {
-        const lvls = hlsL.levels.map((l, i) => ({ i, h: l.height || 0 }));
-        const exact = lvls.find((l) => l.h === height);
+        const lvls = hlsL.levels.map((l, i) => ({
+          i,
+          h: l.height || 0,
+          src: /raw=1/.test((l.url || []).join('')),
+        }));
+        // a native ask (the Source rung, or its probed height) pins the
+        // SOURCE — the level list may not expose its height on cold isolates
+        const srcLvl = lvls.find((l) => l.src);
+        const nativeAsk =
+          height === 0 || (!!srcLvl && height >= (nativeHeightRef.current || Infinity) - 60);
+        const exact = nativeAsk ? srcLvl : lvls.find((l) => l.h === height);
         const below = lvls.filter((l) => l.h > 0 && l.h <= height).sort((a, b) => b.h - a.h)[0];
         const pick = exact || below;
         if (pick) {
           setShowQualityMenu(false);
           // buffer-aware switch: a deep buffer would delay a nextLevel switch
           // by the whole runway (up to a minute) — flush instead so a manual
-          // data-saver pick takes effect NOW (YouTube-style brief blip)
-          const vid = videoRef.current;
-          const ahead = vid && vid.buffered.length ? vid.buffered.end(vid.buffered.length - 1) - vid.currentTime : 0;
-          if (ahead > 20) hlsL.currentLevel = pick.i;
-          else hlsL.nextLevel = pick.i;
+          // data-saver pick takes effect NOW. TURBO rungs are encode-bound:
+          // flush THROUGH the warm band (see warmBandSwitch) or the playhead
+          // lands outside the rung's live window and stalls to a freeze.
+          const lvlUrls = (hlsL.levels[pick.i]?.url || []).join('');
+          const turboTarget = !/raw=1/.test(lvlUrls);
+          warmBandSwitch(hlsL, pick.i, turboTarget);
           setCurrentQuality(pick.i);
-          updatePrefs({ quality: height, autoPicked: !!opts.auto });
+          // persist the NATIVE preference when the pick was the Source rung
+          updatePrefs({ quality: pick.src ? 0 : height, autoPicked: !!opts.auto });
           if (opts.auto) setAutoDs(true);
-          showToast(t('player.qualityToast', { label: `${height}p` }));
+          showToast(t('player.qualityToast', { label: pick.src ? 'Source' : `${height}p` }));
           return;
         }
       }
@@ -1542,7 +1668,7 @@ export function PlayerOverlay() {
           .catch(() => {});
       }
     },
-    [attachSource, showToast, t]
+    [attachSource, showToast, t, warmBandSwitch]
   );
   useEffect(() => {
     selectDataSaverRef.current = selectDataSaver;
@@ -1569,10 +1695,13 @@ export function PlayerOverlay() {
     (level: number) => {
       setShowQualityMenu(false);
       // persist the preference so every future stream opens at this quality.
-      // 'Source' (the ladder master's top rung) persists as quality 0 — the
-      // documented "source/native" preference — so it survives reloads.
+      // The ladder's Source rung persists as quality 0 (the documented
+      // "source/native" preference) — identified by LEVEL INDEX, not label
+      // (the entry relabels to its native "720p"/"1080p" once probed, and a
+      // relabeled pick must still persist as the native preference).
       const label = level === -1 ? t('player.auto') : quality.find((q) => q.level === level)?.label ?? '';
-      const height = level === -1 ? -1 : label === 'Source' ? 0 : parseInt(label, 10) || -1;
+      const isSourceRung = level >= 0 && level === srcLevelRef.current;
+      const height = level === -1 ? -1 : isSourceRung ? 0 : parseInt(label, 10) || -1;
       updatePrefs({ quality: height, autoPicked: false });
       if (tcHeight !== null) {
         // leaving the data-saver ladder — restore the native feed, pin level
@@ -1591,15 +1720,26 @@ export function PlayerOverlay() {
       if (!hls) return;
       // buffer-aware switch: nextLevel rides the boundary smoothly on a
       // shallow buffer; a deep runway would hide the pick for up to a minute —
-      // flush instead (brief blip, immediate effect — what a manual pick means)
-      const vid = videoRef.current;
-      const ahead = vid && vid.buffered.length ? vid.buffered.end(vid.buffered.length - 1) - vid.currentTime : 0;
-      if (level >= 0 && ahead > 20) hls.currentLevel = level;
-      else hls.nextLevel = level;
+      // flush instead (brief blip, immediate effect — what a manual pick
+      // means). TURBO rungs are encode-bound: flush THROUGH the warm band
+      // (see warmBandSwitch) so the pick takes effect now without stalling.
+      const lvlUrls = level >= 0 && hls.levels?.[level] ? (hls.levels[level].url || []).join('') : '';
+      const turboTarget =
+        ladderMasterRef.current && level >= 0 && (hls.levels?.[level]?.height || 0) > 0 && !/raw=1/.test(lvlUrls);
+      const srcOnLadder = ladderMasterRef.current && level >= 0 && /raw=1/.test(lvlUrls);
+      if (level >= 0 && (turboTarget || srcOnLadder)) {
+        warmBandSwitch(hls, level, !!turboTarget);
+      } else {
+        const vid = videoRef.current;
+        const ahead =
+          vid && vid.buffered.length ? vid.buffered.end(vid.buffered.length - 1) - vid.currentTime : 0;
+        if (level >= 0 && ahead > 20) hls.currentLevel = level;
+        else hls.nextLevel = level;
+      }
       setCurrentQuality(level);
       showToast(level === -1 ? t('player.qualityAutoToast') : t('player.qualityToast', { label }));
     },
-    [quality, showToast, tcHeight, attachSource, t]
+    [quality, showToast, tcHeight, attachSource, t, warmBandSwitch]
   );
 
   /* ── per-stream server switching (original-repo feature) ───────────── */

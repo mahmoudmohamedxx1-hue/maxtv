@@ -31,6 +31,34 @@ export interface LadderRung {
   bandwidth: number;
 }
 
+/* ── native-height cache ────────────────────────────────────────────────────
+ * Single-rendition media playlists never declare resolution, so the Source
+ * rung used to surface in the player's quality menu as a bare "Source" — the
+ * user never saw the channel's real 720p/1080p entry ("there is no 720p and
+ * 1080p which are the native quality"). /api/turbo?mode=native probes the
+ * real height once per channel (ffmpeg -i on a window segment) and parks it
+ * here; every subsequent ladder master then carries RESOLUTION on the Source
+ * rung, so hls.js reports a real level height and the menu labels it
+ * "720p"/"1080p" from the very first manifest parse. Per-isolate memory —
+ * cold isolates re-learn it on the first probe (the client also fires one
+ * probe per channel open). */
+const nhG = globalThis as { __maxtvNativeH?: Map<string, number> };
+if (!nhG.__maxtvNativeH) nhG.__maxtvNativeH = new Map();
+
+export function rememberNativeHeight(channel: string, h: number): void {
+  if (h > 0) nhG.__maxtvNativeH!.set(channel, h);
+}
+
+export function knownNativeHeight(channel: string): number {
+  return nhG.__maxtvNativeH!.get(channel) || 0;
+}
+
+/** even 16:9 width for a ladder height (x264 requires even dimensions) */
+function evenW(h: number): number {
+  const w = Math.round((h * 16) / 9);
+  return w % 2 ? w + 1 : w;
+}
+
 /** turbo &h= rungs served in the master (the serverless data-saver engine).
  *  720/1080 stay OFF the transcode ladder — 1-vCPU encodes run slower than
  *  realtime up there (proven 2026-10-08); the native Source rung covers them. */
@@ -60,8 +88,12 @@ export function buildLadderMaster(opts: {
    *  WITHOUT the leading '?' — the Source rung appends &ch/&srv/&raw=1 */
   signedQuery: string;
   srv?: string;
+  /** probed native height of the source (0/undefined = unknown) — when
+   *  known, the Source rung carries RESOLUTION so the player's quality menu
+   * shows the real "720p"/"1080p" entry instead of a bare "Source" */
+  nativeH?: number;
 }): string {
-  const { channel, signedQuery, srv } = opts;
+  const { channel, signedQuery, srv, nativeH } = opts;
   const ch = encodeURIComponent(channel);
   const out: string[] = [
     '#EXTM3U',
@@ -71,7 +103,11 @@ export function buildLadderMaster(opts: {
     out.push(`#EXT-X-STREAM-INF:BANDWIDTH=${r.bandwidth},RESOLUTION=${r.w}x${r.h}`);
     out.push(`/api/turbo?channel=${ch}&h=${r.h}&mode=m3u8`);
   }
-  out.push(`#EXT-X-STREAM-INF:BANDWIDTH=${SOURCE_RUNG_BANDWIDTH}`);
+  out.push(
+    `#EXT-X-STREAM-INF:BANDWIDTH=${SOURCE_RUNG_BANDWIDTH}${
+      nativeH && nativeH > 0 ? `,RESOLUTION=${evenW(nativeH)}x${nativeH}` : ''
+    }`
+  );
   out.push(
     `/api/hls?${signedQuery}&ch=${ch}${srv ? `&srv=${encodeURIComponent(srv)}` : ''}&raw=1`
   );

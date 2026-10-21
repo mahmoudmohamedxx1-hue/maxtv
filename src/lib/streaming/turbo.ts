@@ -46,6 +46,7 @@ import { spawn } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { rememberNativeHeight } from './ladder-master';
 
 const MAX_SESSIONS = 6;
 const IDLE_KILL_MS = 45_000;
@@ -344,6 +345,59 @@ export class TurboSession {
   }
 
   // ── per-segment transcode ladder (the serverless data-saver) ────────────
+
+  /** cached source video height (0 = not yet probed) — powers mode=native */
+  private probedH = 0;
+  private probingH: Promise<number> | null = null;
+
+  /** the channel id this session serves (for the ladder-master native-height
+   *  cache) — extracted from the session key (ch<id>[m<pin>]) */
+  private get channelId(): string {
+    const m = this.key.match(/^ch(\d+)/);
+    return m ? m[1] : '';
+  }
+
+  /** Probe the source's REAL video height: single-rendition media playlists
+   *  never declare resolution, so the ladder master's Source rung ships
+   *  without RESOLUTION and the player's quality menu showed a bare "Source"
+   *  instead of the channel's native "720p"/"1080p" entry. Runs ffmpeg -i on
+   *  the newest in-memory window segment (no extra network fetch once the
+   *  window has anything), parses the Video stream line, and caches the
+   *  result on the session + the per-channel ladder cache (so subsequent
+   *  masters embed RESOLUTION). In-flight dedupe: concurrent asks share one
+   *  probe. Returns 0 when nothing landed within the budget. */
+  nativeHeight(budgetMs = 5_500): Promise<number> {
+    if (this.probedH > 0) return Promise.resolve(this.probedH);
+    if (this.probingH) return this.probingH;
+    const ch = this.channelId;
+    this.probingH = (async () => {
+      const t0 = Date.now();
+      try {
+        while (Date.now() - t0 < budgetMs && !this.dead) {
+          await this.kick(600);
+          const w = this.windowRange(true);
+          const newest = w?.list?.[w.list.length - 1];
+          if (newest) {
+            const seg = this.segs.get(newest.sn);
+            if (seg?.ts?.length) {
+              const h = await probeHeightBytes(seg.ts);
+              if (h > 0) {
+                this.probedH = h;
+                if (ch) rememberNativeHeight(ch, h);
+                return h;
+              }
+            }
+          }
+        }
+      } catch {
+        /* best effort */
+      } finally {
+        this.probingH = null;
+      }
+      return this.probedH;
+    })();
+    return this.probingH;
+  }
 
   /** transcoded segment cache — key `${sn}:${h}` (bounded, LRU by sn order) */
   private readonly tcSegs = new Map<string, Uint8Array>();
@@ -793,6 +847,55 @@ async function tcSlot(priority: boolean): Promise<() => void> {
     tcActive--;
     tcQueue.shift()?.resolve();
   };
+}
+
+/** one-shot ffmpeg -i probe: TS bytes → declared video height (0 on failure).
+ *  `ffmpeg -i` without an output exits non-zero BY DESIGN ("At least one
+ *  output file must be specified") — the stream info we need is on stderr,
+ *  so parse regardless of exit code. Regex targets the resolution on the
+ *  Video stream line: "Video: h264 (High) …, yuv420p(tv), 1280x720 [SAR …]" */
+function probeHeightBytes(ts: Uint8Array): Promise<number> {
+  const exe = ffmpegExecutable();
+  if (!exe) return Promise.resolve(0);
+  return new Promise<number>((res) => {
+    let stderr = '';
+    let done = false;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'maxtv-probe-'));
+    const inPath = path.join(dir, 'in.ts');
+    let p: ReturnType<typeof spawn>;
+    try {
+      fs.writeFileSync(inPath, ts);
+      p = spawn(exe, ['-hide_banner', '-i', inPath], { stdio: ['ignore', 'ignore', 'pipe'] });
+    } catch {
+      try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ }
+      res(0);
+      return;
+    }
+    const cleanup = () => {
+      try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ }
+    };
+    const finish = (h: number) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      try { p.kill('SIGKILL'); } catch { /* already gone */ }
+      cleanup();
+      res(h);
+    };
+    const timer = setTimeout(() => finish(0), 6_000);
+    p.stderr?.on('data', (d: Buffer) => {
+      stderr += d.toString();
+      if (stderr.includes('Video:')) {
+        const m = stderr.match(/Video:[^\n]*?,\s\d{2,5}x(\d{2,5})/);
+        if (m) finish(parseInt(m[1], 10));
+      }
+    });
+    p.on('error', () => finish(0));
+    p.on('close', () => {
+      const m = stderr.match(/Video:[^\n]*?,\s\d{2,5}x(\d{2,5})/);
+      finish(m ? parseInt(m[1], 10) : 0);
+    });
+  });
 }
 
 /** one-shot ffmpeg: TS bytes in → scaled h264 TS bytes out (null on failure).

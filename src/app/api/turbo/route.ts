@@ -2,6 +2,7 @@ import { NextResponse, after } from 'next/server';
 import { getTurboSession, SEG_LADDER_HEIGHTS, TurboSession } from '@/lib/streaming/turbo';
 import { ffmpegCapable, SERVERLESS } from '@/lib/streaming/ffmpeg-cap';
 import { setProxyOriginFromRequest } from '@/lib/streaming/upstream';
+import { rememberNativeHeight } from '@/lib/streaming/ladder-master';
 
 export const dynamic = 'force-dynamic';
 /** per-segment transcodes can take up to ~10s (kick + upstream fetch + encode)
@@ -69,6 +70,25 @@ export async function GET(req: Request) {
 
   if (!channel || !/^\d+$/.test(channel)) {
     return NextResponse.json({ error: 'bad_channel' }, { status: 400 });
+  }
+
+  // ── native-height probe — the ladder master's Source rung ships without
+  // RESOLUTION (single-rendition playlists never declare it), so the quality
+  // menu showed a bare "Source" instead of the channel's real 720p/1080p
+  // entry. The player fires this once per channel open; the answer relabels
+  // the Source menu item AND (per-isolate) teaches buildLadderMaster to embed
+  // RESOLUTION, so future masters carry it natively.
+  if (mode === 'native') {
+    const session = getTurboSession(channel, mirror);
+    session.touch();
+    const h = await session.nativeHeight(5_500);
+    if (h > 0) rememberNativeHeight(channel, h);
+    return NextResponse.json(
+      { h },
+      // browser-cacheable: height is stable for a channel's lifetime — repeat
+      // channel opens skip the probe round-trip entirely
+      { headers: { 'cache-control': 'public, max-age=1800', 'access-control-allow-origin': '*' } }
+    );
   }
 
   const hRaw = parseInt(searchParams.get('h') || '', 10);

@@ -6,7 +6,7 @@ import { proxyHlsRequest } from '@/lib/streaming/proxy';
 import { verifySignature } from '@/lib/streaming/resolve';
 import { resolveDaddyLiveStream } from '@/lib/sports/daddylive';
 import { setProxyOriginFromRequest } from '@/lib/streaming/upstream';
-import { buildLadderMaster } from '@/lib/streaming/ladder-master';
+import { buildLadderMaster, knownNativeHeight } from '@/lib/streaming/ladder-master';
 import { peekTurboSession } from '@/lib/streaming/turbo';
 
 export const dynamic = 'force-dynamic';
@@ -87,7 +87,11 @@ export async function GET(req: Request) {
     // rebuild the SIGNED query (url/r/s) for the Source rung — the same
     // params this request validated, so the variant passes signature checks
     const signedQuery = `url=${encodeURIComponent(target)}&r=${encodeURIComponent(referer)}&s=${encodeURIComponent(sig)}`;
-    return new Response(buildLadderMaster({ channel: ch, signedQuery, srv: srv || undefined }), {
+    // probed native height (per-isolate cache, learned by /api/turbo?mode=native)
+    // — embeds RESOLUTION on the Source rung so the player's quality menu
+    // shows the channel's real "720p"/"1080p" entry instead of a bare "Source"
+    const nativeH = knownNativeHeight(ch) || undefined;
+    return new Response(buildLadderMaster({ channel: ch, signedQuery, srv: srv || undefined, nativeH }), {
       status: 200,
       headers: {
         'access-control-allow-origin': '*',
