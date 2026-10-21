@@ -66,15 +66,25 @@ interface Entry {
 const cache = new Map<string, Entry>();
 let cacheBytes = 0;
 const failures = new Map<string, { n: number; nextAt: number }>();
-const inflight = new Set<string>();
+/** in-flight prefetch promises by URL — the loader JOINS these instead of
+ *  racing them with a duplicate request (the duplicate wasted a second cold
+ *  encode on another isolate and delayed both) */
+const inflight = new Map<string, Promise<Uint8Array | null>>();
 let active = 0;
 
 /* debug counters — surfaced on window.__maxtvPrefetch for E2E inspection */
-const dbg = { hits: 0, prefetched: 0, fails: 0 };
+const dbg = { hits: 0, joined: 0, prefetched: 0, fails: 0 };
 
 /** Pop a prefetched segment for the loader. Returns null on miss/expiry.
  *  Keyed by cacheKey() — session-churn-proof for segdl URLs. */
 export function takeCachedSegment(url: string): Uint8Array | null {
+  const ts = peekCache(url);
+  if (ts) dbg.hits++;
+  return ts;
+}
+
+/** cache peek without counters (shared by takeCachedSegment + awaitSegment) */
+function peekCache(url: string): Uint8Array | null {
   const e = cache.get(cacheKey(url));
   if (!e) return null;
   if (Date.now() - e.at > TTL_MS) {
@@ -82,7 +92,6 @@ export function takeCachedSegment(url: string): Uint8Array | null {
     cacheBytes -= e.bytes;
     return null;
   }
-  dbg.hits++;
   return e.ts;
 }
 
@@ -168,22 +177,53 @@ function prefetch(url: string): void {
   if (f && (f.n >= MAX_ATTEMPTS || Date.now() < f.nextAt)) return;
   if (active >= MAX_CONCURRENT) return; // next trigger (poll/frag) retries
   active++;
-  inflight.add(url);
   const isSegdl = url.indexOf(SEGDL_MARK) !== -1;
-  (isSegdl ? fetchSegdlSegment(url) : fetchTurboSegment(url))
+  const p = (isSegdl ? fetchSegdlSegment(url) : fetchTurboSegment(url))
     .then((ts) => {
       if (ts && ts.length >= 188) {
         store(url, ts);
         failures.delete(url);
-      } else {
-        recordFailure(url);
+        return ts;
       }
+      recordFailure(url);
+      return null;
     })
-    .catch(() => recordFailure(url))
+    .catch(() => {
+      recordFailure(url);
+      return null;
+    })
     .finally(() => {
       inflight.delete(url);
       active--;
     });
+  inflight.set(url, p);
+}
+
+/** Join an in-flight prefetch for this URL (bounded wait). Returns the bytes
+ *  when they land in time, null on miss/timeout/failure — the loader then
+ *  falls through to its own network path. This is what turns hls.js's own
+ *  sequential requests and the prefetcher's ahead-window into ONE encode per
+ *  segment instead of racing duplicates on separate isolates. */
+function awaitSegment(url: string, timeoutMs = 6_000): Promise<Uint8Array | null> {
+  const hit = peekCache(url);
+  if (hit) {
+    dbg.joined++;
+    return Promise.resolve(hit);
+  }
+  const p = inflight.get(url);
+  if (!p) return Promise.resolve(null);
+  return Promise.race([
+    p.then((ts) => {
+      if (ts && ts.length >= 188) dbg.joined++;
+      return ts && ts.length >= 188 ? ts : null;
+    }),
+    new Promise<null>((r) => setTimeout(() => r(null), timeoutMs)),
+  ]);
+}
+
+/** the loader's entry point — join an in-flight prefetch, bounded. */
+export function joinPrefetch(url: string, timeoutMs = 6_000): Promise<Uint8Array | null> {
+  return awaitSegment(url, timeoutMs);
 }
 
 /** Cache identity for a segment URL.

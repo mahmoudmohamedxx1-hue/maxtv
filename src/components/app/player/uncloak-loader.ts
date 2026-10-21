@@ -30,7 +30,7 @@
 import Hls from 'hls.js';
 import { unwrapSegmentBrowser } from '@/lib/player/uncloak-browser';
 import { SEGDL_MARK, isDirectHost, segdlTarget } from './cdn-direct';
-import { takeCachedSegment } from './seg-prefetch';
+import { takeCachedSegment, joinPrefetch } from './seg-prefetch';
 
 /* ── direct-path circuit breaker ──────────────────────────────────────────────
  * When the direct path genuinely can't deliver (CDN drops CORS, a restrictive
@@ -77,11 +77,14 @@ function instantStats(bytes: number, start: number) {
   };
 }
 
-/* eslint-disable @typescript-eslint/no-explicit-any — hls.js loader types are
-   structural; we mirror the LoaderCallbacks/LoaderStats shapes by hand. */
+// hls.js loader types are structural; we mirror the LoaderCallbacks /
+// LoaderStats shapes by hand — hence the `any` throughout this class.
 
 export class UncloakDirectLoader extends (Hls.DefaultConfig.loader as any) {
   private __abortCtrl: AbortController | null = null;
+  /** bumped on every load()/abort() — a pending prefetch-join from a
+   *  superseded request must never deliver into the new one */
+  private __loadGen = 0;
 
   load(context: any, config: any, callbacks: any): void {
     const url: string = context?.url || '';
@@ -93,6 +96,7 @@ export class UncloakDirectLoader extends (Hls.DefaultConfig.loader as any) {
     // carry the /api/segdl?u= mark, so the URL check stays the real gate.
     const ctxType: string = context?.type || '';
     const isFragmentLoad = ctxType === 'fragment' || ctxType.endsWith('fragment');
+    const gen = ++this.__loadGen;
     if (isFragmentLoad) {
       // 2026-10-22: prefetched segment (ladder rungs + Source) → serve from
       // the in-page cache with zero network on the playhead's critical path
@@ -103,7 +107,19 @@ export class UncloakDirectLoader extends (Hls.DefaultConfig.loader as any) {
         return;
       }
     }
-    if (isFragmentLoad && url.includes(SEGDL_MARK) && directPathOpen()) {
+    const isSegdl = url.includes(SEGDL_MARK);
+    if (isFragmentLoad && !(isSegdl && directPathOpen())) {
+      // no cached bytes yet — JOIN an in-flight prefetch for this URL
+      // (bounded) instead of racing it with a duplicate request. hls.js's
+      // own sequential loads and the prefetcher's ahead-window then share
+      // ONE encode per segment (measured pre-fix: every rung segment fetched
+      // twice, the duplicate burning a second cold encode on another
+      // isolate). Healthy-CDN segdl loads skip the join — the direct fetch
+      // is faster than any wait.
+      void this.__joinThenLoad(context, config, callbacks, url, gen);
+      return;
+    }
+    if (isFragmentLoad && isSegdl && directPathOpen()) {
       const target = segdlTarget(url);
       if (target && isDirectHost(target) && typeof DecompressionStream !== 'undefined') {
         void this.__loadDirect(context, config, callbacks, target);
@@ -113,7 +129,44 @@ export class UncloakDirectLoader extends (Hls.DefaultConfig.loader as any) {
     super.load(context, config, callbacks);
   }
 
+  /** await an in-flight prefetch for `url`; serve it when it lands in time,
+   *  otherwise fall through to the direct/super paths. */
+  private async __joinThenLoad(
+    context: any,
+    config: any,
+    callbacks: any,
+    url: string,
+    gen: number
+  ): Promise<void> {
+    let ts: Uint8Array | null = null;
+    try {
+      ts = await joinPrefetch(url, 6_000);
+    } catch {
+      ts = null;
+    }
+    if (gen !== this.__loadGen) return; // superseded (abort / new load)
+    if (ts && ts.length >= 188) {
+      const now = performance.now();
+      callbacks.onSuccess({ url: context.url, data: ts }, instantStats(ts.length, now), context, null);
+      return;
+    }
+    const isSegdl = url.includes(SEGDL_MARK);
+    if (isSegdl) {
+      const target = segdlTarget(url);
+      if (directPathOpen() && target && isDirectHost(target) && typeof DecompressionStream !== 'undefined') {
+        void this.__loadDirect(context, config, callbacks, target);
+        return;
+      }
+    }
+    try {
+      super.load(context, config, callbacks);
+    } catch {
+      /* loader destroyed mid-switch — nothing to do */
+    }
+  }
+
   abort(): void {
+    this.__loadGen++; // pending prefetch-joins must not deliver
     this.__abortCtrl?.abort();
     this.__abortCtrl = null;
     super.abort();
