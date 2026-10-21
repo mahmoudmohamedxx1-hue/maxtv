@@ -51,6 +51,30 @@ function segdlTarget(url: string): string | null {
   return /^https?:\/\//i.test(u) ? u : null;
 }
 
+/* ── direct-path circuit breaker ──────────────────────────────────────────────
+ * When the direct path genuinely can't deliver (CDN drops CORS, a restrictive
+ * network blocks it), every segment would otherwise pay a failed direct
+ * attempt BEFORE the server fallback — an extra roundtrip on the critical
+ * path, forever. Five consecutive failures trips the breaker for 2 minutes;
+ * any success resets it. Intermittent flaps (one bad segment in ten) never
+ * trip it because the consecutive counter resets on every success. */
+const BREAKER_MAX_FAILS = 5;
+const BREAKER_COOLDOWN_MS = 120_000;
+const breaker = { fails: 0, openUntil: 0 };
+
+function directPathOpen(): boolean {
+  return breaker.fails < BREAKER_MAX_FAILS || Date.now() >= breaker.openUntil;
+}
+
+function recordDirect(ok: boolean): void {
+  if (ok) {
+    breaker.fails = 0;
+    breaker.openUntil = 0;
+  } else if (++breaker.fails >= BREAKER_MAX_FAILS) {
+    breaker.openUntil = Date.now() + BREAKER_COOLDOWN_MS;
+  }
+}
+
 /* eslint-disable @typescript-eslint/no-explicit-any — hls.js loader types are
    structural; we mirror the LoaderCallbacks/LoaderStats shapes by hand. */
 
@@ -59,7 +83,15 @@ export class UncloakDirectLoader extends (Hls.DefaultConfig.loader as any) {
 
   load(context: any, config: any, callbacks: any): void {
     const url: string = context?.url || '';
-    if (context?.type === 'fragment' && url.includes(SEGDL_MARK)) {
+    // ⚠ hls.js ≥1.5 labels media fragments 'media-fragment' (older versions
+    // sent 'fragment') — the strict 'fragment' check silently skipped the
+    // direct path on every hls.js ≥1.5, routing ALL Source-rung segments
+    // through the /api/segdl server fallback (2-7s per segment instead of
+    // 133-412ms CDN-direct). Match both spellings; only segment URLs ever
+    // carry the /api/segdl?u= mark, so the URL check stays the real gate.
+    const ctxType: string = context?.type || '';
+    const isFragmentLoad = ctxType === 'fragment' || ctxType.endsWith('fragment');
+    if (isFragmentLoad && url.includes(SEGDL_MARK) && directPathOpen()) {
       const target = segdlTarget(url);
       if (target && isDirectHost(target) && typeof DecompressionStream !== 'undefined') {
         void this.__loadDirect(context, config, callbacks, target);
@@ -114,9 +146,12 @@ export class UncloakDirectLoader extends (Hls.DefaultConfig.loader as any) {
       };
       // segment response — hls.js accepts Uint8Array fragment payloads
       directOk = true;
+      recordDirect(true);
       callbacks.onSuccess({ url: context.url, data: ts }, stats, context, null);
     } catch {
       /* fall through to the server fallback below */
+      // aborted loads (channel/quality change) are not direct-path failures
+      if (!ctrl.signal.aborted) recordDirect(false);
     } finally {
       if (this.__abortCtrl === ctrl) this.__abortCtrl = null;
     }
