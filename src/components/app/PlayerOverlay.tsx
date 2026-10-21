@@ -1534,8 +1534,19 @@ export function PlayerOverlay() {
       if (ahead > 14 && v && v.seekable.length) {
         const end = v.seekable.end(v.seekable.length - 1);
         if (Number.isFinite(end)) {
+          // COLD-RUNG RUNWAY: a target level never polled this session may
+          // still be spinning its encoder up (5-15s). Landing 12s from the
+          // edge puts the playhead AT the encode frontier once the
+          // prefetched band plays out (measured 2026-10-22, ch91 → 144p:
+          // single stall cluster right at the frontier; the pre-tip-404
+          // cascade was fixed in 5e509f4, this is the residual). Land
+          // deeper on cold targets — inside the fresh-level prewarm band
+          // (ride−1 … tip, ≈6 segments) so the band is real runway and
+          // the encoder settles before the playhead reaches the tip.
+          // Polled targets (hot rungs, recent Source) keep the tight 12s.
+          const cold = !hlsL.levels?.[level]?.details?.fragments?.length;
           try {
-            v.currentTime = Math.max(0, end - 12);
+            v.currentTime = Math.max(0, end - (cold ? 16 : 12));
           } catch {
             /* seekable not ready — the flush below still switches */
           }
