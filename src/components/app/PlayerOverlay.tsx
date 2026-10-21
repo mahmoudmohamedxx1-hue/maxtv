@@ -36,6 +36,7 @@ import {
   DL_SERVERS,
   RESILIENT_LOAD_POLICIES,
   LADDER_HLS_CONFIG,
+  LADDER_MASTER_HLS_CONFIG,
   DATA_SAVER_HEIGHTS,
   isDlIframeSrc,
   type AltServer,
@@ -53,6 +54,7 @@ import {
   probeTcCap,
 } from './player/utils';
 import { createNetWatcher } from './player/createNetWatcher';
+import { UncloakDirectLoader } from './player/uncloak-loader';
 import { QualityMenu } from './player/QualityMenu';
 import { ServersMenu } from './player/ServersMenu';
 import { SurfSidebar } from './player/SurfSidebar';
@@ -158,6 +160,13 @@ export function PlayerOverlay() {
   const codecRecovRef = useRef<{ chId: string; count: number }>({ chId: '', count: 0 });
   /** ref mirror of tcHeight for hls event closures */
   const tcHeightRef = useRef<number | null>(null);
+  /** v1.3 — the current attachment plays the synthetic QUALITY LADDER master
+   *  (turbo rungs + CDN-direct Source rung). On ladder sources the quality
+   *  menu is the native hls level list: every pick is an in-place level
+   *  switch — NEVER a source re-attach (the "144p changed the channel then
+   *  came back" bug). */
+  const [ladderMaster, setLadderMaster] = useState(false);
+  const ladderMasterRef = useRef(false);
   useEffect(() => {
     tcHeightRef.current = tcHeight;
   }, [tcHeight]);
@@ -506,6 +515,11 @@ export function PlayerOverlay() {
 
         const src = data.url as string;
         nativeSrcRef.current = src;
+        // v1.3 — ladder master attachment: quality picks become in-place
+        // level switches from here on (see selectDataSaver / setLevel)
+        const isLadderSrc = /lad=1/.test(src);
+        ladderMasterRef.current = isLadderSrc;
+        setLadderMaster(isLadderSrc);
         setPhase('loading');
         const video = videoRef.current;
         if (!video) return;
@@ -526,6 +540,9 @@ export function PlayerOverlay() {
           // seed ABR with the browser's connection estimate so Auto starts on a
           // rung the link can actually sustain (instead of overshoot + stall).
           const budget = connectionBudget();
+          // v1.3 ladder master (lad=1): CDN-direct Source rung + turbo rungs —
+          // balanced ride distance; the custom loader uncloaks segments in-page
+          const isLadderSrc = /lad=1/.test(src);
           const hls = new Hls({
             // ⚠ lowLatencyMode MUST be false: with it on, hls.js's
             // latency-controller ramps playbackRate toward 2× to "catch up"
@@ -533,10 +550,16 @@ export function PlayerOverlay() {
             // bug. These CDNs are not LL-HLS anyway.
             lowLatencyMode: false,
             enableWorker: true,
+            // segment loader: DaddyLive segments resolve CDN-direct with
+            // in-browser uncloaking (ultra-low lag); falls back per-segment
+            // to the server route when the direct path can't deliver
+            loader: UncloakDirectLoader as unknown as typeof Hls.DefaultConfig.loader,
             // start the first fragment download while the manifest is still
             // parsing — shaves ~1-2s off channel changes (freestream-tv trick)
             startFragPrefetch: true,
-            ...hlsPerfConfig(loadPrefs().perfMode),
+            ...(isLadderSrc
+              ? LADDER_MASTER_HLS_CONFIG
+              : hlsPerfConfig(loadPrefs().perfMode)),
             ...RESILIENT_LOAD_POLICIES,
             ...(budget > 0 ? { abrEwmaDefaultEstimate: Math.max(400_000, budget * 0.75) } : {}),
           });
@@ -549,6 +572,7 @@ export function PlayerOverlay() {
           hls.attachMedia(video);
 
           hls.on(Hls.Events.MANIFEST_PARSED, () => {
+            const isLadder = ladderMasterRef.current;
             const buildLevels = () =>
               (hls.levels || []).map((l, i) => {
                 const resH = Number(String(l.attrs?.RESOLUTION ?? '').split('x')[1]) || 0;
@@ -558,15 +582,25 @@ export function PlayerOverlay() {
                 // decodes a frame.
                 const h = l.height || resH;
                 const k = Math.round((l.bitrate || 0) / 1000);
-                return { label: h ? `${h}p` : k > 0 ? `${k}k` : 'Source', level: i, height: h };
+                // ⚠ hls.js SORTS levels (height ascending) — the ladder's
+                // Source rung (no declared height) lands at index 0, NOT at
+                // the top. Identify it by its raw=1 variant URL, never by index.
+                const lvlUrl = (l.url || []).join('') || '';
+                const isSrc = isLadder && /raw=1/.test(lvlUrl);
+                const label = isSrc ? 'Source' : h ? `${h}p` : k > 0 ? `${k}k` : 'Source';
+                return { label, level: i, height: h };
               });
             const seen = new Set<string>();
             const levels = buildLevels().filter((l) => (seen.has(l.label) ? false : seen.add(l.label)));
             setQuality(levels.map(({ label, level }) => ({ label, level })));
-            // remember the native feed's best height — the ladder never encodes up
-            const knownH = levels.map((l) => l.height).filter((h) => h > 0);
-            if (knownH.length) {
-              nativeHeightRef.current = Math.max(...knownH);
+            // remember the native feed's best height — the ladder never encodes up.
+            // ⚠ ladder masters: the turbo rungs (144-480) are NOT the native
+            // height — only LEVEL_SWITCHED on the Source rung teaches the truth.
+            if (!isLadder) {
+              const knownH = levels.map((l) => l.height).filter((h) => h > 0);
+              if (knownH.length) {
+                nativeHeightRef.current = Math.max(...knownH);
+              }
             }
 
             const prefH = loadPrefs().quality;
@@ -588,12 +622,21 @@ export function PlayerOverlay() {
               }
               // the link is too slow for the native ladder → open transcoded.
               // ONLY when ladder heights are actually KNOWN (master playlists).
+              // ⚠ ladder masters already list the 144-480 rungs — the check
+              // below never fires for them (a rung always fits the budget).
               const ds = dataSaverForBudget(budget);
               const ladderKnown = levels.some((l) => l.height > 0);
               if (ds && canTc && ladderKnown && !levels.some((l) => l.height > 0 && l.height <= ds + 60)) {
                 void selectDataSaverRef.current?.(ds, { auto: true });
                 return;
               }
+            } else if (prefH === 0 && levels.length > 0) {
+              // 'Source' preference — pin the NATIVE rung (identified by its
+              // raw=1 URL — hls.js sorts levels, so "top" is NOT the Source)
+              const srcIdx = levels.findIndex((l) => l.label === 'Source');
+              const pin = srcIdx >= 0 ? srcIdx : levels.length - 1;
+              hls.currentLevel = pin;
+              setCurrentQuality(pin);
             } else if (prefH > 0 && levels.length > 1) {
               let idx = levels.find((l) => l.height === prefH)?.level ?? -1;
               if (idx === -1) {
@@ -624,6 +667,8 @@ export function PlayerOverlay() {
             // persisted data-saver preference the provider cannot satisfy
             // natively → switch to the real-time transcode ladder (with the
             // serverless segment-ladder guards — >480 asks stay native).
+            // ⚠ ladder masters carry the 144-480 rungs natively — hasNative
+            // is true and this never re-attaches (in-place switch above).
             if (prefH > 0 && (DATA_SAVER_HEIGHTS as readonly number[]).includes(prefH)) {
               const hasNative = levels.some((l) => l.height > 0 && l.height <= prefH + 60);
               const segOnly = ch.kind === 'daddylive' && tcSegRef.current && !tcRelayRef.current;
@@ -1011,6 +1056,20 @@ export function PlayerOverlay() {
         return;
       }
       if (!hls || !hls.levels?.length) return;
+      // 'Source' preference (0) — pin the NATIVE rung on ladder masters
+      // (identified by label; hls.js sorting makes "top" unreliable)
+      if (p.quality === 0) {
+        if (tcHeightRef.current === null) {
+          const labels = (hls.levels || []).map((l, i) => ({
+            i,
+            src: /raw=1/.test((l.url || []).join('')),
+          }));
+          const srcIdx = labels.find((l) => l.src)?.i ?? hls.levels.length - 1;
+          hls.nextLevel = srcIdx;
+          setCurrentQuality(srcIdx);
+        }
+        return;
+      }
       const levels = hls.levels.map((l, i) => ({ i, h: l.height || 0 }));
       let idx = levels.find((l) => l.h === p.quality)?.i ?? -1;
       if (idx === -1) {
@@ -1075,6 +1134,30 @@ export function PlayerOverlay() {
       openPlayer(next, altFeeds);
     }
   }, [altFeeds, player, openPlayer, showToast, t]);
+
+  /* ── ladder Source-rung keep-alive ──────────────────────────────────────────
+   * hls.js only polls the playlist of the CURRENT level — while the viewer
+   * sits on a turbo rung (144-480), the Source rung's raw=1 manifest is
+   * never polled: the dledge micro-cache expires, the CH_UP session drifts,
+   * and the later switch back to Source pays a cold pair-fetch at the worst
+   * moment (a flaky pair then escalates to a fatal walk). A 20s keep-alive
+   * fetch of the Source variant keeps every rung transition warm — and each
+   * poll also touches the channel's turbo session server-side (see
+   * /api/hls touchTurbo), keeping the rungs' transcode engine alive. */
+  useEffect(() => {
+    if (phase !== 'playing' || !ladderMaster) return;
+    const iv = setInterval(() => {
+      const hls = hlsRef.current;
+      if (!hls || !hls.levels?.length) return;
+      const srcUrl = hls.levels.find((l) => /raw=1/.test((l.url || []).join('')))?.url?.[0];
+      if (srcUrl) {
+        void fetch(srcUrl, { cache: 'no-store' }).catch(() => {
+          /* best-effort warmth — failures are silent by design */
+        });
+      }
+    }, 20_000);
+    return () => clearInterval(iv);
+  }, [phase, ladderMaster]);
 
   /* ── live-edge drift watcher ───────────────────────────────────────────── */
   useEffect(() => {
@@ -1229,14 +1312,24 @@ export function PlayerOverlay() {
       video.muted = prefs.muted;
       if (Hls.isSupported()) {
         // &h= ladder src → ride 5 segments back with a deep buffer (the encode
-        // needs lead time); native srcs keep the profile-tuned edge distance
-        const ladder = /\/api\/turbo\?.*\bh=\d+/.test(src);
+        // needs lead time); native srcs keep the profile-tuned edge distance.
+        // v1.3 ladder masters → the balanced ladder distance + the direct-
+        // segment loader; plain restores keep the profile config.
+        const ladderSeg = /\/api\/turbo\?.*\bh=\d+/.test(src);
+        const isLadderSrc = /lad=1/.test(src);
+        ladderMasterRef.current = isLadderSrc;
+        setLadderMaster(isLadderSrc);
         const hls = new Hls({
           // see load() — LL mode off or hls.js plays 2× catch-up
           lowLatencyMode: false,
           enableWorker: true,
-          ...hlsPerfConfig(loadPrefs().perfMode),
-          ...(ladder ? LADDER_HLS_CONFIG : null),
+          // CDN-direct segment uncloaking (v1.3) — no-ops for non-segdl URLs
+          loader: UncloakDirectLoader as unknown as typeof Hls.DefaultConfig.loader,
+          ...(isLadderSrc
+            ? LADDER_MASTER_HLS_CONFIG
+            : ladderSeg
+              ? LADDER_HLS_CONFIG
+              : hlsPerfConfig(loadPrefs().perfMode)),
           ...RESILIENT_LOAD_POLICIES,
         });
         hlsRef.current = hls;
@@ -1293,11 +1386,37 @@ export function PlayerOverlay() {
   attachSourceRef.current = attachSource;
 
   /** switch to a transcoded rendition (144p → 1080p) of the current stream.
-   *  opts.auto marks a connectivity-engine pick — keeps the user's Auto. */
+   *  opts.auto marks a connectivity-engine pick — keeps the user's Auto.
+   *  ⚠ v1.3 LADDER SOURCES: the rungs are native hls levels — this maps to
+   *  an IN-PLACE nextLevel switch. No re-attach, no reload, no channel
+   *  jump (the "144p changed the channel then returned" bug lived here). */
   const selectDataSaver = useCallback(
     (height: number, opts: { auto?: boolean } = {}) => {
       const cur = playerRef.current;
       if (!cur) return;
+      // ladder master — the rung already exists as a level: switch in place
+      const hlsL = hlsRef.current;
+      if (ladderMasterRef.current && hlsL && hlsL.levels?.length) {
+        const lvls = hlsL.levels.map((l, i) => ({ i, h: l.height || 0 }));
+        const exact = lvls.find((l) => l.h === height);
+        const below = lvls.filter((l) => l.h > 0 && l.h <= height).sort((a, b) => b.h - a.h)[0];
+        const pick = exact || below;
+        if (pick) {
+          setShowQualityMenu(false);
+          // buffer-aware switch: a deep buffer would delay a nextLevel switch
+          // by the whole runway (up to a minute) — flush instead so a manual
+          // data-saver pick takes effect NOW (YouTube-style brief blip)
+          const vid = videoRef.current;
+          const ahead = vid && vid.buffered.length ? vid.buffered.end(vid.buffered.length - 1) - vid.currentTime : 0;
+          if (ahead > 20) hlsL.currentLevel = pick.i;
+          else hlsL.nextLevel = pick.i;
+          setCurrentQuality(pick.i);
+          updatePrefs({ quality: height, autoPicked: !!opts.auto });
+          if (opts.auto) setAutoDs(true);
+          showToast(t('player.qualityToast', { label: `${height}p` }));
+          return;
+        }
+      }
       // deployments without ffmpeg have no ladder — stay native (one notice
       // per page load)
       if (!tcCapRef.current) {
@@ -1408,9 +1527,11 @@ export function PlayerOverlay() {
   const setLevel = useCallback(
     (level: number) => {
       setShowQualityMenu(false);
-      // persist the preference so every future stream opens at this quality
+      // persist the preference so every future stream opens at this quality.
+      // 'Source' (the ladder master's top rung) persists as quality 0 — the
+      // documented "source/native" preference — so it survives reloads.
       const label = level === -1 ? t('player.auto') : quality.find((q) => q.level === level)?.label ?? '';
-      const height = level === -1 ? -1 : parseInt(label, 10) || -1;
+      const height = level === -1 ? -1 : label === 'Source' ? 0 : parseInt(label, 10) || -1;
       updatePrefs({ quality: height, autoPicked: false });
       if (tcHeight !== null) {
         // leaving the data-saver ladder — restore the native feed, pin level
@@ -1427,10 +1548,13 @@ export function PlayerOverlay() {
       }
       const hls = hlsRef.current;
       if (!hls) return;
-      // ⚠ nextLevel, not currentLevel: an immediate switch flushes the whole
-      // live buffer and stalls playback — the smooth path switches at the
-      // next segment boundary as the buffered window plays out.
-      hls.nextLevel = level;
+      // buffer-aware switch: nextLevel rides the boundary smoothly on a
+      // shallow buffer; a deep runway would hide the pick for up to a minute —
+      // flush instead (brief blip, immediate effect — what a manual pick means)
+      const vid = videoRef.current;
+      const ahead = vid && vid.buffered.length ? vid.buffered.end(vid.buffered.length - 1) - vid.currentTime : 0;
+      if (level >= 0 && ahead > 20) hls.currentLevel = level;
+      else hls.nextLevel = level;
       setCurrentQuality(level);
       showToast(level === -1 ? t('player.qualityAutoToast') : t('player.qualityToast', { label }));
     },
@@ -1644,8 +1768,12 @@ export function PlayerOverlay() {
     player.kind === 'daddylive' ? (servers.length ? servers : ([...DL_SERVERS] as ServerOption[])) : [];
   const hasServerChoices = player.kind === 'daddylive' ? serverOptions.length > 0 : alternates.length > 0;
   const canDataSaver =
-    (player.kind === 'daddylive' && (tcCap || tcSeg)) ||
-    (player.kind !== 'daddylive' && !!tcSrcRef.current && tcCap);
+    // v1.3 ladder masters list the rungs as NATIVE levels — the data-saver
+    // section would duplicate them (and its entries used to re-attach the
+    // source: the quality-jump bug). Hide it; the level list is the menu.
+    !ladderMaster &&
+    ((player.kind === 'daddylive' && (tcCap || tcSeg)) ||
+      (player.kind !== 'daddylive' && !!tcSrcRef.current && tcCap));
   /** heights offered on the data-saver ladder. Serverless segment ladder:
    *  144–480 ONLY — encoding 720/1080 runs slower than realtime on a
    *  1-vCPU isolate, so those rungs became constant-loading traps. Full

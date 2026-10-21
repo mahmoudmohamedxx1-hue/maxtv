@@ -68,8 +68,9 @@ function warmPut(url: string, buf: Uint8Array): void {
   }
 }
 
-/** shared: turn upstream bytes into clean TS (or null when undecodable) */
-function decodeSegmentBytes(raw: Uint8Array, upstreamCt: string): Uint8Array | null {
+/** shared: turn upstream bytes into clean TS (or null when undecodable).
+ *  Also used by /api/segdl (the ladder Source-rung segment fallback route). */
+export function decodeSegmentBytes(raw: Uint8Array, upstreamCt: string): Uint8Array | null {
   if (raw.length < 188) return null;
   const isPng = raw[0] === 0x89 && raw[1] === 0x50;
   const isRiff = raw[0] === 0x52 && raw[1] === 0x49 && raw[2] === 0x46 && raw[3] === 0x46;
@@ -143,14 +144,46 @@ function absolutize(line: string, baseUrl: string): string {
   }
 }
 
+/** rewrite options:
+ *  • directSegs — the v1.3 ladder Source rung: segments are listed as
+ *    /api/segdl?u=<cdn> instead of the signed /api/hls proxy. The browser's
+ *    custom hls.js loader resolves those CLIENT-SIDE (CDN-direct fetch +
+ *    in-page uncloak, the ultra-low-lag path); everything else (Safari
+ *    native HLS, loader fallback) hits the segdl ROUTE, which fetches +
+ *    unwraps server-side. Keys/maps stay on the signed proxy either way.
+ *  • segdlHosts — which upstream hosts may take the segdl form (the TikTok
+ *    CDN family; anything else keeps the classic proxy URL). */
+export interface RewriteOptions {
+  directSegs?: boolean;
+  segdlHosts?: string[];
+}
+
+const SEGDL_DEFAULT_HOSTS = ['tiktokcdn-us.com', 'tiktokcdn.com', 'tiktokcdn-eu.com', 'tiktokv.us'];
+
+function segdlEligible(abs: string, hosts: string[]): boolean {
+  try {
+    const h = new URL(abs).hostname.toLowerCase();
+    return hosts.some((d) => h === d || h.endsWith(`.${d}`));
+  } catch {
+    return false;
+  }
+}
+
 /** Rewrite an m3u8 playlist body so every referenced uri routes via /api/hls.
  *  Live media playlists additionally trigger a speculative prefetch of the
  *  NEWEST segments (see the warm cache above) so the player never waits on
- *  the CDN's critical path. */
-export function rewritePlaylist(body: string, playlistUrl: string, referer: string): string {
+ *  the CDN's critical path. With opts.directSegs, segment lines of eligible
+ *  CDNs become /api/segdl URLs instead (see RewriteOptions). */
+export function rewritePlaylist(
+  body: string,
+  playlistUrl: string,
+  referer: string,
+  opts: RewriteOptions = {}
+): string {
   const lines = body.split('\n');
   const out: string[] = [];
   const segmentTargets: string[] = [];
+  const segdlHosts = opts.segdlHosts || SEGDL_DEFAULT_HOSTS;
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
@@ -169,8 +202,13 @@ export function rewritePlaylist(body: string, playlistUrl: string, referer: stri
     // plain uri lines
     if (line && !line.startsWith('#')) {
       const abs = absolutize(line, playlistUrl);
-      segmentTargets.push(abs);
-      out.push(proxyUrlFor(abs, referer));
+      if (opts.directSegs && segdlEligible(abs, segdlHosts)) {
+        // ladder Source rung — client-resolved, server fallback on the same URL
+        out.push(`/api/segdl?u=${encodeURIComponent(abs)}`);
+      } else {
+        segmentTargets.push(abs);
+        out.push(proxyUrlFor(abs, referer));
+      }
       continue;
     }
 
@@ -180,8 +218,10 @@ export function rewritePlaylist(body: string, playlistUrl: string, referer: stri
   // speculatively warm the newest segments (last K) — the player will ask
   // for them within seconds; a cache hit serves them at memory speed.
   // ONLY media playlists (never masters — their non-# lines are variant
-  // playlists, not segments — and never VOD/ENDLIST).
-  if (segmentTargets.length && !/#EXT-X-STREAM-INF|#EXT-X-ENDLIST/.test(body)) {
+  // playlists, not segments — and never VOD/ENDLIST). Direct-seg playlists
+  // skip it: the browser resolves those segments itself and the server-side
+  // warm cache would only double-fetch the CDN.
+  if (segmentTargets.length && !opts.directSegs && !/#EXT-X-STREAM-INF|#EXT-X-ENDLIST/.test(body)) {
     for (const t of segmentTargets.slice(-WARM_PREFETCH_COUNT)) void warmPrefetch(t, referer);
   }
   return out.join('\n');
@@ -195,13 +235,21 @@ export interface ProxyResult {
   stream?: ReadableStream<Uint8Array>;
 }
 
+export interface ProxyHlsOptions {
+  /** the v1.3 ladder Source rung — rewrite eligible segment URLs to
+ *    /api/segdl (client-direct with server fallback) instead of the
+ *    signed proxy (see rewritePlaylist's RewriteOptions) */
+  directSegs?: boolean;
+}
+
 /**
  * Main proxy entry — called by /api/hls route handler with validated inputs.
  */
 export async function proxyHlsRequest(
   target: string,
   referer: string,
-  range?: string
+  range?: string,
+  opts: ProxyHlsOptions = {}
 ): Promise<ProxyResult> {
   let host: string;
   try {
@@ -240,10 +288,14 @@ export async function proxyHlsRequest(
   // (see dledge.ts). The plain upstreamFetch below sends neither, so it
   // would 403. Fetch the token and the manifest from THIS invocation (same
   // egress IP) and run the result through the normal rewrite/warm pipeline.
+  // opts.directSegs (the ladder Source rung) swaps segment lines to
+  // /api/segdl URLs — client-resolved with a server fallback on the same URL.
   if (!range && isDaddyLiveEdgeManifest(target)) {
     const dl = await fetchDaddyLivePlaylist(target);
     if (dl?.ok && dl.body) {
-      const rewritten = rewritePlaylist(dl.body, target, referer);
+      const rewritten = rewritePlaylist(dl.body, target, referer, {
+        directSegs: !!opts.directSegs,
+      });
       return {
         status: 200,
         headers: {
@@ -251,6 +303,7 @@ export async function proxyHlsRequest(
           'cache-control': 'no-store',
           'content-type': 'application/vnd.apple.mpegurl',
           'x-dl-token': 'paired',
+          ...(opts.directSegs ? { 'x-maxtv-ladder': 'source' } : {}),
         },
         body: rewritten,
       };

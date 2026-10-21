@@ -98,6 +98,22 @@ export const LADDER_HLS_CONFIG = {
   backBufferLength: 90,
 } as const;
 
+/** v1.3 quality-ladder master tuning — the synthetic master mixes CDN-direct
+ *  Source segments (fast: 1-2s/segment, can ride close to the edge) with
+ *  turbo-transcoded rungs (slower: on-demand encodes at the window tip).
+ *  3 segments back balances both: low latency on the Source rung, enough
+ *  runway for the transcode rungs' encode lead. maxBufferLength 30 keeps the
+ *  playhead near the live edge (sports!) while still holding ~6 segments of
+ *  flap absorb; manual quality picks flush immediately when the runway is
+ *  deep (buffer-aware switch in setLevel). Playback stays 1x always. */
+export const LADDER_MASTER_HLS_CONFIG = {
+  liveSyncDurationCount: 3,
+  maxBufferLength: 30,
+  maxMaxBufferLength: 60,
+  maxLiveSyncPlaybackRate: 1,
+  backBufferLength: 90,
+} as const;
+
 /** transcode ladder — every height re-encoded in real time for streams whose
  *  provider ships a single rendition (DaddyLive + most free IPTV CDNs) */
 export const DATA_SAVER_HEIGHTS = [144, 244, 360, 480, 720, 1080] as const;

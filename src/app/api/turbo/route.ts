@@ -133,9 +133,23 @@ export async function GET(req: Request) {
     const ok = await session.waitReadyTC(6_000);
     const raw = ok ? session.readPlaylist(h) : null;
     if (!raw) {
-      return new NextResponse('turbo unavailable — channel may be off-air', {
-        status: 503,
-        headers: { 'x-offair': '1', 'content-type': 'text/plain', 'cache-control': 'no-store' },
+      // ⚠ distinguish GENUINE death (dead session / definitive resolve
+      // failure) from a slow warm-up: a freshly-spawned session on a cold
+      // isolate can easily spend its whole 6s budget on the paired
+      // token+manifest fetch, and answering THAT with 503+x-offair made
+      // the player declare the channel dead and walk channels mid-match
+      // (2026-10-21 ladder field test). Only a dead session is off-air;
+      // everything else is a retryable warm-up — hls.js re-polls, each poll
+      // kicks the session forward, and the stream recovers in place.
+      if (session.isDead) {
+        return new NextResponse('turbo unavailable — channel may be off-air', {
+          status: 503,
+          headers: { 'x-offair': '1', 'content-type': 'text/plain', 'cache-control': 'no-store' },
+        });
+      }
+      return new NextResponse('turbo warming up', {
+        status: 502,
+        headers: { 'content-type': 'text/plain', 'cache-control': 'no-store' },
       });
     }
     // warm the window's segments AFTER the response — `after()` keeps this

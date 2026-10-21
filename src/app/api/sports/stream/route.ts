@@ -51,7 +51,12 @@ export async function GET(req: Request) {
   const { searchParams } = new URL(req.url);
   const channel = searchParams.get('channel');
   const serverParam = searchParams.get('server');
-  const server = serverParam || (SERVERLESS ? 'turbo' : 'direct');
+  // v1.3: 'direct' (the LADDER master) is the default on EVERY host — the
+  // ladder's Source rung plays segments client-direct at CDN speed, which
+  // outperforms the turbo passthrough on serverless (measured: the proxy
+  // path delivered segments in ~15s bursts → rebuffer loop; CDN-direct
+  // measured 940-1700ms/segment).
+  const server = serverParam || 'direct';
   const chName = (searchParams.get('name') || '').slice(0, 80);
   if (!channel || !/^\d+$/.test(channel)) {
     return NextResponse.json({ error: 'bad_channel' }, { status: 400 });
@@ -60,6 +65,13 @@ export async function GET(req: Request) {
   const isRelay = server.startsWith('relay');
   const isTurbo = server.startsWith('turbo');
   const isEdge = server === 'edge' || server.startsWith('edge-');
+  // v1.3: the LADDER master (turbo rungs + CDN-direct Source rung) is the
+  // default transport everywhere — serverless included. The old serverless
+  // default (turbo passthrough) proxied every segment through a function and
+  // rebuffered in ~15s bursts; the ladder's Source rung now resolves segments
+  // client-side (uncloak-loader) at CDN speed, and its 144-480 rungs give ABR
+  // real data-saving choices. Turbo/relay stay as manual server picks.
+  const isLadder = !isTurbo && !isRelay;
   const SERVER_LIST = DADDYLIVE_SERVERS as readonly {
     id: string;
     label: string;
@@ -177,21 +189,21 @@ export async function GET(req: Request) {
     } else if (isRelay) {
       url = `/api/live?channel=${encodeURIComponent(channel)}${mirrorParam}&mode=m3u8`;
     } else {
-      // direct + edge: proxy the resolved manifest through /api/hls. The
-      // edge pin makes resolveDaddyLiveStream return the deterministic
-      // edge URL (premium{id}/index.m3u8) — same transport, faster resolve.
-      // &ch/&srv give /api/hls session-affinity recovery context: when the
-      // CDN 403s a refresh (serverless IP rotation) it re-resolves fresh.
+      // direct + edge (the default): the LADDER MASTER — synthetic multi-
+      // quality playlist (144/244/360/480 turbo rungs + the native Source
+      // rung with client-direct segments). &ch/&srv give /api/hls session-
+      // affinity recovery context: when the CDN 403s a refresh (serverless
+      // IP rotation) it re-resolves fresh.
       url =
         proxyUrlFor(resolved.url, resolved.referer || '') +
-        `&ch=${encodeURIComponent(channel)}&srv=${encodeURIComponent(server)}`;
+        `&ch=${encodeURIComponent(channel)}&srv=${encodeURIComponent(server)}&lad=1`;
     }
 
     const defaultId = isTurbo ? 'turbo' : isRelay ? 'relay' : isEdge ? 'edge' : 'direct';
     return NextResponse.json({
       channel,
       url,
-      transport: isTurbo ? 'turbo' : isRelay ? 'relay' : isEdge ? 'edge' : 'direct',
+      transport: isTurbo ? 'turbo' : isRelay ? 'relay' : isLadder ? 'ladder' : 'direct',
       directUrl: resolved.url,
       referer: resolved.referer || undefined,
       strategy: resolved.strategy,

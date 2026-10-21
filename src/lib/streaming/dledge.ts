@@ -210,7 +210,10 @@ export interface DlPlaylistResult {
 }
 
 interface DlFetchOptions {
-  /** total attempts for the token+manifest pair (default 3) */
+  /** total attempts for the token+manifest pair (default 4 — NAT pools that
+   *  split the pair across egress IPs fail ~50%/attempt in the worst case;
+   *  4 attempts leaves <7% compound failure, and hls.js's own manifest
+   *  retry budget absorbs the rest) */
   attempts?: number;
   /** per-request timeout in ms (default 5000) */
   timeoutMs?: number;
@@ -293,7 +296,7 @@ export async function fetchDaddyLivePlaylist(
   const slug = slugFor(manifestUrl);
   if (!slug) return null;
 
-  const attempts = Math.max(1, opts.attempts ?? 3);
+  const attempts = Math.max(1, opts.attempts ?? 4);
   const timeoutMs = opts.timeoutMs ?? 5000;
   const u = new URL(manifestUrl);
   const manifestPath = u.pathname + u.search;
@@ -342,7 +345,7 @@ async function runPairFetch(
   if (CF_PROXY_URL) {
     const base = CF_PROXY_URL.replace(/\/$/, '');
     for (let i = 0; i < attempts; i++) {
-      if (i > 0) await new Promise((r) => setTimeout(r, 150 + Math.random() * 250));
+      if (i > 0) await new Promise((r) => setTimeout(r, 90 + Math.random() * 160));
       try {
         const res = await fetch(
           `${base}?dlslug=${encodeURIComponent(slug)}&dlpath=${encodeURIComponent(manifestPath)}`,
@@ -371,7 +374,7 @@ async function runPairFetch(
 
   // ── direct pair from this invocation ─────────────────────────────────────
   for (let i = 0; i < attempts; i++) {
-    if (i > 0) await new Promise((r) => setTimeout(r, 150 + Math.random() * 250));
+    if (i > 0) await new Promise((r) => setTimeout(r, 90 + Math.random() * 160));
 
     const token = await fetchToken(slug, Math.min(timeoutMs, 3000));
     if (!token) {
