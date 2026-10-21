@@ -72,12 +72,13 @@ let active = 0;
 /* debug counters — surfaced on window.__maxtvPrefetch for E2E inspection */
 const dbg = { hits: 0, prefetched: 0, fails: 0 };
 
-/** Pop a prefetched segment for the loader. Returns null on miss/expiry. */
+/** Pop a prefetched segment for the loader. Returns null on miss/expiry.
+ *  Keyed by cacheKey() — session-churn-proof for segdl URLs. */
 export function takeCachedSegment(url: string): Uint8Array | null {
-  const e = cache.get(url);
+  const e = cache.get(cacheKey(url));
   if (!e) return null;
   if (Date.now() - e.at > TTL_MS) {
-    cache.delete(url);
+    cache.delete(cacheKey(url));
     cacheBytes -= e.bytes;
     return null;
   }
@@ -86,8 +87,9 @@ export function takeCachedSegment(url: string): Uint8Array | null {
 }
 
 function store(url: string, ts: Uint8Array): void {
-  if (cache.has(url)) return;
-  cache.set(url, { ts, at: Date.now(), bytes: ts.byteLength });
+  const key = cacheKey(url);
+  if (cache.has(key)) return;
+  cache.set(key, { ts, at: Date.now(), bytes: ts.byteLength });
   cacheBytes += ts.byteLength;
   dbg.prefetched++;
   // LRU eviction — Map keeps insertion order; oldest first
@@ -161,7 +163,7 @@ function recordFailure(url: string): void {
 }
 
 function prefetch(url: string): void {
-  if (cache.has(url) || inflight.has(url)) return;
+  if (cache.has(cacheKey(url)) || inflight.has(url)) return;
   const f = failures.get(url);
   if (f && (f.n >= MAX_ATTEMPTS || Date.now() < f.nextAt)) return;
   if (active >= MAX_CONCURRENT) return; // next trigger (poll/frag) retries
@@ -182,6 +184,31 @@ function prefetch(url: string): void {
       inflight.delete(url);
       active--;
     });
+}
+
+/** Cache identity for a segment URL.
+ *  ⚠ segdl URLs embed the CDN's SIGNED URL — and the DaddyLive edge re-mints
+ *  the whole segment URL space on every session recovery (/api/hls 403 →
+ *  re-resolve → fresh signed URLs for the SAME objects). Keying by the full
+ *  URL made every prefetched byte unreachable the moment a recovery fired
+ *  mid-watch (measured: prefetched 26 / served 14 with periodic stalls —
+ *  the churn window). The CDN OBJECT PATH (host + path, signature stripped)
+ *  is stable across sessions and identifies the content: same object via a
+ *  fresh session = same cache entry. Turbo URLs are n-keyed and stable —
+ *  they key on themselves. */
+function cacheKey(url: string): string {
+  if (url.indexOf(SEGDL_MARK) !== -1) {
+    const target = segdlTarget(url);
+    if (target) {
+      try {
+        const u = new URL(target);
+        return `${u.hostname}${u.pathname}`;
+      } catch {
+        /* fall through to the raw URL */
+      }
+    }
+  }
+  return url;
 }
 
 function prefetchUrls(urls: string[]): void {
