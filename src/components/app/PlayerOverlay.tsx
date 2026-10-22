@@ -1287,6 +1287,81 @@ export function PlayerOverlay() {
     return () => clearInterval(iv);
   }, [phase, ladderMaster]);
 
+  /* ── micro-gap unfreeze watchdog (frozen-WITH-buffer deadlock) ─────────────
+   * The DUAL of the watchdog above: the playhead freezes while the buffer
+   * still has data. Root cause (measured on production, 2026-10-22 audit,
+   * ch91 Source): an upstream PTS discontinuity left a 0.11s hole between two
+   * completely-appended segments → the video decoder's frames ended 0.07s
+   * before the buffered range end → Chrome stalled at the last frame. hls.js
+   * 1.7.3 could not recover it — its bufferInfo merges holes under
+   * maxBufferHole (0.5s) so the gap looked like continuous buffer ("nothing
+   * to fix"), _trySkipBufferHole only fires on PARTIAL fragments, and
+   * nudgeOnVideoHole needs the playhead already PAST the video range end.
+   * Net effect: a permanent freeze with 23.8s of "buffer" — for 2.5+ minutes
+   * until a manual seek, while the starved watchdog above stayed silent
+   * (it requires ZERO buffer). Detection here is the exact deadlock shape:
+   * playhead FROZEN (not advancing between ticks) + starved (readyState≤2)
+   * + data AHEAD of the playhead + not paused/seeking. Recovery: hop onto
+   * the far side of the micro-gap (next buffered range start +0.05) or, when
+   * frozen mid-range, the classic +0.15 nudge — the same move that unfroze
+   * the production incident by hand. Bounded: fires only after 8s frozen,
+   * max 3 nudges per episode (reset the moment the playhead moves again);
+   * never seeks past the buffered span. */
+  useEffect(() => {
+    if (phase !== 'playing') return;
+    let lastCt = -1;
+    let frozenAt = 0;
+    let nudges = 0;
+    const iv = setInterval(() => {
+      const v = videoRef.current;
+      if (!v || v.seeking || v.paused || v.playbackRate === 0 || !v.buffered.length) {
+        if (v) lastCt = v.currentTime;
+        frozenAt = 0;
+        return;
+      }
+      const ct = v.currentTime;
+      if (ct !== lastCt) {
+        // playhead advancing — healthy; reset the episode
+        lastCt = ct;
+        frozenAt = 0;
+        nudges = 0;
+        return;
+      }
+      // frozen — only the deadlock shape: starved at the decoder while
+      // servable data sits ahead (a legit wait at the live edge has NO
+      // data ahead and is left to the fetch machinery)
+      if (v.readyState > 2 || v.buffered.end(v.buffered.length - 1) <= ct + 0.05) return;
+      if (!frozenAt) {
+        frozenAt = Date.now();
+        return;
+      }
+      if (Date.now() - frozenAt < 8_000 || nudges >= 3) return;
+      let nextStart = -1;
+      for (let i = 0; i < v.buffered.length; i++) {
+        if (v.buffered.start(i) > ct) {
+          nextStart = v.buffered.start(i);
+          break;
+        }
+      }
+      const end = v.buffered.end(v.buffered.length - 1);
+      const target =
+        nextStart > 0 && nextStart - ct < 2
+          ? nextStart + 0.05 // hop the micro-gap onto the far range
+          : ct + 0.15 < end - 0.05
+            ? ct + 0.15 // classic nudge, still inside the buffered span
+            : -1;
+      if (target < 0) return;
+      try {
+        v.currentTime = target;
+        nudges++;
+        frozenAt = Date.now(); // fresh window before the next nudge
+      } catch {
+        /* seekable not ready — next tick retries */
+      }
+    }, 3_000);
+    return () => clearInterval(iv);
+  }, [phase]);
+
   /* ── live-edge drift watcher ───────────────────────────────────────────── */
   useEffect(() => {
     if (phase !== 'playing') return;

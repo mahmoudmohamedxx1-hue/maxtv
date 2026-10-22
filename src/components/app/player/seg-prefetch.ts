@@ -126,7 +126,7 @@ async function unwrapRaw(raw: Uint8Array): Promise<Uint8Array | null> {
 /** turbo segment: same-origin route (edge-cached server-side after the
  *  2026-10-22 fix — any isolate's first success parks it at the edge) */
 async function fetchTurboSegment(url: string): Promise<Uint8Array | null> {
-  const res = await fetch(url, { cache: 'no-store' });
+  const res = await fetch(url, { cache: 'no-store', ...timeoutSignal() });
   if (!res.ok) throw new Error(`turbo seg ${res.status}`);
   const buf = new Uint8Array(await res.arrayBuffer());
   if (buf.length < 188) throw new Error('tiny payload');
@@ -139,7 +139,7 @@ async function fetchSegdlSegment(url: string): Promise<Uint8Array | null> {
   const target = segdlTarget(url);
   if (target && isDirectHost(target) && typeof DecompressionStream !== 'undefined') {
     try {
-      const res = await fetch(target, { cache: 'no-store' });
+      const res = await fetch(target, { cache: 'no-store', ...timeoutSignal() });
       if (res.ok) {
         const ts = await unwrapRaw(new Uint8Array(await res.arrayBuffer()));
         if (ts) return ts;
@@ -148,11 +148,28 @@ async function fetchSegdlSegment(url: string): Promise<Uint8Array | null> {
       /* fall through to the server route */
     }
   }
-  const res = await fetch(url, { cache: 'no-store' });
+  const res = await fetch(url, { cache: 'no-store', ...timeoutSignal() });
   if (!res.ok) throw new Error(`segdl ${res.status}`);
   const buf = new Uint8Array(await res.arrayBuffer());
   if (buf.length < 188) throw new Error('tiny payload');
   return buf;
+}
+
+/** 2026-10-22 audit hardening: an unbounded prefetch fetch that hangs (dead
+ *  socket, blackholed CDN route) would hold its MAX_CONCURRENT slot and its
+ *  inflight entry until the browser's own multi-minute TCP timeout — the
+ *  whole prefetcher could stall behind it. A 20s abort bound turns that into
+ *  an ordinary failure (recordFailure backoff + retry on the next trigger).
+ *  Feature-detected: old browsers without AbortSignal.timeout simply skip
+ *  the bound and keep the legacy behavior. */
+function timeoutSignal(): { signal: AbortSignal } | Record<string, never> {
+  try {
+    return typeof AbortSignal !== 'undefined' && AbortSignal.timeout
+      ? { signal: AbortSignal.timeout(20_000) }
+      : {};
+  } catch {
+    return {};
+  }
 }
 
 function recordFailure(url: string): void {
