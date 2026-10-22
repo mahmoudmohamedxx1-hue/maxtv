@@ -1,0 +1,13 @@
+// ─── LOCAL TEST HARNESS ONLY (never deployed) ────────────────────────────────
+// Same shape as wrangler.jsonc but serves the thin API alone (no OpenNext).
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "maxtv-test",
+  "main": "worker/test-entry.mjs",
+  "compatibility_date": "2026-10-19",
+  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+  "assets": {
+    "directory": "public",
+    "binding": "ASSETS"
+  }
+}

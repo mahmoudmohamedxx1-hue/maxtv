@@ -187,7 +187,15 @@ export async function GET(req: Request) {
   }
 
   const hRaw = parseInt(searchParams.get('h') || '', 10);
-  const h = (SEG_LADDER_HEIGHTS as readonly number[]).includes(hRaw) ? hRaw : 0;
+  // ⤴ WORKERS 2026-10-23: the &h= ladder is per-segment ffmpeg re-encoding —
+  // impossible here (no processes). Before this guard, a stale bookmark, a
+  // saved data-saver pref, or any pre-fix master's rung request reached the
+  // transcode paths, which can never produce bytes → every rung segment
+  // 404'd → hls.js retried forever ("loads for 4 minutes, never plays").
+  // Degrade to NATIVE playback instead: the playlist and segments serve the
+  // passthrough feed, the player plays, the quality menu just shows Source.
+  let h = (SEG_LADDER_HEIGHTS as readonly number[]).includes(hRaw) ? hRaw : 0;
+  if (ON_WORKERS && h) h = 0;
 
   if (mode === 'seg') {
     // ⤴ v3: segment hits CREATE the session when this instance doesn't have

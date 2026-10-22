@@ -25,6 +25,13 @@
 // exact bug this ladder replaces. Overshooting the declaration makes ABR
 // demand headroom before stepping up: stability first, data saved below.
 
+// ⤴ WORKERS 2026-10-23: the &h= rungs are per-segment ffmpeg re-encodes —
+// impossible on Cloudflare Workers (no processes, stubbed child_process).
+// Serving a master that advertises them made hls.js ABR start on a rung
+// whose every segment 404'd forever ("loads for 4 minutes, never plays" —
+// the field report). Workers masters carry ONLY the native Source rung.
+import { ON_WORKERS } from './runtime';
+
 export interface LadderRung {
   h: number;
   w: number;
@@ -99,7 +106,13 @@ export function buildLadderMaster(opts: {
     '#EXTM3U',
     '#EXT-X-VERSION:3',
   ];
-  for (const r of LADDER_RUNGS) {
+  // ⤴ WORKERS: no ffmpeg → no transcode rungs (see the import note above).
+  // A single-variant master is valid HLS: hls.js exposes one level, the
+  // quality menu shows "Source"/native, and ABR/prefs/data-saver picks that
+  // cannot be satisfied simply no-op — the player already treats a missing
+  // rung as "stay where you are".
+  const rungs = ON_WORKERS ? [] : LADDER_RUNGS;
+  for (const r of rungs) {
     out.push(`#EXT-X-STREAM-INF:BANDWIDTH=${r.bandwidth},RESOLUTION=${r.w}x${r.h}`);
     out.push(`/api/turbo?channel=${ch}&h=${r.h}&mode=m3u8`);
   }

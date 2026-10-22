@@ -1,0 +1,10 @@
+# ─── maxtv.pages.dev neutralizer (Cloudflare Pages only) ─────────────────────
+# The Pages project is a STATIC-ONLY leftover: it serves the homepage shell
+# but every /api/* request 404s, which reads as "the site opens but nothing
+# plays". The real deployment (thin API worker + assets) is the Worker at
+# maxtv.mahmoudmohamedxx1.workers.dev. Send every pages.dev visitor there.
+#
+# This file is read by Cloudflare Pages on git-connected builds only. It is
+# inert on the Worker deployment (Workers static assets ignore _redirects)
+# and on Vercel (vercel.json governs redirects there).
+/* https://maxtv.mahmoudmohamedxx1.workers.dev/:splat 301
