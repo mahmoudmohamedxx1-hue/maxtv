@@ -45,6 +45,8 @@ yarn-error.log*
 /examples/
 /scripts/*
 !/scripts/fetch-ffmpeg.sh
+!/scripts/build-worker.mjs
+!/scripts/gen-compact-catalog.ts
 /download/
 /upload/
 /mini-services/
@@ -64,3 +66,8 @@ scripts/artifacts/
 .open-next/
 .wrangler/
 third_party/
+
+# ─── cloudflare worker build artifacts ───────────────────────────────────────
+/.open-next/
+/worker/dist/
+/public/__snapshots/

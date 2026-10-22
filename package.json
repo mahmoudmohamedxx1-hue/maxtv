@@ -22,8 +22,8 @@
     "build": "bash scripts/fetch-ffmpeg.sh && next build && cp -r .next/static .next/standalone/.next/ && cp -r public .next/standalone/ && cp -r data .next/standalone/ && (cp -r third_party .next/standalone/ 2>/dev/null || true)",
     "start": "NODE_ENV=production node .next/standalone/server.js",
     "lint": "eslint .",
-    "cf:build": "opennextjs-cloudflare build",
-    "cf:deploy": "opennextjs-cloudflare build && wrangler deploy",
+    "cf:build": "node scripts/build-worker.mjs && opennextjs-cloudflare build",
+    "cf:deploy": "node scripts/build-worker.mjs && opennextjs-cloudflare build && wrangler deploy",
     "cf:tail": "wrangler tail"
   },
   "dependencies": {
