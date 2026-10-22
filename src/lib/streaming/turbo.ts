@@ -39,8 +39,9 @@
 
 import { resolveDaddyLiveStream } from '@/lib/sports/daddylive';
 import { unwrapSegment } from './uncloak';
+import { coloGetSeg, coloPutSeg, coloGetResolved, coloPutResolved, coloDeleteResolved, keepAlive } from './colocache';
 import { UA } from './resolve';
-import { isDaddyLiveEdgeManifest, fetchDaddyLivePlaylist } from './dledge';
+import { isDaddyLiveEdgeManifest, fetchDaddyLivePlaylist, getDlEdgeDiagnostics } from './dledge';
 import { ffmpegAbsent, ffmpegExecutable, SERVERLESS } from './ffmpeg-cap';
 import { ON_WORKERS, grantSubrequest, subrequestsRemaining } from './runtime';
 import { spawn } from 'child_process';
@@ -60,9 +61,13 @@ const POLL_MS = 1500;
  *  warm-up that burns the budget dies mid-pass (2026-10-22 "Too many
  *  subrequests" → 502 warm-up loop → "bein not opening"). Small batches
  *  spread the warm-up across the player's next polls, each with a fresh
- *  budget. Steady state is 1 new segment per poll either way. */
-const MAX_PARALLEL = ON_WORKERS ? 2 : 4;
-const STARTUP_BURST = ON_WORKERS ? 2 : 4;
+ *  budget. Steady state is 1 new segment per poll either way.
+ *  ⤴ 2026-10-23: 3, not 2 — a colo→CDN segment fetch costs only 20-70ms
+ *  (measured from the worker), so a third slot makes catch-up bursts
+ *  (after an L1/L2 boundary or a missed poll) free while staying far
+ *  inside the subrequest budget (36 counted + resolve margin). */
+const MAX_PARALLEL = ON_WORKERS ? 3 : 4;
+const STARTUP_BURST = ON_WORKERS ? 3 : 4;
 /** segments listed in the served live window — 12 × ~5s = 60s of runway.
  *  Playback never speeds up anymore (maxLiveSyncPlaybackRate pinned to 1
  *  after the "plays like 2x" bug), so stalls accumulate drift behind the
@@ -78,10 +83,19 @@ const KEEP = 24;
  *  budget-trimmed batches fetch fewer segments per pass) — give the session
  *  twice the runway before declaring death. */
 const STALL_KILL_MS = ON_WORKERS ? 120_000 : 60_000;
-const SEG_FETCH_TIMEOUT_MS = 12_000;
+const SEG_FETCH_TIMEOUT_MS = ON_WORKERS ? 6_000 : 12_000;
 const MAX_SN_TRIES = 10;
 /** bound for the inline kick a playlist/segment request waits on */
 const KICK_MS = 2_500;
+
+/** a pass older than this is a ZOMBIE: workerd cancels in-flight I/O when an
+ *  invocation ends without a waitUntil sponsor — an abandoned pass (the kick
+ *  race gave up on it) used to die mid-flight with `polling` stuck true
+ *  FOREVER, freezing that isolate's session permanently (the 2026-10-23
+ *  "window froze at one mseq for 20s+" field symptom). A legitimate pass is
+ *  bounded by pair retries (~2s) + one fetchSeg timeout (6s on Workers), so
+ *  anything past 15s is dead — the escape below takes the mutex back. */
+const STUCK_PASS_MS = 15_000;
 
 /** sessions survive dev-server hot reloads */
 const g = globalThis as {
@@ -158,6 +172,12 @@ export class TurboSession {
   private startup = true;
   /** segment-URL generation counter (see pass() restart detection) */
   private gen = 0;
+  /** consecutive upstream-manifest fetch failures (colo-resolve purge —
+   *  see pass()) */
+  private manifestFails = 0;
+  /** polling-mutex bookkeeping — see pass()/kick() (zombie-pass protection) */
+  private passEpoch = 0;
+  private pollingSince = 0;
   lastServed = Date.now();
   createdAt = Date.now();
 
@@ -229,10 +249,44 @@ export class TurboSession {
     if (this.dead) return;
     if (this.polling) {
       const t0 = Date.now();
-      while (this.polling && !this.dead && Date.now() - t0 < timeoutMs) await sleep(60);
+      while (this.polling && !this.dead && Date.now() - t0 < timeoutMs) {
+        // ⤴ zombie-pass escape — see STUCK_PASS_MS. The epoch bump makes the
+        // zombie's finally() a no-op so it can never clobber the new owner.
+        if (this.pollingSince > 0 && Date.now() - this.pollingSince > STUCK_PASS_MS) {
+          this.passEpoch++;
+          this.polling = false;
+          this.pollingSince = 0;
+          this.pending.clear(); // its batch sns must become fetchable again
+          break;
+        }
+        await sleep(60);
+      }
       return;
     }
     await Promise.race([this.pass(), sleep(timeoutMs)]);
+  }
+
+  /** temporary field diagnostics (2026-10-23) — see route mode=dbg */
+  debugWindow(): Record<string, unknown> {
+    const w = this.windowRange();
+    return {
+      key: this.key,
+      dead: this.dead,
+      startup: this.startup,
+      segsInMemory: this.segs.size,
+      windowLen: w ? w.list.length : 0,
+      windowBase: w ? w.base : null,
+      newestSn: this.newestSn,
+      lastSn: this.lastSn,
+      lastUpMseq: this.lastUpMseq,
+      lastUpFloor: this.lastUpFloor,
+      lastParseAgoMs: this.lastParseAt ? Date.now() - this.lastParseAt : null,
+      manifestFails: this.manifestFails,
+      gen: this.gen,
+      upstreamUrl: this.upstream?.url || null,
+      upstreamAgeMs: this.upstreamAt ? Date.now() - this.upstreamAt : null,
+      dledge: getDlEdgeDiagnostics(),
+    };
   }
 
   /** Wait (bounded) until the session can serve a playlist. Re-enterable —
@@ -347,6 +401,19 @@ export class TurboSession {
     const direct = this.segs.get(n);
     if (direct) return direct.ts;
     const t0 = Date.now();
+    // ⤴ WORKERS 2026-10-23 colo-shared fast path: the listing parse taught
+    // us this sn's upstream URL, and another isolate's poller very likely
+    // parked those bytes in the colo cache — ~65ms instead of the 2-12s
+    // re-warm below (the "loads for 4 minutes out of 5" root cause: every
+    // cross-isolate segment miss used to re-download from the CDN).
+    let url = this.urlBySn.get(n);
+    if (url) {
+      const shared = await coloGetSeg(url);
+      if (shared) {
+        this.commit(n, shared, this.urlDur.get(n) || 6, false);
+        return shared;
+      }
+    }
     // refresh our view of the upstream window, then re-check
     await this.kick(Math.min(KICK_MS, 1_800));
     let seg = this.segs.get(n);
@@ -354,10 +421,18 @@ export class TurboSession {
     // we (or a sibling instance) listed this sn — its URL may still be
     // known; fetch it on demand
     const referer = this.upstream?.referer || '';
-    let url = this.urlBySn.get(n);
+    url = this.urlBySn.get(n);
     if (url) {
+      // kick parsed the listing but the batch may have been budget-trimmed
+      // past this sn — the colo cache can still hold it from a sibling
+      const shared = await coloGetSeg(url);
+      if (shared) {
+        this.commit(n, shared, this.urlDur.get(n) || 6, false);
+        return shared;
+      }
       const ts = await this.fetchSeg(url, referer);
       if (ts && ts.length >= 188) {
+        coloPutSeg(url, ts);
         this.commit(n, ts, this.urlDur.get(n) || 6, false);
         return ts;
       }
@@ -379,8 +454,14 @@ export class TurboSession {
       if (seg) return seg.ts;
       url = this.urlBySn.get(n);
       if (url) {
+        const shared = await coloGetSeg(url);
+        if (shared) {
+          this.commit(n, shared, this.urlDur.get(n) || 6, false);
+          return shared;
+        }
         const ts = await this.fetchSeg(url, referer);
         if (ts && ts.length >= 188) {
+          coloPutSeg(url, ts);
           this.commit(n, ts, this.urlDur.get(n) || 6, false);
           return ts;
         }
@@ -399,6 +480,13 @@ export class TurboSession {
    *  cache) — extracted from the session key (ch<id>[m<pin>]) */
   private get channelId(): string {
     const m = this.key.match(/^ch(\d+)/);
+    return m ? m[1] : '';
+  }
+
+  /** the mirror pin this session serves ('' = auto) — extracted the same
+   *  way; used to namespace the colo-shared resolve cache */
+  private get mirrorId(): string {
+    const m = this.key.match(/^ch\d+m(.+)$/);
     return m ? m[1] : '';
   }
 
@@ -548,17 +636,55 @@ export class TurboSession {
 
   private async ensureUpstream(): Promise<Upstream | null> {
     if (this.upstream && Date.now() - this.upstreamAt < 2 * 60_000) return this.upstream;
+    // ⤴ WORKERS 2026-10-23 colo-shared resolve: a cold isolate adopts the
+    // URL another isolate resolved within the last 2min instead of re-running
+    // the resolve chain (embed pages + token+manifest pair) on its own
+    // egress IP — measured 0.5-4s per cold isolate, and the free plan sprays
+    // requests across cold isolates constantly. THAT was the real cost
+    // behind every slow poll and every slow segment recovery.
+    if (ON_WORKERS && !this.upstream) {
+      const shared = await coloGetResolved(this.channelId, this.mirrorId);
+      if (shared) {
+        this.upstream = shared;
+        this.upstreamAt = Date.now();
+        return shared;
+      }
+    }
     const u = await this.resolveUpstream(!!this.upstream);
     if (u) {
       this.upstream = u;
       this.upstreamAt = Date.now();
+      coloPutResolved(this.channelId, this.mirrorId, u);
     }
     return u;
   }
 
-  private async pass(): Promise<void> {
-    if (this.dead || this.polling) return;
+  /** pass wrapper — owns the polling mutex + invocation-death protection.
+   *  passInner() holds the original logic. */
+  private pass(): Promise<void> {
+    if (this.dead || this.polling) return Promise.resolve();
     this.polling = true;
+    this.pollingSince = Date.now();
+    const epoch = ++this.passEpoch;
+    const p = this.passInner().finally(() => {
+      // only the CURRENT pass owner may release the mutex (a zombie that
+      // lost the epoch race must not clear a newer pass's flag)
+      if (epoch === this.passEpoch) {
+        this.polling = false;
+        this.pollingSince = 0;
+      }
+    });
+    // ⤴ Workers: sponsor the pass PAST the response. The m3u8/seg handlers
+    // race the pass against a sleep bound; when the bound wins, the response
+    // ships and workerd cancels unsponsored I/O — the pass used to die
+    // mid-flight with the mutex stuck (see STUCK_PASS_MS). waitUntil keeps
+    // this invocation alive until the pass settles, so commits + colo puts
+    // actually land. On Vercel/dev keepAlive is a detached no-op.
+    keepAlive(p.catch(() => {}));
+    return p;
+  }
+
+  private async passInner(): Promise<void> {
     try {
       // ⤴ Workers 2026-10-22: the invocation's subrequest budget is nearly
       // spent — stop HERE (state survives; the next request's fresh budget
@@ -568,7 +694,21 @@ export class TurboSession {
       if (!up) return;
 
       let text = await fetchText(up.url, up.referer);
-      if (!text || !text.includes('#EXTM3U')) return;
+      if (!text || !text.includes('#EXTM3U')) {
+        // ⤴ 3 strikes: the upstream URL (possibly adopted from the colo-shared
+        // resolve) may point at a rotated/dead edge — purge BOTH the colo entry
+        // and our own copy so the next pass re-resolves from scratch and learns
+        // the new edge host (setDlEdgeHost) like a truly cold isolate would.
+        this.manifestFails++;
+        if (this.manifestFails >= 3) {
+          if (this.upstream) coloDeleteResolved(this.channelId, this.mirrorId);
+          this.upstream = null;
+          this.upstreamAt = 0;
+          this.manifestFails = 0;
+        }
+        return;
+      }
+      this.manifestFails = 0;
 
       // master playlist → first variant (absolutized)
       if (text.includes('#EXT-X-STREAM-INF')) {
@@ -647,11 +787,20 @@ export class TurboSession {
 
       const fresh = entries.filter(
         (e) =>
-          e.sn > this.lastSn &&
           !this.pending.has(e.sn) &&
           !this.segs.has(e.sn) &&
           (this.snTries.get(e.sn) ?? 0) < MAX_SN_TRIES
       );
+      // ⤴ 2026-10-23 BACKFILL: the old `e.sn > this.lastSn` filter meant the
+      // startup burst (newest N) left a PERMANENT hole under the tip — the
+      // pass never looked below lastSn, so the served window stayed 2-4
+      // segments deep forever (windowRange stops at the first hole). On
+      // Vercel the s-maxage edge cache papered over it; on Workers the
+      // shallow window starved the player's buffer runway. entries[] only
+      // contains CURRENTLY-LISTED sns (all ≥ upstream floor, all still
+      // fetchable), so fetching any of them is safe — and restart recycling
+      // is already handled ABOVE (the mseq-jump purge clears segs/lastSn
+      // before this filter runs) plus `!this.segs.has` skips stale twins.
       // startup: burst the NEWEST segments (live edge, fastest first frame);
       // afterwards: oldest-first catch-up so the timeline stays ordered
       let batch = this.startup ? fresh.slice(-STARTUP_BURST) : fresh.slice(0, MAX_PARALLEL);
@@ -673,7 +822,21 @@ export class TurboSession {
         this.snTries.set(e.sn, (this.snTries.get(e.sn) ?? 0) + 1);
       }
       const results = await Promise.all(
-        batch.map(async (e) => ({ e, ts: await this.fetchSeg(e.abs, this.upstream!.referer) }))
+        batch.map(async (e) => {
+          // ⤴ WORKERS 2026-10-23 colo-shared segments: a sibling isolate's
+          // poller very likely already downloaded+unwrapped this exact URL
+          // (upstream URLs are unique + immutable) — a hit skips the upstream
+          // download entirely (no subrequest, no egress bandwidth, ~65ms) and
+          // just re-commits the bytes into this isolate's window. This is
+          // what keeps cold-isolate warm-ups cheap: only GENUINELY new
+          // segments (1-2 per poll) are ever fetched from the CDN.
+          const shared = await coloGetSeg(e.abs);
+          if (shared) return { e, ts: shared };
+          const ts = await this.fetchSeg(e.abs, this.upstream!.referer);
+          // park the unwrapped bytes for every isolate at this colo
+          if (ts && ts.length >= 188) coloPutSeg(e.abs, ts);
+          return { e, ts };
+        })
       );
       for (const r of results) this.pending.delete(r.e.sn);
 
@@ -700,7 +863,6 @@ export class TurboSession {
     } catch {
       /* transient — next pass retries */
     } finally {
-      this.polling = false;
       // honest death — no new content for 60s (dead upstream / unreachable
       // playlist). The client keeps playing the cached window meanwhile; far
       // more tolerant than direct, but not immortal.

@@ -3,7 +3,7 @@ import { getTurboSession, SEG_LADDER_HEIGHTS, TurboSession } from '@/lib/streami
 import { ffmpegCapable, SERVERLESS } from '@/lib/streaming/ffmpeg-cap';
 import { setProxyOriginFromRequest } from '@/lib/streaming/upstream';
 import { rememberNativeHeight } from '@/lib/streaming/ladder-master';
-import { ON_WORKERS, resetSubrequestBudget } from '@/lib/streaming/runtime';
+import { ON_WORKERS, resetSubrequestBudget, subrequestsRemaining } from '@/lib/streaming/runtime';
 
 export const dynamic = 'force-dynamic';
 /** per-segment transcodes can take up to ~10s (kick + upstream fetch + encode)
@@ -116,9 +116,27 @@ export async function GET(req: Request) {
   const channel = searchParams.get('channel');
   const mirror = searchParams.get('m') || undefined;
 
-  // ⤴ Workers guards on the two expensive modes only (m3u8 polls + segment
-  //  bytes are what a quota thief wants; cap/native probes are cheap)
-  if (ON_WORKERS && (mode === 'm3u8' || mode === 'seg')) {
+  // ⚴ temporary field diagnostics (2026-10-23) — window-freeze hunt. Exposes
+  // the session + dledge cache state so the deployed engine can be observed
+  // from outside without wrangler tail. no-store; no secrets.
+  if (mode === 'dbg' && channel) {
+    const s = getTurboSession(channel, mirror);
+    await s.kick(2500);
+    const w = s.debugWindow();
+    return NextResponse.json(
+      {
+        ts: Date.now(),
+        ...w,
+        subrequestsRemaining: subrequestsRemaining(),
+      },
+      { headers: { 'cache-control': 'no-store', 'access-control-allow-origin': '*' } }
+    );
+  }
+
+  // ⤴ Workers guards on the expensive modes (m3u8 polls + segment bytes are
+  // what a quota thief wants; cap/native probes are cheap). dbg kicks a real
+  // pass (upstream work) so it rides the same guards.
+  if (ON_WORKERS && (mode === 'm3u8' || mode === 'seg' || mode === 'dbg')) {
     if (crossSiteEmbed(req)) {
       return new NextResponse('hotlink denied', {
         status: 403,

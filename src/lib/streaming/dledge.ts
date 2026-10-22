@@ -46,6 +46,8 @@
 // so a 4-pane grid or a viewer burst costs ONE pair-fetch per window.
 
 import { UA } from './resolve';
+import { ON_WORKERS } from './runtime';
+import { coloGetManifest, coloPutManifest, keepAlive } from './colocache';
 
 /** the premium edge host — updatable when the resolve layer learns a new one */
 let edgeHost = 'edge.cowedd4855ws.sbs';
@@ -98,13 +100,20 @@ const CACHE_MAX_ENTRIES = 512; // ~512 channels' live playlists (a few KB each)
 const cacheG = globalThis as {
   __maxtvDlManifestCache?: Map<string, ManifestCacheEntry>;
   __maxtvDlInflight?: Map<string, Promise<DlPlaylistResult | null>>;
+  /** when each inflight pair-fetch started — zombie detection (an invocation
+   *  killed mid-pair leaves its inflight entry forever without a timestamped
+   *  escape, every later fetch for that manifest would coalesce onto a
+   *  promise that never settles) */
+  __maxtvDlInflightAt?: Map<string, number>;
   __maxtvDlCacheStats?: { hits: number; misses: number; coalesced: number; savedPairs: number };
 };
 if (!cacheG.__maxtvDlManifestCache) cacheG.__maxtvDlManifestCache = new Map();
 if (!cacheG.__maxtvDlInflight) cacheG.__maxtvDlInflight = new Map();
+if (!cacheG.__maxtvDlInflightAt) cacheG.__maxtvDlInflightAt = new Map();
 if (!cacheG.__maxtvDlCacheStats) cacheG.__maxtvDlCacheStats = { hits: 0, misses: 0, coalesced: 0, savedPairs: 0 };
 const manifestCache = cacheG.__maxtvDlManifestCache;
 const inflight = cacheG.__maxtvDlInflight;
+const inflightAt = cacheG.__maxtvDlInflightAt;
 const cacheStats = cacheG.__maxtvDlCacheStats;
 
 /** micro-cache TTL: ~1.6× the playlist's target duration, clamped 4–10s.
@@ -117,11 +126,19 @@ const cacheStats = cacheG.__maxtvDlCacheStats;
  *  (single-flight coalesces their concurrent polls too). Max staleness is
  *  ~1.6 segments — safe: the CDN window holds ~3-6 segments and segment URLs
  *  stay fetchable after leaving the playlist, so hls.js catches up on the
- *  next refresh. */
+ *  next refresh.
+ *  ⤴ WORKERS 2026-10-23: clamped MUCH shorter (2.5-4s). The isolate-spray
+ *  means L1 rarely serves consecutive polls anyway, and the served window's
+ *  TIP can only advance when a FRESH listing is parsed — the 4-10s clamp
+ *  throttled tip advancement to ~1x real-time (measured 0.87x end-to-end:
+ *  the player's buffer could never get AHEAD, so every hiccup became a
+ *  rebuffer). A pair costs only ~0.3-1s from a colo (measured) — paying it
+ *  (nearly) every poll buys catch-up bursts that push delivery >1x. */
 function ttlFromBody(body: string): number {
   const m = body.match(/#EXTINF:([0-9.]+)/);
   const dur = m ? parseFloat(m[1]) : 0;
-  if (!dur || !Number.isFinite(dur)) return 6000;
+  if (!dur || !Number.isFinite(dur)) return ON_WORKERS ? 3000 : 6000;
+  if (ON_WORKERS) return Math.min(4000, Math.max(2500, dur * 1000 * 0.8));
   return Math.min(10000, Math.max(4000, dur * 1000 * 1.6));
 }
 
@@ -138,13 +155,26 @@ function cacheGet(url: string): ManifestCacheEntry | null {
   return hit;
 }
 
-function cachePut(url: string, body: string): void {
+function cachePut(url: string, body: string, promoteToColo = true): void {
   if (manifestCache.size >= CACHE_MAX_ENTRIES) {
     // evict the oldest entry (first key of the insertion-ordered Map)
     const oldest = manifestCache.keys().next().value;
     if (oldest !== undefined) manifestCache.delete(oldest);
   }
-  manifestCache.set(url, { body, at: Date.now(), ttlMs: ttlFromBody(body) });
+  const ttlMs = ttlFromBody(body);
+  manifestCache.set(url, { body, at: Date.now(), ttlMs });
+  // ⤴ WORKERS 2026-10-23 L2 promotion: park freshly PAIR-FETCHED bodies in
+  // the COLO cache so every OTHER isolate at this datacenter (the free plan
+  // sprays requests across them) adopts them instead of re-rolling the
+  // token+manifest pair on its own egress IP. TTL mirrors L1 (4-10s): a
+  // longer L2 TTL made the window advance in bursts and lag the live edge;
+  // equal TTLs give the smooth hit/miss cadence the design intended — one
+  // pair per window per colo, amortized across all isolates' polls.
+  // ⚠ promoteToColo=false on the L2-HIT path: re-promoting there would
+  // refresh L2's TTL on every hit and the manifest would NEVER expire (the
+  // "window froze at 4 segments" bug — a permanently stale listing served
+  // forever, no new segments ever parsed).
+  if (promoteToColo) coloPutManifest(url, body, ttlMs);
 }
 
 /** operator/monitoring view: edge host, rotation log, cache effectiveness */
@@ -310,23 +340,55 @@ export async function fetchDaddyLivePlaylist(
       cacheStats.savedPairs++;
       return { ok: true, status: 200, body: hit.body, finalUrl: manifestUrl, cached: true };
     }
+    // ⤴ WORKERS 2026-10-23 L2 (colo-shared): no in-memory entry on THIS
+    // isolate, but a sibling isolate at this colo may have pair-fetched
+    // within the TTL — adopt its body and repopulate our L1 so the next
+    // poll is a pure memory hit. Still no tokens: bodies only, exactly
+    // like L1. This kills the cold-isolate token+manifest 403 roulette
+    // (the free plan sprays polls across isolates; each used to re-pay
+    // the pair on its own egress IP).
+    if (ON_WORKERS) {
+      const coloBody = await coloGetManifest(manifestUrl);
+      if (coloBody) {
+        // repopulate THIS isolate's L1 only — NEVER re-promote to L2 (that
+        // would refresh the L2 TTL on every hit and freeze the manifest
+        // stale forever)
+        cachePut(manifestUrl, coloBody, false);
+        cacheStats.hits++;
+        cacheStats.savedPairs++;
+        return { ok: true, status: 200, body: coloBody, finalUrl: manifestUrl, cached: true };
+      }
+    }
     // single-flight: a pair-fetch for this exact manifest is already running
     // (multi-view panes, concurrent viewers) — ride its result instead of
-    // hitting the edge with a duplicate token request
+    // hitting the edge with a duplicate token request. ⤴ ZOMBIE GUARD: only
+    // coalesce onto a pair younger than any legitimate pair can be — a pair
+    // abandoned by invocation death never settles and would freeze this
+    // isolate's manifest fetch forever.
     const running = inflight.get(manifestUrl);
     if (running) {
-      cacheStats.coalesced++;
-      cacheStats.savedPairs++;
-      return running;
+      const startedAt = inflightAt.get(manifestUrl) ?? 0;
+      if (startedAt && Date.now() - startedAt < 12_000) {
+        cacheStats.coalesced++;
+        cacheStats.savedPairs++;
+        return running;
+      }
+      inflight.delete(manifestUrl);
+      inflightAt.delete(manifestUrl);
     }
   }
   const pairFetch = runPairFetch(manifestUrl, slug, manifestPath, attempts, timeoutMs, !!opts.skipCache).finally(() => {
     inflight.delete(manifestUrl);
+    inflightAt.delete(manifestUrl);
   });
   if (!opts.skipCache) {
     inflight.set(manifestUrl, pairFetch);
+    inflightAt.set(manifestUrl, Date.now());
     cacheStats.misses++;
   }
+  // ⤴ Workers: sponsor the pair past the response (workerd cancels
+  // unsponsored I/O at invocation end — see colocache.keepAlive)
+  keepAlive(pairFetch.catch(() => {}));
   return pairFetch;
 }
 
