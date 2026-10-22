@@ -59,3 +59,8 @@ db/
 # local-only test harness
 third_party/
 scripts/artifacts/
+
+# cloudflare (OpenNext)
+.open-next/
+.wrangler/
+third_party/

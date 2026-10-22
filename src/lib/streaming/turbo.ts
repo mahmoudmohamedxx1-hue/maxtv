@@ -42,6 +42,7 @@ import { unwrapSegment } from './uncloak';
 import { UA } from './resolve';
 import { isDaddyLiveEdgeManifest, fetchDaddyLivePlaylist } from './dledge';
 import { ffmpegAbsent, ffmpegExecutable, SERVERLESS } from './ffmpeg-cap';
+import { ON_WORKERS, grantSubrequest, subrequestsRemaining } from './runtime';
 import { spawn } from 'child_process';
 import fs from 'fs';
 import os from 'os';
@@ -54,8 +55,14 @@ const MAX_AGE_MS = 2 * 60 * 60_000;
 /** only used on hosts where the isolate stays warm (dev / self-hosted) —
  *  on serverless the inline kick does the advancing */
 const POLL_MS = 1500;
-const MAX_PARALLEL = 4;
-const STARTUP_BURST = 4;
+/** segment batch size per poll pass — on Workers trimmed hard: every fetch
+ *  spends from the invocation's 50-subrequest budget (free plan), and a
+ *  warm-up that burns the budget dies mid-pass (2026-10-22 "Too many
+ *  subrequests" → 502 warm-up loop → "bein not opening"). Small batches
+ *  spread the warm-up across the player's next polls, each with a fresh
+ *  budget. Steady state is 1 new segment per poll either way. */
+const MAX_PARALLEL = ON_WORKERS ? 2 : 4;
+const STARTUP_BURST = ON_WORKERS ? 2 : 4;
 /** segments listed in the served live window — 12 × ~5s = 60s of runway.
  *  Playback never speeds up anymore (maxLiveSyncPlaybackRate pinned to 1
  *  after the "plays like 2x" bug), so stalls accumulate drift behind the
@@ -65,8 +72,12 @@ const WINDOW = 12;
 /** segments kept in the memory cache (flap absorb depth ≈ KEEP × segdur) */
 const KEEP = 24;
 /** upstream must be dead this long before we give up (client keeps playing
- *  cached content meanwhile — far more tolerant than direct) */
-const STALL_KILL_MS = 60_000;
+ *  cached content meanwhile — far more tolerant than direct). On Workers the
+ *  warm-up itself can be slow (per-colo egress-IP rotation splits the dledge
+ *  token pair more often than on Vercel's invocation-stable egress IP, and
+ *  budget-trimmed batches fetch fewer segments per pass) — give the session
+ *  twice the runway before declaring death. */
+const STALL_KILL_MS = ON_WORKERS ? 120_000 : 60_000;
 const SEG_FETCH_TIMEOUT_MS = 12_000;
 const MAX_SN_TRIES = 10;
 /** bound for the inline kick a playlist/segment request waits on */
@@ -154,11 +165,19 @@ export class TurboSession {
     this.key = key;
     this.sid = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
     this.resolveUpstream = resolveUpstream;
-    void this.pass();
-    // on serverless the isolate usually freezes between requests and this
-    // timer only fires in bursts — harmless (the inline kick is the real
-    // engine). On warm hosts it keeps the prefetch rolling.
-    this.timer = setInterval(() => void this.pass(), POLL_MS);
+    // ⤴ Workers 2026-10-22: NO constructor pass, NO interval timer. On workerd
+    // timers only fire while an invocation is running — i.e. they piggyback on
+    // a live request and SPEND THAT REQUEST's subrequest budget (free plan:
+    // 50/invocation). The route's inline kick (m3u8 poll / segment on-demand)
+    // is the only driver there; the reaper is replaced by a lazy sweep in
+    // getTurboSession. On Vercel/dev the original warm-host behavior stays.
+    if (!ON_WORKERS) {
+      void this.pass();
+      // on serverless the isolate usually freezes between requests and this
+      // timer only fires in bursts — harmless (the inline kick is the real
+      // engine). On warm hosts it keeps the prefetch rolling.
+      this.timer = setInterval(() => void this.pass(), POLL_MS);
+    }
   }
 
   touch(): void {
@@ -217,19 +236,27 @@ export class TurboSession {
   }
 
   /** Wait (bounded) until the session can serve a playlist. Re-enterable —
-   *  later requests re-check live state instead of a one-shot promise. */
+   *  later requests re-check live state instead of a one-shot promise.
+   *  ⤴ Workers 2026-10-22: cap the inline wait well below the caller's budget
+   *  — the FIRST playlist poll returning a retryable 502 after ~2s is better
+   *  than 6s of futile in-invocation polling: hls.js re-polls with a FRESH
+   *  50-subrequest budget and the next pass (small batch, resolve cached)
+   *  usually completes the window. Measured warm-up: 2-4 polls, 3-6s total. */
   async waitReady(timeoutMs = 7_000): Promise<TurboVerdict> {
     const t0 = Date.now();
+    const budgetMs = ON_WORKERS ? Math.min(timeoutMs, 2_200) : timeoutMs;
     for (;;) {
       if (this.dead) return 'dead';
       if (this.needsRelay) return 'relay';
       const w = this.windowRange();
       if (w && w.list.length >= 2) return 'ready';
-      if (Date.now() - t0 >= timeoutMs) {
+      if (Date.now() - t0 >= budgetMs) {
         if (this.needsRelay) return 'relay';
         if (w && w.list.length >= 1) return 'ready';
         return 'dead';
       }
+      // out of subrequests → let the NEXT request continue the warm-up
+      if (ON_WORKERS && subrequestsRemaining() < 4) return 'dead';
       await sleep(120);
     }
   }
@@ -533,6 +560,10 @@ export class TurboSession {
     if (this.dead || this.polling) return;
     this.polling = true;
     try {
+      // ⤴ Workers 2026-10-22: the invocation's subrequest budget is nearly
+      // spent — stop HERE (state survives; the next request's fresh budget
+      // continues). Better a short retryable answer than a dead pass.
+      if (ON_WORKERS && subrequestsRemaining() < 4) return;
       const up = await this.ensureUpstream();
       if (!up) return;
 
@@ -623,7 +654,15 @@ export class TurboSession {
       );
       // startup: burst the NEWEST segments (live edge, fastest first frame);
       // afterwards: oldest-first catch-up so the timeline stays ordered
-      const batch = this.startup ? fresh.slice(-STARTUP_BURST) : fresh.slice(0, MAX_PARALLEL);
+      let batch = this.startup ? fresh.slice(-STARTUP_BURST) : fresh.slice(0, MAX_PARALLEL);
+      // ⤴ Workers: trim the batch to the remaining subrequest budget (keep 4
+      //  in reserve for the dledge pair on the next pass) — a batch that
+      //  overruns the 50-subrequest cap kills the whole pass INCLUDING the
+      //  commits of segments that already fetched fine.
+      if (ON_WORKERS) {
+        const cap = Math.max(0, subrequestsRemaining() - 4);
+        if (batch.length > cap) batch = batch.slice(0, cap);
+      }
       if (!batch.length) {
         if (this.startup && Date.now() - this.createdAt > 9_000) this.startup = false;
         return;
@@ -764,6 +803,9 @@ export class TurboSession {
 
   private async fetchSeg(url: string, referer: string): Promise<Uint8Array | null> {
     try {
+      // ⤴ Workers: no budget → treat as "not now" (the caller's batch
+      //  trimming normally prevents this; the guard is the hard backstop)
+      if (ON_WORKERS && !grantSubrequest()) return null;
       const target = proxiedUrl(url, referer);
       const res = await fetch(target, {
         headers: { 'User-Agent': UA, Accept: '*/*', ...(referer ? { Referer: referer } : {}) },
@@ -998,6 +1040,10 @@ async function transcodeSegment(ts: Uint8Array, h: number, priority: boolean): P
 // ── session management ────────────────────────────────────────────────────────
 
 function startReaper(): void {
+  // ⤴ Workers 2026-10-22: NO interval reaper — on workerd it fires only
+  // piggybacked on live invocations, spending THEIR subrequest budget. Idle
+  // eviction is done lazily in getTurboSession instead (same policy).
+  if (ON_WORKERS) return;
   if (g.__maxtvTurboReaper) return;
   g.__maxtvTurboReaper = setInterval(() => {
     const now = Date.now();
@@ -1008,6 +1054,19 @@ function startReaper(): void {
     }
   }, 15_000);
   (g.__maxtvTurboReaper as unknown as { unref?: () => void }).unref?.();
+}
+
+/** lazy idle sweep (Workers): same policy as the reaper, driven by traffic
+ *  instead of a timer — runs on session lookup, so a busy isolate evicts
+ *  exactly when it matters and an idle one spends nothing. */
+function sweepIdle(): void {
+  const now = Date.now();
+  for (const s of SESSIONS.values()) {
+    if (now - s.lastServed > IDLE_KILL_MS || now - s.createdAt > MAX_AGE_MS || s.isDead) {
+      s.kill(new Error('idle'));
+      SESSIONS.delete(s.key);
+    }
+  }
 }
 
 /** Map a relay/turbo UI server id → entry-route pin (mirrors transcode.ts) */
@@ -1043,11 +1102,14 @@ function pinForServer(serverId: string | undefined): string | undefined {
 export function getTurboSession(channelId: string, serverPin?: string): TurboSession {
   const pin = pinForServer(serverPin);
   const key = `ch${channelId}${pin ? `m${pin}` : ''}`;
+  // ⤴ Workers: the lazy reaper — evict idle/dead sessions on lookup
+  if (ON_WORKERS) sweepIdle();
   const existing = SESSIONS.get(key);
   if (existing && !existing.isDead) {
     existing.touch();
     return existing;
   }
+  SESSIONS.delete(key);
   if (SESSIONS.size >= MAX_SESSIONS) {
     const oldest = [...SESSIONS.values()].sort((a, b) => a.lastServed - b.lastServed)[0];
     oldest?.kill(new Error('evicted'));
@@ -1237,11 +1299,17 @@ async function fetchText(url: string, referer: string): Promise<string | null> {
   // DaddyLive premium edge: the playlist needs a paired Origin+token fetch
   // (see dledge.ts) — the plain Referer-only fetch below gets 403'd.
   if (isDaddyLiveEdgeManifest(url)) {
-    const dl = await fetchDaddyLivePlaylist(url);
+    // ⤴ Workers: the pair costs 2 subrequests per attempt (token + manifest);
+    // when the invocation is nearly out of budget, skip entirely and let the
+    // NEXT playlist poll (fresh budget) do the pair — a half-dead pair fetch
+    // is what exhausted invocations mid-warm-up.
+    if (ON_WORKERS && subrequestsRemaining() < 6) return null;
+    const dl = await fetchDaddyLivePlaylist(url, { attempts: ON_WORKERS ? 2 : 4 });
     if (dl?.ok && dl.body) return dl.body;
     return null;
   }
   try {
+    if (ON_WORKERS && !grantSubrequest()) return null;
     const target = proxiedUrl(url, referer);
     const res = await fetch(target, {
       headers: { 'User-Agent': UA, Accept: '*/*', ...(referer ? { Referer: referer } : {}) },

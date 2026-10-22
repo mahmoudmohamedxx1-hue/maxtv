@@ -1,0 +1,19 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  // The data-plane + UI worker (OpenNext). Deployed on the Workers FREE plan:
+  //   • 100k requests/day  — the player poll cadence + browser-cached
+  //     segments (max-age=45) keep a personal-use household well inside it
+  //   • 50 subrequests/invocation — the turbo engine budgets itself
+  //     (see src/lib/streaming/runtime.ts)
+  "name": "maxtv",
+  "main": ".open-next/worker.js",
+  "compatibility_date": "2026-10-19",
+  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+  "assets": {
+    "directory": ".open-next/assets",
+    "binding": "ASSETS"
+  },
+  "observability": {
+    "enabled": true
+  }
+}

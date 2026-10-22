@@ -21,7 +21,10 @@
     "dev": "next dev -p 3000",
     "build": "bash scripts/fetch-ffmpeg.sh && next build && cp -r .next/static .next/standalone/.next/ && cp -r public .next/standalone/ && cp -r data .next/standalone/ && (cp -r third_party .next/standalone/ 2>/dev/null || true)",
     "start": "NODE_ENV=production node .next/standalone/server.js",
-    "lint": "eslint ."
+    "lint": "eslint .",
+    "cf:build": "opennextjs-cloudflare build",
+    "cf:deploy": "opennextjs-cloudflare build && wrangler deploy",
+    "cf:tail": "wrangler tail"
   },
   "dependencies": {
     "@dnd-kit/core": "^6.3.1",
@@ -94,6 +97,7 @@
     "zustand": "^5.0.6"
   },
   "devDependencies": {
+    "@opennextjs/cloudflare": "^1.20.13",
     "@tailwindcss/postcss": "^4",
     "@types/react": "^19",
     "@types/react-dom": "^19",
@@ -102,6 +106,7 @@
     "eslint-config-next": "^16.1.1",
     "tailwindcss": "^4",
     "tw-animate-css": "^1.3.5",
-    "typescript": "^5"
+    "typescript": "^5",
+    "wrangler": "^4.152.0"
   }
 }

@@ -3,11 +3,68 @@ import { getTurboSession, SEG_LADDER_HEIGHTS, TurboSession } from '@/lib/streami
 import { ffmpegCapable, SERVERLESS } from '@/lib/streaming/ffmpeg-cap';
 import { setProxyOriginFromRequest } from '@/lib/streaming/upstream';
 import { rememberNativeHeight } from '@/lib/streaming/ladder-master';
+import { ON_WORKERS, resetSubrequestBudget } from '@/lib/streaming/runtime';
 
 export const dynamic = 'force-dynamic';
 /** per-segment transcodes can take up to ~10s (kick + upstream fetch + encode)
  *  — the default 10s function budget is too tight for the &h= ladder */
 export const maxDuration = 60;
+
+// ── Workers guards (2026-10-22) ─────────────────────────────────────────────
+// The free plan meters REQUESTS (100k/day) and caps subrequests per invocation
+// (50). Two cheap isolate-local guards keep strangers from burning the quota:
+
+/** referer/origin gate — a video URL only works for OUR pages. Absent
+ *  referer (some browsers/extensions/PWAs strip it) passes; a referer from
+ *  ANOTHER host is a third-party embed → 403. hls.js same-origin fetches
+ *  always carry the app's own origin. */
+function crossSiteEmbed(req: Request): boolean {
+  const host = new URL(req.url).host;
+  const ref = req.headers.get('referer');
+  if (ref) {
+    try {
+      if (new URL(ref).host !== host) return true;
+    } catch {
+      /* unparseable referer — treat as absent */
+    }
+  }
+  const org = req.headers.get('origin');
+  if (org && org !== 'null') {
+    try {
+      if (new URL(org).host !== host) return true;
+    } catch {
+      /* ignore */
+    }
+  }
+  return false;
+}
+
+/** per-IP token bucket (isolate-local approximation — enough to stop a
+ *  runaway client, the platform's own metering remains the real bound).
+ *  90 requests / 10s covers a 4-pane multi-view grid with the prefetcher. */
+const RL_WINDOW_MS = 10_000;
+const RL_MAX = 90;
+const rlG = globalThis as { __maxtvRl?: Map<string, { n: number; at: number }> };
+if (!rlG.__maxtvRl) rlG.__maxtvRl = new Map();
+function rateLimited(req: Request): boolean {
+  const ip =
+    req.headers.get('cf-connecting-ip') ||
+    req.headers.get('x-forwarded-for')?.split(',')[0].trim() ||
+    'unknown';
+  const now = Date.now();
+  const b = rlG.__maxtvRl!.get(ip);
+  if (!b || now - b.at > RL_WINDOW_MS) {
+    rlG.__maxtvRl!.set(ip, { n: 1, at: now });
+    if (rlG.__maxtvRl!.size > 500) {
+      // drop the oldest half (insertion order ≈ age)
+      const keys = [...rlG.__maxtvRl!.keys()].slice(0, 250);
+      for (const k of keys) rlG.__maxtvRl!.delete(k);
+    }
+    return false;
+  }
+  b.n++;
+  return b.n > RL_MAX;
+}
 
 /**
  * Turbo transport endpoint — prefetch passthrough for DaddyLive channels.
@@ -51,10 +108,30 @@ export async function GET(req: Request) {
   // Capture incoming origin so streaming-layer fetches to /api/proxy use the
   // public alias (bypasses Vercel's deployment-URL SSO redirect).
   setProxyOriginFromRequest(req);
+  // ⤴ Workers: fresh subrequest budget for this invocation (free plan caps
+  //  at 50; the turbo engine trims itself to what remains — see runtime.ts)
+  resetSubrequestBudget();
   const { searchParams } = new URL(req.url);
   const mode = searchParams.get('mode') || 'm3u8';
   const channel = searchParams.get('channel');
   const mirror = searchParams.get('m') || undefined;
+
+  // ⤴ Workers guards on the two expensive modes only (m3u8 polls + segment
+  //  bytes are what a quota thief wants; cap/native probes are cheap)
+  if (ON_WORKERS && (mode === 'm3u8' || mode === 'seg')) {
+    if (crossSiteEmbed(req)) {
+      return new NextResponse('hotlink denied', {
+        status: 403,
+        headers: { 'content-type': 'text/plain', 'cache-control': 'no-store' },
+      });
+    }
+    if (rateLimited(req)) {
+      return new NextResponse('slow down', {
+        status: 429,
+        headers: { 'content-type': 'text/plain', 'cache-control': 'no-store', 'retry-after': '2' },
+      });
+    }
+  }
 
   // capability probe — the player asks once per page load whether the
   // data-saver ladder exists on this deployment:
@@ -143,7 +220,17 @@ export async function GET(req: Request) {
         // upstream restarts; the &g= generation param keeps the EDGE honest
         // — see the m3u8 rewriter below). 25s covers the ride band's
         // lifetime (~25-30s behind the tip) with margin for recycle safety.
-        'cache-control': 'public, max-age=0, s-maxage=25',
+        //
+        // ⤴ WORKERS: no shared edge cache by header on workers.dev, and the
+        // free plan meters REQUESTS — so flip to BROWSER caching instead:
+        // upstream segment URLs are immutable (unique ns), so 45s of
+        // max-age lets the client prefetcher's bytes be reused by hls.js's
+        // own fragment load — roughly HALVING segment requests. A restart
+        // mid-window only risks ≤45s of stale bytes, and the player's
+        // micro-gap watchdog absorbs the PTS discontinuity.
+        'cache-control': ON_WORKERS
+          ? 'public, max-age=45'
+          : 'public, max-age=0, s-maxage=25',
         'access-control-allow-origin': '*',
       },
     });

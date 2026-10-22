@@ -124,9 +124,14 @@ async function unwrapRaw(raw: Uint8Array): Promise<Uint8Array | null> {
 }
 
 /** turbo segment: same-origin route (edge-cached server-side after the
- *  2026-10-22 fix — any isolate's first success parks it at the edge) */
+ *  2026-10-22 fix — any isolate's first success parks it at the edge).
+ *  cache mode left DEFAULT (not no-store): on the Workers deployment segments
+ *  carry max-age=45, so the prefetched bytes land in the browser HTTP cache
+ *  and hls.js's own fragment load reuses them — roughly halving segment
+ *  requests against the free plan's 100k/day meter. On Vercel the response
+ *  is max-age=0, making the default mode a no-op vs no-store. */
 async function fetchTurboSegment(url: string): Promise<Uint8Array | null> {
-  const res = await fetch(url, { cache: 'no-store', ...timeoutSignal() });
+  const res = await fetch(url, timeoutSignal());
   if (!res.ok) throw new Error(`turbo seg ${res.status}`);
   const buf = new Uint8Array(await res.arrayBuffer());
   if (buf.length < 188) throw new Error('tiny payload');
@@ -148,7 +153,9 @@ async function fetchSegdlSegment(url: string): Promise<Uint8Array | null> {
       /* fall through to the server route */
     }
   }
-  const res = await fetch(url, { cache: 'no-store', ...timeoutSignal() });
+  // default cache mode (see fetchTurboSegment — same reasoning; the segdl
+  // route is no-store server-side, so this is a behavioral no-op there)
+  const res = await fetch(url, timeoutSignal());
   if (!res.ok) throw new Error(`segdl ${res.status}`);
   const buf = new Uint8Array(await res.arrayBuffer());
   if (buf.length < 188) throw new Error('tiny payload');
