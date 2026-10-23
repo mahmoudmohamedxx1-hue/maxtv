@@ -6,7 +6,17 @@
 //   • stream resolution: watch page → embed iframe → _econfig / direct m3u8
 //   • the exact _econfig 4-segment base64 decoder from the original repo
 
-import * as cheerio from 'cheerio';
+// ⤴ WORKERS 2026-10-23: cheerio was REMOVED from this module. The two DOM
+// parses it did (schedule page 699KB, 24/7 page 208KB — real captured sizes)
+// burned 60-150ms of pure CPU, 6-15x the Workers free-plan 10ms/invocation
+// budget. In production that killed /api/sports/* + /api/search on every
+// cold isolate — the invocation dies BEFORE the result is cached, so every
+// retry re-parses and dies again: "the site is broken again", four times
+// running (38 exceededResources kills/day in the account analytics).
+// The string-op walkers in parseScheduleHtml()/parse247Html() perform the
+// SAME extraction in <1ms (bench: 0.72ms on a captured 699KB page). Output
+// parity with the old cheerio walk is pinned by scripts/bench/daddylive-parity.mjs
+// on captured real pages — run it after touching either parser.
 import type { SportsMatch, SportsChannelRef, ResolvedStream } from '../types';
 import { normalizeSport, splitLeague, stripEmojis, decodeEntities, isEventStream, DEAD_DL_CHANNEL_IDS } from './categories';
 import { rankScheduleFeeds, type FeedHealth } from './feeds';
@@ -156,7 +166,7 @@ async function fetchText(url: string, referer: string, timeoutMs = 9000): Promis
 }
 
 // ─── per-sport max durations (ms) for live/upcoming status ──────────────────
-const DURATIONS: Record<string, number> = {
+export const DURATIONS: Record<string, number> = {
   cricket: 8 * 3600_000,
   mma: 6 * 3600_000,
   fighting: 6 * 3600_000,
@@ -181,7 +191,7 @@ const DURATIONS: Record<string, number> = {
  *  matched — the World Surf League uses the same abbreviation. */
 const WOMENS_RE =
   /\bwomen|women's|femin|femen|frauen|nwsl|wnba|damallsvenskan|kvinner|w-league|liga f\b/i;
-function isWomensCompetition(hay: string): boolean {
+export function isWomensCompetition(hay: string): boolean {
   const flat = hay.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
   return WOMENS_RE.test(flat);
 }
@@ -312,50 +322,102 @@ export async function getSchedule(): Promise<SportsMatch[]> {
 }
 
 export function parseScheduleHtml(html: string): SportsMatch[] {
-  const $ = cheerio.load(html);
   const out: SportsMatch[] = [];
   const now = Date.now();
   const currentYear = new Date().getUTCFullYear();
   const seen = new Set<string>();
 
-  $('.schedule__day').each((_, dayEl) => {
-    const $day = $(dayEl);
-    const dayTitle = $day.find('.schedule__dayTitle').first().text().trim();
+  // string-op DOM walk (see the cheerio-removal note atop this file). Slice
+  // markers carry closing quotes so prefix collisions cannot match:
+  // `class="schedule__event"` can never hit `schedule__eventHeader`/`eventTitle`.
+  // The category marker needs BOTH variants — the real page has three:
+  // `class="schedule__category is-expanded"` (58), `class="schedule__category"`
+  // (2), and the collider `class="schedule__categoryBody"` (60) which must NOT
+  // match: a bare `class="schedule__category` prefix truncated every category
+  // slice at its own Body wrapper and dropped all events (parity caught it).
+  const DAY = 'class="schedule__day"';
+  const EV = 'class="schedule__event"';
+  const CH = 'class="schedule__channels"';
+  const nextCatMark = (s: string, from: number): number => {
+    const a = s.indexOf('class="schedule__category"', from);
+    const b = s.indexOf('class="schedule__category ', from); // trailing space: `is-expanded` etc.
+    return a === -1 ? b : b === -1 ? a : Math.min(a, b);
+  };
+
+  let dayPos = html.indexOf(DAY);
+  while (dayPos !== -1) {
+    const dayNext = html.indexOf(DAY, dayPos + DAY.length);
+    const daySlice = html.slice(dayPos, dayNext === -1 ? html.length : dayNext);
+    dayPos = dayNext;
+
+    const dayTitle = dec2(daySlice.match(/class="schedule__dayTitle">([^<]*)/)?.[1] || '').trim();
     const dateMatch = dayTitle.match(/(\d+)(?:st|nd|rd|th)\s+([A-Za-z]+)(?:\s+(\d{4}))?/i);
     const year = dateMatch && dateMatch[3] ? parseInt(dateMatch[3], 10) : currentYear;
     let dayStr = '';
     if (dateMatch) dayStr = `${dateMatch[1]} ${dateMatch[2]} ${year}`;
 
-    $day.find('.schedule__category').each((_, catEl) => {
-      const $cat = $(catEl);
-      const rawCat = $cat.find('.card__meta').first().text().trim();
-      const cleanCat = stripEmojis(decodeEntities(rawCat));
-      if (!cleanCat || /big brother/i.test(cleanCat)) return;
+    let catPos = nextCatMark(daySlice, 0);
+    while (catPos !== -1) {
+      const catNext = nextCatMark(daySlice, catPos + 29);
+      const catSlice = daySlice.slice(catPos, catNext === -1 ? daySlice.length : catNext);
+      catPos = catNext;
 
-      $cat.find('.schedule__event').each((__, evEl) => {
-        const $ev = $(evEl);
-        const time = ($ev.find('.schedule__time').attr('data-time') || $ev.find('.schedule__time').text() || '').trim();
-        const rawTitle = $ev.find('.schedule__eventTitle').first().text().trim();
-        if (!rawTitle || !time) return;
+      const rawCat = (catSlice.match(/class="card__meta">([^<]*)/)?.[1] || '').trim();
+      const cleanCat = stripEmojis(dec2(rawCat));
+      if (!cleanCat || /big brother/i.test(cleanCat)) continue;
+
+      let evPos = catSlice.indexOf(EV);
+      while (evPos !== -1) {
+        const evNext = catSlice.indexOf(EV, evPos + EV.length);
+        const evSlice = catSlice.slice(evPos, evNext === -1 ? catSlice.length : evNext);
+        evPos = evNext;
+
+        // time: data-time attr on the first .schedule__time, else its inner text
+        let time = '';
+        const timeTagAt = evSlice.indexOf('class="schedule__time"');
+        if (timeTagAt !== -1) {
+          const tagEnd = evSlice.indexOf('>', timeTagAt);
+          if (tagEnd !== -1) {
+            const tag = evSlice.slice(timeTagAt, tagEnd);
+            time = (tag.match(/data-time="([^"]*)"/)?.[1] || '').trim();
+            if (!time) {
+              time = (evSlice.slice(tagEnd + 1).match(/([^<]*)/)?.[1] || '').trim();
+            }
+          }
+        }
+        const rawTitle = (evSlice.match(/class="schedule__eventTitle">([^<]*)/)?.[1] || '').trim();
+        if (!rawTitle || !time) continue;
 
         const channels: SportsChannelRef[] = [];
         const seenCh = new Set<string>();
-        $ev.find('.schedule__channels a').each((___, a) => {
-          const href = $(a).attr('href') || '';
-          const idm = href.match(/id=(\d+)/);
-          if (!idm || idm[1] === '00') return;
-          const name = ($(a).attr('title') || $(a).text() || `Channel ${idm[1]}`).trim();
+        let chPos = evSlice.indexOf(CH);
+        while (chPos !== -1) {
+          const chNext = evSlice.indexOf(CH, chPos + CH.length);
+          const chSlice = evSlice.slice(chPos, chNext === -1 ? evSlice.length : chNext);
+          chPos = chNext;
           // NOTE: "Event SD Stream" feeds are NOT dummy channels — they are
           // real per-event streams (PNG-cloaked TS the proxy unwraps). Keeping
           // them restores all the football fixtures that list no other feed.
-          const id = idm[1];
-          if (seenCh.has(id)) return;
-          seenCh.add(id);
-          channels.push({ id, name: fixMojibake(decodeEntities(name)) || `Channel ${id}` });
-        });
-        if (channels.length === 0) return;
+          const A_RE = /<a\b[^>]*>/g;
+          let am: RegExpExecArray | null;
+          while ((am = A_RE.exec(chSlice)) !== null) {
+            const tag = am[0];
+            const href = tag.match(/href="([^"]*)"/)?.[1] || '';
+            const idm = href.match(/id=(\d+)/);
+            if (!idm || idm[1] === '00') continue;
+            const id = idm[1];
+            if (seenCh.has(id)) continue;
+            seenCh.add(id);
+            let name = (tag.match(/title="([^"]*)"/)?.[1] || '').trim();
+            if (!name) {
+              name = (chSlice.slice(am.index + am[0].length).match(/([^<]*)/)?.[1] || '').trim();
+            }
+            channels.push({ id, name: fixMojibake(dec2(name)) || `Channel ${id}` });
+          }
+        }
+        if (channels.length === 0) continue;
 
-        const rawEvent = stripEmojis(decodeEntities(rawTitle));
+        const rawEvent = stripEmojis(dec2(rawTitle));
         const { league, title } = splitLeague(rawEvent);
         const category = normalizeSport(`${cleanCat} ${league} ${title}`);
 
@@ -375,15 +437,15 @@ export function parseScheduleHtml(html: string): SportsMatch[] {
             matchTime = time < '06:00' ? parsed + 24 * 3600_000 : parsed;
           }
         }
-        if (matchTime == null) return;
+        if (matchTime == null) continue;
 
         // skip fully-finished fixtures
         const maxDuration = DURATIONS[category] ?? 3 * 3600_000;
-        if (now > matchTime + maxDuration) return;
+        if (now > matchTime + maxDuration) continue;
 
         // de-dup fixtures listed on multiple days
         const dedup = `${title}|${matchTime}`;
-        if (seen.has(dedup)) return;
+        if (seen.has(dedup)) continue;
         seen.add(dedup);
 
         out.push({
@@ -398,9 +460,9 @@ export function parseScheduleHtml(html: string): SportsMatch[] {
           day: dayTitle,
           women: isWomensCompetition(`${league} ${cleanCat}`),
         });
-      });
-    });
-  });
+      }
+    }
+  }
 
   out.sort((a, b) => a.startTime - b.startTime);
   return out;
@@ -413,6 +475,15 @@ export interface DaddyLiveChannel {
   country?: string;
 }
 
+/** Two decodeEntities passes. The old cheerio pipeline DOM-decoded once
+ *  (.text()/.attr()) and the code then ran decodeEntities again — upstream
+ *  sometimes double-encodes (&amp;amp;) which needs both passes. The string
+ *  walkers capture raw text, so they call dec2 wherever cheerio used to
+ *  DOM-decode (parity-pinned by scripts/bench/daddylive-parity.mjs). */
+function dec2(s: string): string {
+  return decodeEntities(decodeEntities(s));
+}
+
 /** Repair common Shift-JIS mojibake left by the channel pages ("Espa単ol" → "Español"). */
 function fixMojibake(name: string): string {
   return name.replace(/Espa単ol/g, 'Español');
@@ -421,25 +492,40 @@ function fixMojibake(name: string): string {
 async function fetch247Uncached(): Promise<DaddyLiveChannel[]> {
   const html = await raceMirrorHtml('/24-7-channels.php', 'class="card"');
   if (!html) return [];
+  return parse247Html(html);
+}
 
-  const $ = cheerio.load(html);
+/** pure string-op walk over a captured 24/7 page (see the note atop this
+ *  file). Every `class="card"` occurrence is a slice start; the closing
+ *  quote in the marker cannot collide with `card__title` (underscore
+ *  follows, not "). Parity-pinned by scripts/bench/daddylive-parity.mjs. */
+export function parse247Html(html: string): DaddyLiveChannel[] {
   const out: DaddyLiveChannel[] = [];
   const seen = new Set<string>();
   // NOTE: dead ids are NOT dropped here — consumers filter with the scan seed
   // (DEAD_DL_CHANNEL_IDS) + runtime verdicts, so channels that resurrect on
   // the CDN come back automatically instead of being hidden until a re-scan.
-  $('a.card').each((_, el) => {
-    const href = $(el).attr('href') || '';
+  const CARD = 'class="card"';
+  let pos = html.indexOf(CARD);
+  while (pos !== -1) {
+    const next = html.indexOf(CARD, pos + CARD.length);
+    const slice = html.slice(pos, next === -1 ? html.length : next);
+    pos = next;
+    const tagEnd = slice.indexOf('>');
+    if (tagEnd === -1) continue;
+    const tag = slice.slice(0, tagEnd);
+    const href = tag.match(/href="([^"]*)"/)?.[1] || '';
     const idm = href.match(/id=(\d+)/);
-    if (!idm) return;
+    if (!idm) continue;
     const id = idm[1];
-    if (seen.has(id)) return;
+    if (seen.has(id)) continue;
     seen.add(id);
-    const name = ($(el).find('.card__title').first().text() || $(el).attr('data-title') || `Channel ${id}`).trim();
-    if (!name || isEventStream(name)) return;
-    out.push({ id, name: fixMojibake(decodeEntities(name)) });
-  });
-
+    const cardTitle = (slice.match(/class="card__title">([^<]*)/)?.[1] || '').trim();
+    const dataTitle = (tag.match(/data-title="([^"]*)"/)?.[1] || '').trim();
+    const name = (cardTitle || dataTitle || `Channel ${id}`).trim();
+    if (!name || isEventStream(name)) continue;
+    out.push({ id, name: fixMojibake(dec2(name)) });
+  }
   return out;
 }
 
