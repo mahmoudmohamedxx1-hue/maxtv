@@ -118,6 +118,13 @@ export const LADDER_MASTER_HLS_CONFIG = {
  *  provider ships a single rendition (DaddyLive + most free IPTV CDNs) */
 export const DATA_SAVER_HEIGHTS = [144, 244, 360, 480, 720, 1080] as const;
 
+/** Local Turbo rungs (Tier 3 client pipeline) — render heights decoded and
+ *  scaled in the browser via WebCodecs. 0 = Source (native size, pure
+ *  live-edge boost). Unlike DATA_SAVER_HEIGHTS these add zero server load
+ *  and change the RENDER size only — the source rendition is downloaded
+ *  either way, so they do not reduce data usage. */
+export const LOCAL_TURBO_RUNGS = [0, 720, 480] as const;
+
 /** the DaddyLive iframe-chain sources — when the resolved src is one of
  *  these, the embedded page takes over playback instead of hls.js */
 const DL_IFRAME_PREFIXES = [

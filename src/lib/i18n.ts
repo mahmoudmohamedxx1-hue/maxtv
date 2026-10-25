@@ -151,6 +151,17 @@ const en = {
   'player.rung.hd': 'HD',
   'player.rung.fullHd': 'Full HD',
 
+  // player — Local Turbo (client-side low-latency pipeline)
+  'player.localTurboSection': 'Local Turbo (beta)',
+  'player.localTurboNote':
+    "Decoded in your browser — rides ~1s behind the live edge instead of several segments. Doesn't reduce data usage.",
+  'player.localTurboOn': 'Turbo on · {height}',
+  'player.localTurboFail': 'Turbo unavailable here — back to standard playback',
+  'player.localTurboExit': '← back to standard playback',
+  'player.localTurboNoPip': 'Picture-in-picture needs standard playback — exit Turbo first',
+  'player.turboChip': 'Turbo',
+  'player.sourceRung': 'Source',
+
   // player — servers menu
   'player.servers': 'Servers',
   'player.streamingServers': 'Streaming servers',
@@ -457,6 +468,17 @@ const ar: Record<Exclude<TKey, never>, string> = {
   'player.rung.ultraLow': 'منخفضة جدًا',
   'player.rung.hd': 'HD',
   'player.rung.fullHd': 'Full HD',
+
+  // player — Local Turbo (client-side low-latency pipeline)
+  'player.localTurboSection': 'التُربو المحلي (تجريبي)',
+  'player.localTurboNote':
+    'يُفكّ ترميز البث داخل متصفحك — يلتصق بحدّ البث المباشر خلال ثانية تقريبًا بدل عدة مقاطع. لا يقلّل استهلاك البيانات.',
+  'player.localTurboOn': 'التُربو مفعّل · {height}',
+  'player.localTurboFail': 'التُربو غير متاح هنا — العودة للتشغيل القياسي',
+  'player.localTurboExit': '→ العودة للتشغيل القياسي',
+  'player.localTurboNoPip': 'الصورة داخل الصورة تحتاج التشغيل القياسي — اخرج من التُربو أولًا',
+  'player.turboChip': 'تُربو',
+  'player.sourceRung': 'الأصل',
 
   // player — servers menu
   'player.servers': 'السيرفرات',

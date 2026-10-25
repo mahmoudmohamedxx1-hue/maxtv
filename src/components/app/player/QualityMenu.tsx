@@ -23,9 +23,15 @@ export interface QualityMenuProps {
   segLadder: boolean;
   /** daddylive channel (or an alternate with a signed transcode source) */
   canLadderTranscode: boolean;
+  /** Local Turbo (client-side pipeline) — offered + active state */
+  canLocalTurbo: boolean;
+  localTurboHeights: number[];
+  localTurboHeight: number | null;
   onSetLevel: (level: number) => void;
   onSelectDataSaver: (height: number) => void;
   onPickAltRung: (alt: AltServer, height: number) => void;
+  onPickLocalTurbo: (height: number) => void;
+  onExitLocalTurbo: () => void;
 }
 
 export function QualityMenu({
@@ -40,9 +46,14 @@ export function QualityMenu({
   singleQuality,
   segLadder,
   canLadderTranscode,
+  canLocalTurbo,
+  localTurboHeights,
+  localTurboHeight,
   onSetLevel,
   onSelectDataSaver,
   onPickAltRung,
+  onPickLocalTurbo,
+  onExitLocalTurbo,
 }: QualityMenuProps) {
   return (
     <div className="styled-scrollbar absolute end-0 top-11 z-30 max-h-[70vh] w-48 overflow-y-auto rounded-xl border border-zilla-line bg-zilla-bg/95 shadow-2xl backdrop-blur">
@@ -100,6 +111,41 @@ export function QualityMenu({
             ))}
           <p className="px-3.5 py-2 text-[10px] font-medium leading-snug text-zilla-dim">
             {t('player.altRungNote', { source: ladderAlt.sourceName })}
+          </p>
+        </>
+      )}
+
+      {canLocalTurbo && localTurboHeights.length > 0 && (
+        <>
+          <p className="border-t border-zilla-line/60 px-3.5 py-2 text-[9px] font-black uppercase tracking-widest text-zilla-dim">
+            {t('player.localTurboSection')}
+          </p>
+          {localTurboHeights.map((h) => (
+            <button
+              key={`turbo-${h}`}
+              onClick={() => onPickLocalTurbo(h)}
+              className={cn(
+                'flex w-full items-center justify-between px-3.5 py-2.5 text-xs font-bold transition-colors hover:bg-white/10',
+                localTurboHeight === h ? 'text-zilla-yellow' : 'text-zilla-text'
+              )}
+            >
+              <span>
+                {h === 0 ? t('player.sourceRung') : `${h}p`}
+                <span className="ms-1.5 text-[9px] font-bold text-zilla-dim">{t('player.turboChip')}</span>
+              </span>
+              {localTurboHeight === h && <span>✓</span>}
+            </button>
+          ))}
+          {localTurboHeight !== null && (
+            <button
+              onClick={onExitLocalTurbo}
+              className="w-full px-3.5 py-2 text-start text-[10px] font-bold text-zilla-yellow/80 transition-colors hover:text-zilla-yellow"
+            >
+              {t('player.localTurboExit')}
+            </button>
+          )}
+          <p className="px-3.5 py-2 text-[10px] font-medium leading-snug text-zilla-dim">
+            {t('player.localTurboNote')}
           </p>
         </>
       )}

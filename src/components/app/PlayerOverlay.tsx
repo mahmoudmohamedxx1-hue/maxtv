@@ -38,6 +38,7 @@ import {
   LADDER_HLS_CONFIG,
   LADDER_MASTER_HLS_CONFIG,
   DATA_SAVER_HEIGHTS,
+  LOCAL_TURBO_RUNGS,
   isDlIframeSrc,
   type AltServer,
   type MatchLike,
@@ -57,6 +58,11 @@ import { createNetWatcher } from './player/createNetWatcher';
 import { UncloakDirectLoader, directPathHealthy } from './player/uncloak-loader';
 import { attachSegPrefetch } from './player/seg-prefetch';
 import { QualityMenu } from './player/QualityMenu';
+import {
+  probeLocalTurbo,
+  startLocalTurbo,
+  type LocalTurboHandle,
+} from './player/local-turbo';
 import { ServersMenu } from './player/ServersMenu';
 import { SurfSidebar } from './player/SurfSidebar';
 import { StateOverlays } from './player/StateOverlays';
@@ -83,6 +89,14 @@ export function PlayerOverlay() {
   const [showQualityMenu, setShowQualityMenu] = useState(false);
   /** active data-saver (transcoded) height — null = native stream */
   const [tcHeight, setTcHeight] = useState<number | null>(null);
+  /* ── Local Turbo (Tier 3 client pipeline) ── turboHeight = active render
+   * rung (0 = Source/native size); null = standard hls.js playback */
+  const [turboHeight, setTurboHeight] = useState<number | null>(null);
+  const [turboCapable, setTurboCapable] = useState(false);
+  const turboRef = useRef<LocalTurboHandle | null>(null);
+  const turboHeightRef = useRef<number | null>(null);
+  const turboCanvasRef = useRef<HTMLCanvasElement>(null);
+  const turboPausedRef = useRef(false);
   /** the data-saver rung was picked by the connectivity engine (not the user) */
   const [autoDs, setAutoDs] = useState(false);
   const [servers, setServers] = useState<ServerOption[]>([]);
@@ -392,6 +406,14 @@ export function PlayerOverlay() {
       if (hlsRef.current) {
         hlsRef.current.destroy();
         hlsRef.current = null;
+      }
+      // a channel switch always drops any active Local Turbo session
+      if (turboRef.current) {
+        turboRef.current.stop();
+        turboRef.current = null;
+        turboHeightRef.current = null;
+        turboPausedRef.current = false;
+        setTurboHeight(null);
       }
 
       try {
@@ -1085,6 +1107,13 @@ export function PlayerOverlay() {
         hlsRef.current.destroy();
         hlsRef.current = null;
       }
+      if (turboRef.current) {
+        turboRef.current.stop();
+        turboRef.current = null;
+        turboHeightRef.current = null;
+        turboPausedRef.current = false;
+        setTurboHeight(null);
+      }
     }
   }, [playerOpen]);
 
@@ -1438,6 +1467,18 @@ export function PlayerOverlay() {
   playWithFallbackRef.current = playWithFallback;
 
   const togglePlay = useCallback(() => {
+    if (turboRef.current) {
+      if (turboPausedRef.current) {
+        turboRef.current.resume();
+        turboPausedRef.current = false;
+        setPhase('playing');
+      } else {
+        turboRef.current.pause();
+        turboPausedRef.current = true;
+        setPhase('paused');
+      }
+      return;
+    }
     const v = videoRef.current;
     if (!v) return;
     if (v.paused) {
@@ -1450,6 +1491,16 @@ export function PlayerOverlay() {
   }, [soundOn]);
 
   const toggleMute = useCallback(() => {
+    if (turboRef.current) {
+      const next = !muted;
+      turboRef.current.setMuted(next);
+      setMuted(next);
+      if (!next && (volume === 0 || Number.isNaN(volume))) {
+        turboRef.current.setVolume(0.75);
+        setVolume(0.75);
+      }
+      return;
+    }
     const v = videoRef.current;
     if (!v) return;
     if (v.muted) soundOn(v);
@@ -1457,9 +1508,14 @@ export function PlayerOverlay() {
       v.muted = true;
       setMuted(true);
     }
-  }, [soundOn]);
+  }, [soundOn, muted, volume]);
 
   const goLive = useCallback(() => {
+    if (turboRef.current) {
+      turboRef.current.jumpToLive();
+      setLiveBehind(false);
+      return;
+    }
     const v = videoRef.current;
     if (!v || !v.seekable.length) return;
     v.currentTime = v.seekable.end(v.seekable.length - 1) - 1;
@@ -1484,6 +1540,10 @@ export function PlayerOverlay() {
   }, []);
 
   const togglePip = useCallback(async () => {
+    if (turboRef.current) {
+      showToast(t('player.localTurboNoPip'));
+      return;
+    }
     const v = videoRef.current;
     if (!v) return;
     try {
@@ -1795,9 +1855,117 @@ export function PlayerOverlay() {
     exitDataSaverRef.current = exitDataSaver;
   }, [exitDataSaver]);
 
+  /* ── Local Turbo (Tier 3): browser-side low-latency pipeline ─────── */
+
+  /** capability probe — cheap + memoized in the engine module */
+  useEffect(() => {
+    setTurboCapable(probeLocalTurbo());
+  }, []);
+
+  /** leave Turbo — restore the standard hls.js engine on the native source */
+  const exitTurbo = useCallback(
+    (restore = true) => {
+      setShowQualityMenu(false);
+      turboRef.current?.stop();
+      turboRef.current = null;
+      turboHeightRef.current = null;
+      turboPausedRef.current = false;
+      setTurboHeight(null);
+      setBuffering(false);
+      const src = nativeSrcRef.current;
+      if (restore && src) {
+        setPhase('loading');
+        attachSource(src);
+      }
+    },
+    [attachSource]
+  );
+  const exitTurboRef = useRef(exitTurbo);
+  exitTurboRef.current = exitTurbo;
+
+  /** switch playback to the local pipeline at a render-height rung
+   *  (0 = Source/native size — pure live-edge boost) */
+  const enterTurbo = useCallback(
+    async (height: number) => {
+      setShowQualityMenu(false);
+      const src = nativeSrcRef.current;
+      const canvas = turboCanvasRef.current;
+      if (!src || !canvas || isDlIframeSrc(src)) return;
+      if (tcHeightRef.current !== null) return; // not from data-saver mode
+      // hand over from hls.js — the canvas takes over the surface
+      if (hlsRef.current) {
+        hlsRef.current.destroy();
+        hlsRef.current = null;
+      }
+      turboHeightRef.current = height;
+      setTurboHeight(height);
+      turboPausedRef.current = false;
+      setPhase('loading');
+      setBuffering(true);
+      const prefs = loadPrefs();
+      try {
+        turboRef.current = await startLocalTurbo({
+          url: src,
+          canvas,
+          height: height || null,
+          volume: prefs.volume,
+          muted: prefs.muted,
+          onPhase: (p) => {
+            if (p === 'playing') {
+              setPhase('playing');
+              setBuffering(false);
+            } else if (p === 'stalled') {
+              setBuffering(true);
+            } else if (p === 'error') {
+              showToast(t('player.localTurboFail'));
+              exitTurboRef.current(true);
+            }
+          },
+          onStats: (st) => {
+            if (typeof window !== 'undefined') {
+              (window as unknown as { __maxtvTurbo?: unknown }).__maxtvTurbo = st;
+            }
+          },
+        });
+        showToast(t('player.localTurboOn', { height: height || t('player.sourceRung') }));
+      } catch {
+        turboRef.current = null;
+        turboHeightRef.current = null;
+        setTurboHeight(null);
+        showToast(t('player.localTurboFail'));
+        const s = nativeSrcRef.current;
+        if (s) {
+          setPhase('loading');
+          attachSource(s);
+        } else {
+          setPhase('error');
+        }
+      }
+    },
+    [showToast, t, attachSource]
+  );
+
   const setLevel = useCallback(
     (level: number) => {
       setShowQualityMenu(false);
+      // leaving Turbo for a native/alt rung — drop the engine first; the
+      // restore paths below re-attach hls.js themselves
+      if (turboRef.current) {
+        const wasTurbo = true;
+        turboRef.current.stop();
+        turboRef.current = null;
+        turboHeightRef.current = null;
+        turboPausedRef.current = false;
+        setTurboHeight(null);
+        setBuffering(false);
+        if (wasTurbo && nativeSrcRef.current) {
+          setPhase('loading');
+          attachSource(nativeSrcRef.current, level >= 0 ? level : undefined);
+          setCurrentQuality(level);
+          showToast(level === -1 ? t('player.qualityAutoToast') : t('player.qualityToast', { label: quality.find((q) => q.level === level)?.label ?? '' }));
+          return;
+        }
+      }
       // persist the preference so every future stream opens at this quality.
       // The ladder's Source rung persists as quality 0 (the documented
       // "source/native" preference) — identified by LEVEL INDEX, not label
@@ -1977,6 +2145,14 @@ export function PlayerOverlay() {
           break;
         case 'ArrowUp': {
           e.preventDefault();
+          if (turboRef.current) {
+            const nv = Math.min(1, Math.max(0.1, volume + 0.1));
+            turboRef.current.setVolume(nv);
+            turboRef.current.setMuted(false);
+            setVolume(nv);
+            setMuted(false);
+            break;
+          }
           const v = videoRef.current;
           if (v) {
             const nv = Math.min(1, Math.max(0.1, v.volume + 0.1));
@@ -1989,6 +2165,12 @@ export function PlayerOverlay() {
         }
         case 'ArrowDown': {
           e.preventDefault();
+          if (turboRef.current) {
+            const nv = Math.max(0, volume - 0.1);
+            turboRef.current.setVolume(nv);
+            setVolume(nv);
+            break;
+          }
           const v = videoRef.current;
           if (v) {
             const nv = Math.max(0, v.volume - 0.1);
@@ -2042,7 +2224,9 @@ export function PlayerOverlay() {
 
   /* ── derived view state ─────────────────────────────────────────────────── */
   const qualityLabel =
-    tcHeight !== null
+    turboHeight !== null
+      ? `${turboHeight ? `${turboHeight}p` : t('player.sourceRung')} · ${t('player.turboChip')}`
+      : tcHeight !== null
       ? `${autoDs ? `${t('player.auto')} · ` : ''}${tcHeight}p · ${t('player.dsChip')}`
       : currentQuality === -1
         ? `${t('player.auto')}${activeHeight ? ` · ${activeHeight}p` : ''}`
@@ -2066,6 +2250,19 @@ export function PlayerOverlay() {
    *  alternate sources. */
   const segLadder = player.kind === 'daddylive' && tcSeg && !tcRelayRef.current;
   const dsHeights: readonly number[] = segLadder ? [144, 244, 360, 480] : DATA_SAVER_HEIGHTS;
+  /* Local Turbo section — only for HLS sources the engine can read (no DL
+   *  iframes), outside data-saver mode, on WebCodecs-capable browsers. Rungs
+   *  below the native height + Source (pure live-edge boost). */
+  const turboSrc = nativeSrcRef.current;
+  const nativeH = activeHeight || nativeHeightRef.current;
+  const canLocalTurbo =
+    turboCapable &&
+    tcHeight === null &&
+    !!turboSrc &&
+    !isDlIframeSrc(turboSrc);
+  const turboHeights: number[] = LOCAL_TURBO_RUNGS.filter(
+    (h) => h === 0 || !nativeH || h < nativeH - 60
+  );
   const familyAlt =
     alternates.find((a) => a.sameChannel === false && a.ladder?.length) ||
     alternates.find((a) => a.sameChannel === false);
@@ -2107,21 +2304,37 @@ export function PlayerOverlay() {
             title="DaddyLive Stream"
           />
         ) : (
-          <video
-            ref={videoRef}
-            className="absolute inset-0 h-full w-full object-contain"
-            playsInline
-            autoPlay
-            onClick={() => (controlsVisible ? togglePlay() : poke())}
-            onDoubleClick={toggleFullscreen}
-            onPlaying={() => setPhase('playing')}
-            onPause={() => {
-              if (phase === 'playing') setPhase('paused');
-            }}
-            onWaiting={() => setBuffering(true)}
-            onPlayingCapture={() => setBuffering(false)}
-            onCanPlay={() => setBuffering(false)}
-          />
+          <>
+            <video
+              ref={videoRef}
+              className={cn(
+                'absolute inset-0 h-full w-full object-contain',
+                turboHeight !== null && 'invisible'
+              )}
+              playsInline
+              autoPlay
+              onClick={() => (controlsVisible ? togglePlay() : poke())}
+              onDoubleClick={toggleFullscreen}
+              onPlaying={() => setPhase('playing')}
+              onPause={() => {
+                if (phase === 'playing') setPhase('paused');
+              }}
+              onWaiting={() => setBuffering(true)}
+              onPlayingCapture={() => setBuffering(false)}
+              onCanPlay={() => setBuffering(false)}
+            />
+            {/* Local Turbo render surface — mounted always, shown only while
+                the engine owns playback (keeps handover flicker-free) */}
+            <canvas
+              ref={turboCanvasRef}
+              className={cn(
+                'absolute inset-0 h-full w-full bg-black object-contain',
+                turboHeight === null && 'hidden'
+              )}
+              onClick={() => (controlsVisible ? togglePlay() : poke())}
+              onDoubleClick={toggleFullscreen}
+            />
+          </>
         )}
 
         {/* buffering ring */}
@@ -2239,6 +2452,11 @@ export function PlayerOverlay() {
                     singleQuality={singleQuality}
                     segLadder={segLadder}
                     canLadderTranscode={player.kind === 'daddylive' || !!tcSrcRef.current}
+                    canLocalTurbo={canLocalTurbo}
+                    localTurboHeights={turboHeights}
+                    localTurboHeight={turboHeight}
+                    onPickLocalTurbo={(h) => void enterTurbo(h)}
+                    onExitLocalTurbo={() => exitTurbo(true)}
                     onSetLevel={setLevel}
                     onSelectDataSaver={(h) => selectDataSaver(h)}
                     onPickAltRung={pickAltRung}
@@ -2392,9 +2610,20 @@ export function PlayerOverlay() {
                   step={0.05}
                   value={muted ? 0 : volume}
                   onChange={(e) => {
-                    const v = videoRef.current;
                     const nv = parseFloat(e.target.value);
                     setVolume(nv);
+                    if (turboRef.current) {
+                      turboRef.current.setVolume(nv);
+                      if (nv > 0) {
+                        turboRef.current.setMuted(false);
+                        setMuted(false);
+                      } else {
+                        turboRef.current.setMuted(true);
+                        setMuted(true);
+                      }
+                      return;
+                    }
+                    const v = videoRef.current;
                     if (v) {
                       v.volume = nv;
                       if (nv > 0 && v.muted) {
