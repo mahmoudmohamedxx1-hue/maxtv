@@ -14,7 +14,7 @@ import { normalizeCategory } from './categories';
 import { isObfuscatedName, repairChannelName } from './repair';
 import { getChannelLogo, warmLogoCache } from '@/lib/media/logos';
 import { probeSource, type SourceHealth } from './health';
-import { getLadderPool, providerLabelFromUrl } from './ladderpool';
+import { getLadderPool, providerLabelFromUrl, seedLadderPool, type LadderPoolEntry } from './ladderpool';
 import { ON_WORKERS } from '@/lib/streaming/runtime';
 
 export interface Catalog {
@@ -63,6 +63,9 @@ interface CompactSnapshot {
   sportsIds: string[];
   categories: CatalogCategory[];
   sources: ChannelSourceInfo[];
+  /** v2: the curated ladder-alternates pool — data/iptv cannot be read on
+   *  workerd, so the snapshot is the pool's only delivery vehicle there */
+  ladderPool?: LadderPoolEntry[];
 }
 
 /** Workers: catalog from the build-time snapshot asset. The thin worker
@@ -80,6 +83,9 @@ async function buildFromSnapshot(): Promise<Catalog> {
       const res = await fetchAsset('/__snapshots/iptv-compact.json');
       if (res.ok) {
         const snap = (await res.json()) as CompactSnapshot;
+        // pool first — findAlternates() awaits getCatalog() before reading
+        // it, so seeding here guarantees the pool is warm for every caller
+        seedLadderPool(snap.ladderPool);
         const sportsSet = new Set(snap.sportsIds);
         const channels = snap.channels;
         return {
@@ -405,6 +411,84 @@ function channelNumbers(n: string): string[] {
   return normalizeChannelName(n).match(/\d+/g) || [];
 }
 
+// ─── exported match core (single source of truth) ───────────────────────────
+// The tier ladder below used to live inline in findAlternates()'s consider().
+// It is exported so scripts/build-ladder-alts.ts can run the EXACT runtime
+// matching semantics against external candidate indexes (iptv-org) — the
+// pool builder and the runtime must never drift apart.
+
+/** precomputed match identity of a channel name */
+export interface ChannelMatchProfile {
+  /** raw display name */
+  name: string;
+  /** normalizeChannelName */
+  norm: string;
+  /** coreChannelName (leading channel numbers stripped) */
+  core: string;
+  /** regionalCoreName (region qualifiers stripped) */
+  regional: string;
+  /** standalone channel numbers */
+  nums: string[];
+  /** region class ('' unqualified, 'mena-ar', 'us', …) */
+  region: string;
+}
+
+export function prepareChannelMatch(name: string): ChannelMatchProfile {
+  return {
+    name,
+    norm: normalizeChannelName(name),
+    core: coreChannelName(name),
+    regional: regionalCoreName(name),
+    nums: channelNumbers(name),
+    region: regionClass(name),
+  };
+}
+
+export interface ChannelMatchResult {
+  tier: 1 | 2 | 3 | 4;
+  sameChannel: boolean;
+}
+
+/** decide the match tier + sameChannel verdict between a wanted channel and
+ *  a candidate. Tier ladder (mirrors the docs on findAlternates):
+ *    t1 exact normalized · t2 number-stripped core · t3 region-stripped
+ *    (number-guarded) · t4 brand-family prefix. sameChannel additionally
+ *    requires region-class equality at every tier and, at t3, a non-bein
+ *    source (the curated free-tier beIN feeds are different channels). */
+export function matchChannelProfiles(
+  want: ChannelMatchProfile,
+  cand: ChannelMatchProfile,
+  candSource = ''
+): ChannelMatchResult | null {
+  let tier: 1 | 2 | 3 | 4 | null = null;
+  if (cand.norm === want.norm) tier = 1;
+  else if (want.core.length >= 5 && cand.core === want.core) tier = 2;
+  else if (want.regional.length >= 6 && cand.regional === want.regional && cand.norm !== want.norm) tier = 3;
+  else if (
+    want.regional.length >= 8 &&
+    cand.regional.length >= 8 &&
+    cand.regional !== want.regional &&
+    (cand.regional.startsWith(want.regional) || want.regional.startsWith(cand.regional))
+  ) tier = 4;
+  if (!tier) return null;
+
+  let sameChannel = tier <= 2;
+  if (tier === 3) {
+    sameChannel = cand.nums.join(',') === want.nums.join(',') && candSource !== 'bein';
+  }
+  if (sameChannel && cand.region !== want.region) sameChannel = false;
+  return { tier, sameChannel };
+}
+
+/** convenience wrapper — raw names in, verdict out */
+export function matchChannelNames(
+  wantName: string,
+  candName: string,
+  candSource = ''
+): ChannelMatchResult | null {
+  return matchChannelProfiles(prepareChannelMatch(wantName), prepareChannelMatch(candName), candSource);
+}
+
 /**
  * Find the same channel served by other sources — the IPTV counterpart of the
  * original repo's per-stream server switching. Same channel on a different
@@ -428,15 +512,13 @@ export async function findAlternates(
 ): Promise<AlternateChannel[]> {
   if (!name) return [];
   const cat = await getCatalog();
-  const want = normalizeChannelName(name);
-  const core = coreChannelName(name);
+  const wantP = prepareChannelMatch(name);
+  const want = wantP.norm;
   if (!want) return [];
 
   const out: AlternateChannel[] = [];
   const seenUrls = new Set<string>([excludeUrl]);
   const seenKeys = new Set<string>();
-  const regional = regionalCoreName(name);
-  const nums = channelNumbers(name);
   // catalog channels carry only a source id — resolve the display name
   const srcLabel = (id: string) => cat.sources.find((s) => s.id === id)?.name || id;
 
@@ -445,46 +527,19 @@ export async function findAlternates(
     opts?: { ladder?: number[]; pool?: boolean }
   ): 'same' | 'family' | null => {
     if (seenUrls.has(ch.url)) return null;
-    const n = normalizeChannelName(ch.name);
-    const rc = regionalCoreName(ch.name);
-    let tier: 1 | 2 | 3 | 4 | null = null;
-    if (n === want) tier = 1;
-    else if (core.length >= 5 && coreChannelName(ch.name) === core) tier = 2;
-    else if (regional.length >= 6 && rc === regional && n !== want) tier = 3;
-    else if (
-      regional.length >= 8 &&
-      rc.length >= 8 &&
-      rc !== regional &&
-      (rc.startsWith(regional) || regional.startsWith(rc))
-    ) tier = 4;
-    if (!tier) return null;
-
-    // same-channel rules for quality rungs: exact/core always qualify; the
-    // regional tier additionally needs matching channel numbers AND must not
-    // cross into the curated free-tier beIN feeds (beIN 1 ≠ "beIN Sports"
-    // cloud/XTRA — different channel, per the 2026-10-02 field report)
-    let sameChannel = tier <= 2;
-    if (tier === 3) {
-      sameChannel =
-        channelNumbers(ch.name).join(',') === nums.join(',') &&
-        ch.source !== 'bein';
-    }
-    // region guard at EVERY tier — a localized twin (Arabic ↔ unqualified/
-    // Singapore ↔ Turkey ↔ France …) is a DIFFERENT channel. Auto-failover
-    // and quality rungs must never silently swap languages (2026-10-03:
-    // "bein 5 arabic is not arabic" — dead premium95 hopped onto the
-    // unqualified English "Bein Sports 5"). Regional twins stay in the
-    // servers menu as manual picks, never automatic ones.
-    if (sameChannel && regionClass(ch.name) !== regionClass(name)) sameChannel = false;
+    const cand = prepareChannelMatch(ch.name);
+    const verdict = matchChannelProfiles(wantP, cand, ch.source);
+    if (!verdict) return null;
+    const { tier, sameChannel } = verdict;
 
     seenUrls.add(ch.url);
     // one menu entry per (source, matched-name) pair — skips "108 X" + "129 X"
     // clones AND regional twins from the same source
-    const key = `${ch.source}|${tier === 1 ? n : tier === 2 ? coreChannelName(ch.name) : rc}`;
+    const key = `${ch.source}|${tier === 1 ? cand.norm : tier === 2 ? cand.core : cand.regional}`;
     if (seenKeys.has(key)) return null;
     seenKeys.add(key);
     out.push({
-      id: ch.id || `alt:${ch.source}:${n}`,
+      id: ch.id || `alt:${ch.source}:${cand.norm}`,
       name: ch.name,
       source: ch.source,
       sourceName: ch.sourceName || srcLabel(ch.source),

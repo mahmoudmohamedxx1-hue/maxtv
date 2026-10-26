@@ -20,6 +20,7 @@ import { parseM3U, entryToChannel } from '../src/lib/iptv/m3u';
 import { normalizeCategory } from '../src/lib/iptv/categories';
 import { isObfuscatedName, repairChannelName } from '../src/lib/iptv/repair';
 import { getChannelLogo } from '../src/lib/media/logos';
+import { getLadderPool } from '../src/lib/iptv/ladderpool';
 import type { IPTVChannel, CatalogCategory, ChannelSourceInfo } from '../src/lib/types';
 
 // NOTE: this file is esbuild-bundled to /tmp and executed from the repo
@@ -122,12 +123,17 @@ for (const id of CATEGORY_ORDER) {
 }
 
 const snapshot = {
-  version: 1,
+  version: 2,
   builtAt: Date.now(),
   channels,
   sportsIds: [...sportsIds],
   categories,
   sources: sourcesFor(channels),
+  // v2: the ladder-alternates pool rides the snapshot so the Workers data
+  // plane can serve it (workerd has no disk — catalog.buildFromSnapshot
+  // seeds ladderpool via seedLadderPool). Vercel keeps reading the m3u off
+  // disk; both parse with the SAME parseLadderPoolText, so they never drift.
+  ladderPool: getLadderPool(),
 };
 
 const outDir = join(ROOT, 'public', '__snapshots');

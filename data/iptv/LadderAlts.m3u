@@ -1,25 +1,64 @@
 #EXTM3U
 # Curated same-channel ABR-ladder alternates for DaddyLive 24/7 channels.
-# Every entry VERIFIED to ship a multi-variant master playlist (real
-# quality rungs 240p-1080p). Regenerate with scripts/build-ladder-alts.py
-# (scans the iptv-org index + alive FAST playlists, probes every manifest).
-# Consumed by findAlternates() as an invisible pool — never a UI rail.
-#EXTINF:-1 tvg-logo="https://i.imgur.com/jOKA735.png" group-title="Ladder Alternates" x-ladder="240/360/480/720/1080",Court TV (1080p)
-https://cdn-uw2-prod.tsv2.amagi.tv/linear/amg01438-ewscrippscompan-courttv-tablo/playlist.m3u8
+# Every entry VERIFIED at build time to ship a multi-variant master
+# playlist (real quality rungs, heights in x-ladder, ascending).
+# Entry names are the DL 24/7 channel names VERBATIM so the runtime
+# matcher (findAlternates) tier-1-matches them with region + channel-
+# number guards intact. Consumed as an invisible pool — never a UI rail.
+# Regenerate: node scripts/run-ladder-alts.mjs (see build-ladder-alts.ts).
+# Generated 2026-10-26T11:46:55.975Z — 22 DL channels + 8 legacy, 30 entries total.
+#EXTINF:-1 group-title="Ladder Alternates" x-ladder="240/360/480/720/1080",ABC USA
+https://amg01942-amg01942c6-stirr-us-10178.playouts.now.amagi.tv/playlist.m3u8
+#EXTINF:-1 group-title="Ladder Alternates" x-ladder="216/360/576/720",CBS USA
+https://aegis-cloudfront-1.tubi.video/8d1f164d-34ef-4f70-b948-ae33826a0aaa/playlist.m3u8
+#EXTINF:-1 tvg-logo="https://tvpnlogopeu.samsungcloud.tv/platform/image/sourcelogo/vc/00/02/34/ATBD800001VA_20260609T041657SQUARE.png" group-title="Ladder Alternates" x-ladder="360/540/720/1080",CNN USA
+https://jmp2.uk/stvp-ATBD800001VA
+#EXTINF:-1 group-title="Ladder Alternates" x-ladder="360/480/720/1080",Comet USA
+https://fast-channels.sinclairstoryline.com/COMET/index.m3u8
+#EXTINF:-1 tvg-logo="https://image.xumo.com/v1/channels/channel/99951559/168x168.png?type=color_onBlack" group-title="Ladder Alternates" x-ladder="216/360/540/720/1080",Court TV USA
+https://dbrb49pjoymg4.cloudfront.net/10001/99951559/hls/playlist.m3u8?ads.xumo_channelId=99951559&ads.xumo_streamId=99951559&ads.channelId=99951559&ads.channelName=LawCrimeCourtTV_us&ads.xumo_channelName=LawCrimeCourtTV&ads.caid=LawCrimeCourtTV&ads.csid=xumo_web_LawCrimeCourtTV_ssai&ads.genre=Documentary,Crime,DO,Entertainment,GV,SM,News,Reality-TV,N,DN,OP,IAB11,IAB12,IAB14&ads._fw_content_genre=Documentary,Crime,DO,Entertainment,GV,SM,News,Reality-TV,N,DN,OP,IAB11,IAB12,IAB14&ads._fw_coppa=0&ads.xumo_contentId=4458&ads.xumo_contentName=LawCrimeCourtTV&ads.xumo_providerId=4458&ads.xumo_providerName=LawCrimeCourtTV&ads._fw_ifa_type=&ads._fw_did=5f9beef8-f6a4-4f12-8d3b-355a6f349db1&ads.amznappId=&ads.lat=&ads.lon=&ads.os=&ads.osv=&ads._fw_is_lat=0&ads._fw_us_privacy=&ads._fw_content_category=&ads._fw_content_language=en&ads._fw_content_rating=&ads._fw_deviceMake=GitHubAction&ads._fw_device_model=PythonScript&ads.xumo_platform=web&ads.site_id=&ads.appVersion=1.0.0&ads._fw_app_bundle=web.xumo.com&ads._fw_app_store_url=&ads.appName=XumoPlay
 #EXTINF:-1 tvg-logo="https://i.imgur.com/5IxIFJ0.png" group-title="Ladder Alternates" x-ladder="360/550/720/1080",Discovery Channel
 https://streaming.aurora.enhanced.live/live/mpc/enl0eG1mLmVncmVzcy5mZDJ2eHI=/out/v1/IT_SIMULCAST/DISCOVERYCHANNEL/CMAF/index.m3u8
-#EXTINF:-1 tvg-logo="https://upload.wikimedia.org/wikipedia/commons/thumb/7/7a/Fashion_TV_logo.svg/960px-Fashion_TV_logo.svg.png" group-title="Ladder Alternates" x-ladder="270/360/576/720/1080",FashionTV (Russia) (1080p)
+#EXTINF:-1 tvg-logo="https://upload.wikimedia.org/wikipedia/commons/thumb/7/7a/Fashion_TV_logo.svg/960px-Fashion_TV_logo.svg.png" group-title="Ladder Alternates" x-ladder="270/360/576/720/1080",Fashion TV
 http://fashionlive.mediacdn.ru/cdn/fashiontv/playlist.m3u8
 #EXTINF:-1 tvg-logo="https://provider-static.plex.tv/f/epg/channels/logos/gracenote/f6e88714b4dae6026720d36ad9de611f.png" group-title="Ladder Alternates" x-ladder="216/360/480/720/1080",Fight Network
 https://jmp2.uk/plex-6a1610bebdf296985fd95603-606605549dbfca002d2ae877.m3u8
+#EXTINF:-1 group-title="Ladder Alternates" x-ladder="240/360/480/576/720",FOX Deportes USA
+https://live-manifest.production-public.tubi.io/live/d906efca-1302-4e29-b0d9-9a1d7a305d69/playlist.m3u8
+#EXTINF:-1 group-title="Ladder Alternates" x-ladder="216/288/404/720/1080",FOX USA
+https://cdn-uw2-prod.tsv2.amagi.tv/linear/amg00488-foxdigital-fox4dallaskdfw-vizious/playlist.m3u8
+#EXTINF:-1 group-title="Ladder Alternates" x-ladder="360/540/720/1080",History USA
+https://d1ocru52bkg5e9.cloudfront.net/VICE.m3u8
+#EXTINF:-1 tvg-logo="https://image.xumo.com/v1/channels/channel/99951158/168x168.png?type=color_onBlack" group-title="Ladder Alternates" x-ladder="216/360/540/720/1080",ION USA
+https://dbrb49pjoymg4.cloudfront.net/10001/99951158/hls/playlist.m3u8?includeAssetTags=true&ads.xumo_channelId=99951158&ads.xumo_streamId=99951158&ads.channelId=99951158&ads.channelName=ScrippsION&ads.caid=ScrippsION&ads.csid=xumo_web_ScrippsION_ssai&ads.genre=Action,Drama,GD,GV,Entertainment&ads._fw_content_genre=Action,Drama,GD,GV,Entertainment&ads._fw_coppa=0&ads.xumo_contentId=3766&ads.xumo_contentName=ScrippsION&ads.xumo_providerId=3766&ads.xumo_providerName=ScrippsION&ads.asnw=&ads.xumo_channelName=ScrippsION&ads._fw_h_x_country=US&ads._fw_ifa_type=&ads._fw_did=51926228-deb8-4493-8471-3d84fe9fdf3b&ads.amznappId=&ads.lat=&ads.lon=&ads.os=&ads.osv=&ads._fw_is_lat=0&ads._fw_us_privacy=&ads._fw_content_category=&ads._fw_content_language=en&ads._fw_content_rating=&ads._fw_deviceMake=GitHubAction&ads._fw_device_model=PythonScript&ads.xumo_platform=web&ads.site_id=&ads.appVersion=1.0.0&ads._fw_app_bundle=web.xumo.com&ads._fw_app_store_url=&ads.appName=xumo
+#EXTINF:-1 group-title="Ladder Alternates" x-ladder="180/270/360/460/540/720",Las Estrellas
+https://channel01-onlymex.akamaized.net/hls/live/2022749/event01/index.m3u8
+#EXTINF:-1 group-title="Ladder Alternates" x-ladder="240/360/432/720/1080",NBC USA
+https://d368vp0qqzvkid.cloudfront.net/11603/88889711/hls/master.m3u8?ads.xumo_channelId=88889711a&ads.xumo_ifaType=&ads.xumo_providerId=3822&ads.xumo_providerName=NBCNBA
+#EXTINF:-1 tvg-logo="https://provider-static.plex.tv/epg/cms/production/90b1708c-fab8-4016-874a-33afa40fd951/NSMX_dark_base.png" group-title="Ladder Alternates" x-ladder="360/480/720/1080",Newsmax USA
+https://jmp2.uk/plex-697140a85d851f5e69414688-6abd4743e1b65dffbc995e44.m3u8
+#EXTINF:-1 tvg-logo="https://tvpnlogopus.samsungcloud.tv/platform/image/sourcelogo/vc/00/02/34/IN46000210J_20260812T011001SQUARE.png" group-title="Ladder Alternates" x-ladder="360/504/720/1080",NewsNation USA
+https://jmp2.uk/stvp-IN46000210J
+#EXTINF:-1 group-title="Ladder Alternates" x-ladder="240/360/480/720/1080",NHL Network USA
+https://nhl-firetv.amagi.tv/playlist.m3u8
+#EXTINF:-1 group-title="Ladder Alternates" x-ladder="240/360/480/720/1080",Outdoor Channel USA
+https://cdn-apse1-prod.tsv2.amagi.tv/linear/amg00718-outdoorchannela-outdoortvnz-samsungnz/playlist.m3u8
+#EXTINF:-1 tvg-logo="https://i.postimg.cc/WtLq2C7c/logo-Rally-Tv1.png" group-title="Ladder Alternates" x-ladder="180/240/360/540/720/1080",Rally Tv
+https://rally-tv-live.akamaized.net/hls/live/2117704/RallyTV-Pri/master.m3u8
+#EXTINF:-1 group-title="Ladder Alternates" x-ladder="240/360/540/720/1080",Telemundo
+https://nbculocallive.akamaized.net/hls/live/2037098/sandiego/stream1/master.m3u8
+#EXTINF:-1 tvg-logo="https://i.imgur.com/tsljAnY.png" group-title="Ladder Alternates" x-ladder="360/540/720/1080",Tennis Channel
+https://cdn-ue1-prod.tsv2.amagi.tv/linear/amg01444-tennischannelth-tennischannelnl-samsungnl/playlist.m3u8
+#EXTINF:-1 group-title="Ladder Alternates" x-ladder="240/360/480/720/1080",VICE TV
+https://vicetv-vicefast1-firetv.amagi.tv/playlist.m3u8
+#EXTINF:-1 tvg-logo="https://i.imgur.com/jOKA735.png" group-title="Ladder Alternates" x-ladder="240/360/480/720/1080",Court TV (1080p)
+https://cdn-uw2-prod.tsv2.amagi.tv/linear/amg01438-ewscrippscompan-courttv-tablo/playlist.m3u8
 #EXTINF:-1 tvg-logo="https://upload.wikimedia.org/wikipedia/commons/thumb/0/01/History_%282021%29.svg/500px-History_%282021%29.svg.png" group-title="Ladder Alternates" x-ladder="480/720/1080",History Asia (720p)
 https://freem3u.xyz/api/live/play.m3u8?vid=9856
 #EXTINF:-1 tvg-logo="https://tvpnlogopeu.samsungcloud.tv/platform/image/sourcelogo/vc/00/02/34/FR200016Y5_20250422T103213SQUARE.png" group-title="Ladder Alternates" x-ladder="360/540/720/1080",L'Equipe
 https://jmp2.uk/stvp-FR200016Y5
 #EXTINF:-1 tvg-logo="https://i.imgur.com/UNZ8bef.png" group-title="Ladder Alternates" x-ladder="240/360/480/720/1080",NHL Network (1080p)
 https://nhl-firetv.amagi.tv/playlist.m3u8
-#EXTINF:-1 tvg-logo="https://upload.wikimedia.org/wikipedia/commons/thumb/f/fc/Natgeologo.svg/960px-Natgeologo.svg.png" group-title="Ladder Alternates" x-ladder="360/576/720/1080",National Geographic (Croatia) (1080p)
-http://176.61.157.250/NationalGeographic/index.m3u8
 #EXTINF:-1 tvg-logo="https://dtil.tmsimg.com/assets/s143596_ld_h15_aa.png?lock=720x540" group-title="Ladder Alternates" x-ladder="216/360/504/720/1080",News Nation (1080p)
 https://d3qs3d2rkhfqrt.cloudfront.net/out/v1/6cd2f649739a45ca9de1daf81cc7d0f2/index.m3u8
 #EXTINF:-1 tvg-logo="https://i.ibb.co/jZ2NVqN/outdoorch.png" group-title="Ladder Alternates" x-ladder="240/360/480/720/1080",OUTDOOR CHANNEL 🇺🇸
@@ -28,5 +67,3 @@ https://cdn-apse1-prod.tsv2.amagi.tv/linear/amg00718-outdoorchannela-outdoortvnz
 https://rmtv.akamaized.net/hls/live/2043153/rmtv-es-web/master.m3u8
 #EXTINF:-1 tvg-logo="https://i.ibb.co/0jxLdjnY/TDP.png" group-title="Ladder Alternates" x-ladder="360/576/720",Teledeporte
 https://rtvelivestream.rtve.es/rtvesec/tdp/tdp_main.m3u8
-#EXTINF:-1 tvg-logo="https://i.imgur.com/tsljAnY.png" group-title="Ladder Alternates" x-ladder="360/540/720/1080",Tennis Channel (1080p)
-https://cdn-ue1-prod.tsv2.amagi.tv/linear/amg01444-tennischannelth-tennischannelnl-samsungnl/playlist.m3u8

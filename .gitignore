@@ -47,6 +47,10 @@ yarn-error.log*
 !/scripts/fetch-ffmpeg.sh
 !/scripts/build-worker.mjs
 !/scripts/gen-compact-catalog.ts
+!/scripts/build-ladder-alts.ts
+!/scripts/run-ladder-alts.mjs
+!/scripts/verify-ladder-pool.ts
+!/scripts/verify-ladder-pool.mjs
 /download/
 /upload/
 /mini-services/
