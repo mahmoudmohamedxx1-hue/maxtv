@@ -57,6 +57,7 @@ import {
 import { createNetWatcher } from './player/createNetWatcher';
 import { UncloakDirectLoader, directPathHealthy } from './player/uncloak-loader';
 import { attachSegPrefetch } from './player/seg-prefetch';
+import { anySlowHost, hostHealthSnapshot } from './player/host-health';
 import { QualityMenu } from './player/QualityMenu';
 import {
   probeLocalTurbo,
@@ -798,6 +799,14 @@ export function PlayerOverlay() {
           // + Source): decouple fetch time from play time so cold-isolate
           // 404s and slow fallbacks never sit on the playhead's critical path
           attachSegPrefetch(hls);
+          // 2026-10-26 stability engine observability — host-health snapshot
+          // for the stats overlay + E2E (per-CDN-shard fetch EWMA)
+          if (typeof window !== 'undefined') {
+            (window as unknown as { __maxtvStability?: unknown }).__maxtvStability = {
+              hosts: hostHealthSnapshot,
+              anySlowHost,
+            };
+          }
           hls.on(Hls.Events.LEVEL_SWITCHED, (_e, d) => {
             // ┚ rung-adaptive ride distance (ladder masters): turbo rungs are
             // encode-bound at the live edge (4-7s per 5s segment on a 1-vCPU
@@ -814,9 +823,17 @@ export function PlayerOverlay() {
               // parallelism holds the throughput, and the deeper ride gives
               // that margin room to breathe instead of hugging the edge.
               const dead = !directPathHealthy();
+              // ⤴ 2026-10-26 beIN lag fix: a MEASURED-SLOW CDN shard (per-
+              // connection body throttle — measured 4.6s avg / 45s max per
+              // 3.3MB segment on p19 vs 0.7s on p16, see host-health.ts)
+              // outruns neither the shallow ride nor the sequential loader.
+              // Join 5 segments back + a 60s buffer so slow fetches land in
+              // runway instead of draining the playhead; the prefetcher's
+              // slow-host priority + server-route rescue fill that runway.
+              const slow = anySlowHost();
               const cfg = hls.config as { liveSyncDurationCount?: number; maxBufferLength?: number };
-              cfg.liveSyncDurationCount = turboRung ? 5 : dead ? 5 : 3;
-              cfg.maxBufferLength = turboRung ? 45 : dead ? 45 : 30;
+              cfg.liveSyncDurationCount = turboRung ? 5 : dead || slow ? 5 : 3;
+              cfg.maxBufferLength = turboRung ? 45 : dead ? 45 : slow ? 60 : 30;
             }
             // refresh labels — some CDNs only report resolution once fragments load
             const lvl = hls.levels?.[d.level];
@@ -1608,6 +1625,19 @@ export function PlayerOverlay() {
         attachNetWatcher(hls);
         // 2026-10-22 stall fix — background segment prefetch (see load())
         attachSegPrefetch(hls);
+        // 2026-10-26 stability engine — same rung-adaptive ride distance as
+        // the primary load() path (turbo rungs / dead direct path / slow CDN
+        // shard all need the deeper posture; see host-health.ts)
+        hls.on(Hls.Events.LEVEL_SWITCHED, (_e, d) => {
+          if (!ladderMasterRef.current || !hls.levels) return;
+          const lvl = hls.levels[d.level];
+          const turboRung = !!lvl && (lvl.height || 0) > 0 && !/raw=1/.test((lvl.url || []).join(''));
+          const dead = !directPathHealthy();
+          const slow = anySlowHost();
+          const cfg = hls.config as { liveSyncDurationCount?: number; maxBufferLength?: number };
+          cfg.liveSyncDurationCount = turboRung ? 5 : dead || slow ? 5 : 3;
+          cfg.maxBufferLength = turboRung ? 45 : dead ? 45 : slow ? 60 : 30;
+        });
         hls.on(Hls.Events.MANIFEST_PARSED, () => {
           if (typeof level === 'number' && level >= 0 && hls.levels?.[level]) {
             hls.currentLevel = level;

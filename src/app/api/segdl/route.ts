@@ -13,6 +13,7 @@
 import { decodeSegmentBytes } from '@/lib/streaming/proxy';
 import { fetchTolerant } from '@/lib/streaming/tls-fetch';
 import { UA } from '@/lib/streaming/resolve';
+import { coloGetSeg, coloPutSeg } from '@/lib/streaming/colocache';
 
 export const dynamic = 'force-dynamic';
 
@@ -45,6 +46,30 @@ export async function GET(req: Request) {
   }
   const range = req.headers.get('range') || undefined;
   try {
+    // ⤴ 2026-10-26 beIN lag fix — COLO-SHARED SEGMENT CACHE (Workers Cache
+    // API, see colocache.ts): the client stability engine now ROUTES slow-
+    // shard segments through this route deliberately (host-health EWMA >
+    // 2.5s → loader race / prefetch rescue), because the Worker colo's pipe
+    // to the CDN measured 4-10x faster than a throttled shard's browser
+    // path. Without this cache every such hit re-pulled upstream; with it,
+    // the FIRST pull parks the unwrapped TS at the colo for every later
+    // viewer AND every retry — the rescue path becomes near-instant after
+    // the first touch. No-op everywhere except real workerd.
+    if (!range) {
+      const cached = await coloGetSeg(target);
+      if (cached) {
+        return new Response(cached as unknown as BodyInit, {
+          status: 200,
+          headers: {
+            'access-control-allow-origin': '*',
+            'cache-control': 'public, max-age=3600, s-maxage=3600',
+            'content-type': 'video/mp2t',
+            'accept-ranges': 'none',
+            'x-maxtv-colo': 'hit',
+          },
+        });
+      }
+    }
     const res = await fetchTolerant(target, {
       headers: {
         'User-Agent': UA,
@@ -70,6 +95,11 @@ export async function GET(req: Request) {
         headers: { 'content-type': 'text/plain', 'x-offair': '1' },
       });
     }
+    // ⤴ 2026-10-26: park the unwrapped bytes at the Workers colo (Cache API —
+    // not a subrequest, free-plan safe). Keyed by the CDN URL, identical to
+    // the turbo engine's colo segment cache. coloPutSeg is fire-and-forget
+    // (waitUntil-sponsored inside colocache).
+    if (!range && ts.length >= 188) coloPutSeg(target, ts);
     return new Response(ts as unknown as BodyInit, {
       status: 200,
       headers: {
@@ -82,6 +112,7 @@ export async function GET(req: Request) {
         'cache-control': 'public, max-age=3600, s-maxage=3600',
         'content-type': 'video/mp2t',
         'accept-ranges': 'none',
+        ...(range ? {} : { 'x-maxtv-colo': 'miss' }),
       },
     });
   } catch (e) {

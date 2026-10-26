@@ -11,6 +11,7 @@ import type Hls from 'hls.js';
 import { cn } from '@/lib/utils';
 import type { Translator } from '@/lib/locale';
 import { Icon } from './icons';
+import { hostHealthSnapshot } from './host-health';
 
 export interface StatsSnapshot {
   resolution: string;
@@ -57,6 +58,7 @@ function secs(s: number): string {
 export function StatsOverlay({ t, open, isDaddyLive, getTransportLabel, hlsRef, videoRef, onClose }: StatsOverlayProps) {
   const [snap, setSnap] = useState<StatsSnapshot | null>(null);
   const [edge, setEdge] = useState<EdgeInfo | null>(null);
+  const [hosts, setHosts] = useState<ReturnType<typeof hostHealthSnapshot>>({});
 
   // sample the player once a second while open
   useEffect(() => {
@@ -102,6 +104,8 @@ export function StatsOverlay({ t, open, isDaddyLive, getTransportLabel, hlsRef, 
         liveLatency,
         transport,
       });
+      // 2026-10-26 stability engine — per-CDN-shard fetch health (EWMA)
+      setHosts(hostHealthSnapshot());
     };
     tick();
     const iv = setInterval(tick, 1000);
@@ -174,6 +178,22 @@ export function StatsOverlay({ t, open, isDaddyLive, getTransportLabel, hlsRef, 
       ))}
       {isDaddyLive && (
         <div className="mt-2 border-t border-zilla-line/70 pt-1.5">
+          {Object.keys(hosts).length > 0 && (
+            <div className="mb-1.5">
+              <span className="text-zilla-dim">{t('stats.shardHealth')}</span>
+              {Object.entries(hosts).map(([h, s]) => (
+                <div key={h} className="flex items-baseline justify-between gap-3">
+                  <span className="shrink-0 truncate text-zilla-dim">
+                    {h.replace('-common-sign.tiktokcdn-us.com', '')}
+                  </span>
+                  <span className={cn('text-end font-bold', s.slow ? 'text-zilla-yellow' : '')}>
+                    {(s.ewmaMs / 1000).toFixed(1)}s ×{s.samples}
+                    {s.slow ? ' ⚠' : ''}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
           <div className="flex items-baseline justify-between gap-3">
             <span className="shrink-0 text-zilla-dim">{t('stats.edgeHost')}</span>
             <span className="truncate text-end font-bold">{edge?.host || t('stats.unknown')}</span>

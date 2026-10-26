@@ -33,6 +33,7 @@
 import Hls from 'hls.js';
 import { unwrapSegmentBrowser } from '@/lib/player/uncloak-browser';
 import { SEGDL_MARK, isDirectHost, segdlTarget } from './cdn-direct';
+import { anySlowHost, isSlowHost, recordHostFetch, tryAcquireRaceSlot } from './host-health';
 
 const TURBO_SEG_MARK = '/api/turbo?';
 
@@ -42,13 +43,29 @@ const TTL_MS = 90_000;
 /** total bytes the cache may hold (segments: 144p ≈ 0.4MB … Source ≈ 2.7MB) */
 const BYTES_BUDGET = 26 * 1024 * 1024;
 /** concurrent background fetches — enough to parallelize the fallback path,
- *  small enough to never compete with hls.js's own loader for sockets */
+ *  small enough to never compete with hls.js's own loader for sockets.
+ *  ⤴ 2026-10-26: +1 when a measured-slow CDN shard is known — an all-slow
+ *  window (beIN on a throttled pNN shard) otherwise queues its third segment
+ *  behind two 4.6s fetches, eating the very lead time the prefetch exists to
+ *  provide. */
 const MAX_CONCURRENT = 3;
+const MAX_CONCURRENT_SLOW = 4;
 /** attempts per URL (spread across playlist refreshes ≈ every 5s) */
 const MAX_ATTEMPTS = 5;
 /** how far ahead of the just-appended fragment to prefetch (skipping the
  *  one hls.js is already loading itself) */
 const AHEAD = 3;
+/** SLOW-SHARD RESCUE: when a slow-host segment's direct prefetch has run
+ *  this long without landing, fire the /api/segdl server route in parallel —
+ *  the Worker colo's pipe to the CDN measured 4-10x faster than a throttled
+ *  shard's browser path (2026-10-26 beIN fix; see host-health.ts). Whatever
+ *  lands first wins; the loser is left to complete harmlessly (its bytes are
+ *  dropped). Draws from the SEPARATE rescue budget pool — a declined rescue
+ *  costs only lead time, never the critical path (the loader's race has its
+ *  own pool and priority). 3s: early enough to beat the throttled leg even
+ *  on marginally-slow shards, late enough that a healthy direct fetch
+ *  (0.6-1.3s) never pays for a server round-trip. */
+const RESCUE_AFTER_MS = 3_000;
 
 /** is this a URL the prefetcher handles? (both ladder segment shapes) */
 function isPrefetchableUrl(url: string): boolean {
@@ -138,19 +155,81 @@ async function fetchTurboSegment(url: string): Promise<Uint8Array | null> {
   return buf;
 }
 
+/** CDN-direct fetch + in-browser unwrap with host-health recording.
+ *  Never throws — returns null so callers can fall through to the route.
+ *  ⚠ host-health records DELIVERY only: a 200 that fails to unwrap is an
+ *  off-air placeholder (content condition), not a host failure. */
+async function directFetch(target: string): Promise<Uint8Array | null> {
+  const t0 = Date.now();
+  try {
+    const res = await fetch(target, { cache: 'no-store', ...timeoutSignal() });
+    if (!res.ok) {
+      recordHostFetch(target, Date.now() - t0, false);
+      return null;
+    }
+    const raw = new Uint8Array(await res.arrayBuffer());
+    // delivered — the unwrap outcome below is content, not transport
+    recordHostFetch(target, Date.now() - t0, true);
+    return await unwrapRaw(raw);
+  } catch {
+    recordHostFetch(target, Date.now() - t0, false);
+    return null;
+  }
+}
+
 /** segdl segment: CDN-direct + in-browser unwrap first (zero server hops,
- *  the fastest path there is), same-origin route as the fallback */
+ *  the fastest path there is), same-origin route as the fallback.
+ *  ⤴ 2026-10-26: SLOW-HOST RESCUE — on a measured-slow shard (host-health
+ *  EWMA > 2.5s; measured on beIN: 4.6s avg / 45s max per 3.3MB segment vs
+ *  0.7s on healthy shards) a direct-only prefetch burns its whole lead time
+ *  and can land after the playhead already waited. A timer fires the server
+ *  route in parallel after RESCUE_AFTER_MS; first valid segment wins. */
 async function fetchSegdlSegment(url: string): Promise<Uint8Array | null> {
   const target = segdlTarget(url);
-  if (target && isDirectHost(target) && typeof DecompressionStream !== 'undefined') {
-    try {
-      const res = await fetch(target, { cache: 'no-store', ...timeoutSignal() });
-      if (res.ok) {
-        const ts = await unwrapRaw(new Uint8Array(await res.arrayBuffer()));
-        if (ts) return ts;
+  const canDirect = target && isDirectHost(target) && typeof DecompressionStream !== 'undefined';
+  if (canDirect) {
+    const needsRescue = isSlowHost(target);
+    // ONE direct fetch, referenced everywhere (never re-fired on fallback)
+    const directPromise = directFetch(target);
+    if (!needsRescue) {
+      const ts = await directPromise;
+      if (ts) return ts;
+    } else {
+      // slow shard: race the direct fetch against a DELAYED server-route
+      // rescue (the delay gives the direct path a fair head start; the budget
+      // keeps the Workers invocation meter safe even when everything is slow)
+      let settled = false; // a valid segment was delivered to the caller
+      let directSettled = false; // the direct leg finished (win OR lose)
+      const tracked = directPromise.then((ts) => {
+        directSettled = true;
+        return ts;
+      });
+      const rescue = async (): Promise<Uint8Array | null> => {
+        await new Promise((r) => setTimeout(r, RESCUE_AFTER_MS));
+        // already delivered, or the direct leg settled — spend nothing
+        if (settled || directSettled) return null;
+        if (!tryAcquireRaceSlot('rescue')) return null;
+        try {
+          const res = await fetch(url, timeoutSignal());
+          if (!res.ok) return null;
+          const buf = new Uint8Array(await res.arrayBuffer());
+          return buf.length >= 188 && buf[0] === 0x47 ? buf : null;
+        } catch {
+          return null;
+        }
+      };
+      const winner = await Promise.race([tracked, rescue()]);
+      if (winner && winner.length >= 188) {
+        settled = true;
+        return winner;
       }
-    } catch {
-      /* fall through to the server route */
+      // rescue declined (budget) or lost — the SAME direct fetch may still
+      // land; wait it out before falling through to the plain server route
+      const ts = await tracked;
+      if (ts) {
+        settled = true;
+        return ts;
+      }
     }
   }
   // default cache mode (see fetchTurboSegment — same reasoning; the segdl
@@ -199,7 +278,8 @@ function prefetch(url: string): void {
   if (cache.has(cacheKey(url)) || inflight.has(url)) return;
   const f = failures.get(url);
   if (f && (f.n >= MAX_ATTEMPTS || Date.now() < f.nextAt)) return;
-  if (active >= MAX_CONCURRENT) return; // next trigger (poll/frag) retries
+  const cap = anySlowHost() ? MAX_CONCURRENT_SLOW : MAX_CONCURRENT;
+  if (active >= cap) return; // next trigger (poll/frag) retries
   active++;
   const isSegdl = url.indexOf(SEGDL_MARK) !== -1;
   const p = (isSegdl ? fetchSegdlSegment(url) : fetchTurboSegment(url))
@@ -276,7 +356,22 @@ function cacheKey(url: string): string {
 }
 
 function prefetchUrls(urls: string[]): void {
-  for (const u of urls) {
+  // ⤴ 2026-10-26 slow-shard priority: with a measured-slow host in the mix,
+  // its segments get the concurrency slots FIRST — they are the ones that
+  // need every millisecond of lead time (measured: a throttled shard takes
+  // 4.6s avg per segment, healthy shards 0.7s — ordering alone recovers most
+  // of the stall budget at zero extra cost).
+  let ordered = urls;
+  if (urls.length > 1 && anySlowHost()) {
+    const slow: string[] = [];
+    const fast: string[] = [];
+    for (const u of urls) {
+      const t = segdlTarget(u);
+      (t && isSlowHost(t) ? slow : fast).push(u);
+    }
+    ordered = slow.concat(fast);
+  }
+  for (const u of ordered) {
     if (isPrefetchableUrl(u)) prefetch(u);
   }
 }

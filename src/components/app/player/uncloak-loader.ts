@@ -31,6 +31,7 @@ import Hls from 'hls.js';
 import { unwrapSegmentBrowser } from '@/lib/player/uncloak-browser';
 import { SEGDL_MARK, isDirectHost, segdlTarget } from './cdn-direct';
 import { takeCachedSegment, joinPrefetch } from './seg-prefetch';
+import { isSlowHost, recordHostFetch, tryAcquireRaceSlot } from './host-health';
 
 /* ── direct-path circuit breaker ──────────────────────────────────────────────
  * When the direct path genuinely can't deliver (CDN drops CORS, a restrictive
@@ -108,7 +109,15 @@ export class UncloakDirectLoader extends (Hls.DefaultConfig.loader as any) {
       }
     }
     const isSegdl = url.includes(SEGDL_MARK);
-    if (isFragmentLoad && !(isSegdl && directPathOpen())) {
+    // ⤴ 2026-10-26: a slow-host segment must NOT sit through a bounded
+    // prefetch-join first — the in-flight prefetch is riding the same
+    // throttled shard (≥10s in the A/B soak), the join would time out at 6s,
+    // and the fallback would start a SECOND full-throttle fetch: 16s on the
+    // critical path instead of a ~3s raced server leg. Slow hosts skip the
+    // join entirely and go straight to the race below.
+    const segTarget = isSegdl ? segdlTarget(url) : null;
+    const slowSeg = !!(segTarget && directPathOpen() && isSlowHost(segTarget));
+    if (isFragmentLoad && !slowSeg && !(isSegdl && directPathOpen())) {
       // no cached bytes yet — JOIN an in-flight prefetch for this URL
       // (bounded) instead of racing it with a duplicate request. hls.js's
       // own sequential loads and the prefetcher's ahead-window then share
@@ -122,6 +131,19 @@ export class UncloakDirectLoader extends (Hls.DefaultConfig.loader as any) {
     if (isFragmentLoad && isSegdl && directPathOpen()) {
       const target = segdlTarget(url);
       if (target && isDirectHost(target) && typeof DecompressionStream !== 'undefined') {
+        // ⤴ 2026-10-26 beIN lag fix: a segment sitting on a MEASURED-SLOW CDN
+        // shard (host-health EWMA > 2.5s — see host-health.ts) cannot land in
+        // time on the critical path. Race the browser-direct fetch against the
+        // /api/segdl server route (the Worker colo's pipe to the CDN measured
+        // 4-10x faster than the throttled browser path, and the route parks the
+        // unwrapped bytes in the colo Cache API for every later viewer).
+        // First VALIDATED segment wins; the loser is aborted. The critical
+        // pool is separate from the prefetcher's rescue pool so prefetch
+        // rescues can never starve the critical path.
+        if (isSlowHost(target) && tryAcquireRaceSlot('critical')) {
+          void this.__loadRaced(context, config, callbacks, target, url);
+          return;
+        }
         void this.__loadDirect(context, config, callbacks, target);
         return;
       }
@@ -182,6 +204,11 @@ export class UncloakDirectLoader extends (Hls.DefaultConfig.loader as any) {
     const ctrl = new AbortController();
     this.__abortCtrl = ctrl;
     let directOk = false;
+    // delivery vs decode: a 200 whose payload fails to unwrap is a CONTENT
+    // condition (off-air placeholder), not a host failure — it must not poison
+    // host-health or the breaker (measured: an ad-break phase flagged the
+    // FAST shard slow via 6 placeholder PNGs)
+    let delivered = false;
     try {
       const res = await fetch(target, {
         cache: 'no-store',
@@ -190,6 +217,7 @@ export class UncloakDirectLoader extends (Hls.DefaultConfig.loader as any) {
       });
       if (!res.ok) throw new Error(`cdn ${res.status}`);
       const raw = new Uint8Array(await res.arrayBuffer());
+      delivered = true;
       const firstByte = performance.now();
       if (raw.length < 188) throw new Error('empty segment');
       // clean TS passes through; cloaked payloads unwrap in-browser
@@ -212,17 +240,109 @@ export class UncloakDirectLoader extends (Hls.DefaultConfig.loader as any) {
       // segment response — hls.js accepts Uint8Array fragment payloads
       directOk = true;
       recordDirect(true);
+      recordHostFetch(target, end - start, true);
       callbacks.onSuccess({ url: context.url, data: ts }, stats, context, null);
     } catch {
       /* fall through to the server fallback below */
-      // aborted loads (channel/quality change) are not direct-path failures
-      if (!ctrl.signal.aborted) recordDirect(false);
+      // aborted loads (channel/quality change) are not direct-path failures;
+      // a DELIVERED but undecodable payload is a content condition, not a
+      // transport failure — neither counts against the host
+      if (!ctrl.signal.aborted && !delivered) {
+        recordDirect(false);
+        recordHostFetch(target, performance.now() - start, false);
+      }
     } finally {
       if (this.__abortCtrl === ctrl) this.__abortCtrl = null;
     }
     if (!directOk && !ctrl.signal.aborted) {
       // any failure → the server-side segdl route (fetch + unwrap + serve —
       // the exact legacy proxy behavior, on the same URL the player holds)
+      try {
+        super.load(context, config, callbacks);
+      } catch {
+        /* loader destroyed mid-switch — nothing to do */
+      }
+    }
+  }
+
+  /** SLOW-HOST RACE — direct fetch vs the /api/segdl server route, first
+   *  validated segment wins, loser aborted. The server leg rides the Worker
+   *  colo's fat pipe to the CDN (measured 4-10x faster than a throttled
+   *  shard's browser path) and its response is colo-cached (Cache API) so
+   *  every later viewer of the same segment is near-instant. Only fires for
+   *  hosts with ≥3 slow measurements, inside the per-minute race budget. */
+  private async __loadRaced(
+    context: any,
+    config: any,
+    callbacks: any,
+    target: string,
+    segdlUrl: string
+  ): Promise<void> {
+    const start = performance.now();
+    const ctrl = new AbortController();
+    this.__abortCtrl = ctrl;
+    let settled = false;
+    const finish = (ts: Uint8Array, via: 'direct' | 'server') => {
+      if (settled || ctrl.signal.aborted) return;
+      settled = true;
+      ctrl.abort(); // kill the losing fetch
+      const now = performance.now();
+      const stats = {
+        aborted: false,
+        loaded: ts.length,
+        retry: 0,
+        total: ts.length,
+        chunkCount: 1,
+        bwEstimate: 0,
+        loading: { start, first: start + (now - start) / 2, end: now },
+        parsing: { start: now, first: now, end: now },
+        buffering: { start: now, first: now, end: now },
+      };
+      if (via === 'direct') {
+        recordDirect(true);
+        recordHostFetch(target, now - start, true);
+      } else {
+        // server leg won: the direct shard was (again) too slow — count it as
+        // slow-host evidence so the flag stays warm, but NOT as a direct-path
+        // breaker failure (the direct path technically works, it's just slow)
+        recordHostFetch(target, now - start + 2_500, true);
+      }
+      callbacks.onSuccess({ url: context.url, data: ts }, stats, context, null);
+    };
+
+    // leg 1 — browser-direct (same validation as __loadDirect)
+    const directLeg = (async () => {
+      try {
+        const res = await fetch(target, { cache: 'no-store', signal: ctrl.signal, redirect: 'follow' });
+        if (!res.ok) throw new Error(`cdn ${res.status}`);
+        const raw = new Uint8Array(await res.arrayBuffer());
+        if (raw.length < 188) throw new Error('empty segment');
+        const ts =
+          raw[0] === 0x47 && raw[188] === 0x47 ? raw : ((await unwrapSegmentBrowser(raw)) as Uint8Array | null);
+        if (ts && ts.length >= 188) finish(ts, 'direct');
+      } catch {
+        /* the other leg decides */
+      }
+    })();
+
+    // leg 2 — the server route (same-origin /api/segdl URL the player holds)
+    const serverLeg = (async () => {
+      try {
+        const res = await fetch(segdlUrl, { cache: 'no-store', signal: ctrl.signal });
+        if (!res.ok) throw new Error(`segdl ${res.status}`);
+        const ts = new Uint8Array(await res.arrayBuffer());
+        if (ts.length >= 188 && ts[0] === 0x47) finish(ts, 'server');
+      } catch {
+        /* the other leg decides */
+      }
+    })();
+
+    // wait for BOTH legs (the winner's finish() aborts the loser, so the
+    // loser settles immediately; allSettled never hangs on a dead leg)
+    await Promise.allSettled([directLeg, serverLeg]);
+    // neither leg produced a valid segment in time → behave exactly like a
+    // direct failure: full server fallback through the normal loader path
+    if (!settled && !ctrl.signal.aborted) {
       try {
         super.load(context, config, callbacks);
       } catch {
