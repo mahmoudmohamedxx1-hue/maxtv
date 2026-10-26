@@ -2,7 +2,7 @@ import { NextResponse, after } from 'next/server';
 import { getSchedule } from '@/lib/sports/daddylive';
 import { sportName } from '@/lib/sports/categories';
 import { extractTeamsFromTitle, findTeamLogo, findCachedTeamLogo, getLeagueLogo, getChannelLogo, extractTennisPlayers, findPlayerLogo, extractFighters } from '@/lib/media/logos';
-import { getBigLeagueFixtures, getNFLFixtures, fixtureKey, peekFixtures, warmBigLeagues, type BigFixture } from '@/lib/sports/bigleagues';
+import { getBigLeagueFixtures, getNFLFixtures, getNBAFixtures, fixtureKey, peekFixtures, warmBigLeagues, type BigFixture } from '@/lib/sports/bigleagues';
 import type { SportsMatch } from '@/lib/types';
 import { setProxyOriginFromRequest } from '@/lib/streaming/upstream';
 
@@ -207,10 +207,19 @@ const BIG_LEAGUE_TESTS: ((league: string, title: string) => boolean)[] = [
   (l) => /copa libertadores|copa america/i.test(l),
   (l, t) => /el\s*cl[aá]sico/i.test(t),
   (l) => /\bnfl\b/i.test(l),
+  // NBA joins the headline rail (field report 2026-10-25: "i dont see any nba
+  // matches" — with tips at 01:00-04:30 Cairo, NBA was invisible in every
+  // prominent surface: big-matches rail excluded basketball by category,
+  // all other match sections are live-only, and the only pre-game surface
+  // was the bottom Upcoming scroller mixed with 57 other cards)
+  (l) => /^\s*nba\b/i.test(l),
 ];
 
 function isBigLeague(m: SportsMatch): boolean {
-  if (m.category === 'handball' || m.category === 'basketball' || m.category === 'motorsport') return false;
+  if (m.category === 'handball' || m.category === 'motorsport') return false;
+  // basketball: ONLY the NBA carries headline weight (ACB/Euroleague/college
+  // stay off the rail); every other test below is league-specific anyway
+  if (m.category === 'basketball' && !/^\s*nba\b/i.test(m.league)) return false;
   const hay = `${m.league} ${m.title}`;
   return BIG_LEAGUE_TESTS.some((t) => t(m.league, hay));
 }
@@ -253,7 +262,10 @@ function top5LeaguePriority(m: SportsMatch): number {
 }
 
 /** merge DaddyLive fixtures with TheSportsDB calendars, DaddyLive wins (it carries feeds) */
-function mergeFixtures(daddyLive: EnrichedMatch[], sdb: BigFixture[]): (EnrichedMatch | BigFixture)[] {
+function mergeFixtures(
+  daddyLive: (EnrichedMatch | BigFixture)[],
+  sdb: BigFixture[]
+): (EnrichedMatch | BigFixture)[] {
   const seen = new Set<string>();
   const out: (EnrichedMatch | BigFixture)[] = [];
   for (const m of daddyLive) {
@@ -330,12 +342,13 @@ export async function GET(req: Request) {
 
     const upcomingRaw = matches.filter((m) => m.status === 'upcoming').slice(0, 120);
 
-    // TheSportsDB→ESPN championship calendars (PL, La Liga, Serie A, …, NFL) so
-    // the big-matches rail has real fixtures even on days DaddyLive carries none.
-    // Bounded wait when cold (~1–2s, hard cap 4s) so the first response already
-    // carries the championship fixtures; afterwards it's a pure cache read.
+    // TheSportsDB→ESPN championship calendars (PL, La Liga, Serie A, …, NFL,
+    // NBA) so the big-matches rail has real fixtures even on days DaddyLive
+    // carries none. Bounded wait when cold (~1–2s, hard cap 4s) so the first
+    // response already carries the championship fixtures; afterwards it's a
+    // pure cache read.
     warmBigLeagues();
-    let { football: sdbFootball, nfl: sdbNFL } = peekFixtures();
+    let { football: sdbFootball, nfl: sdbNFL, nba: sdbNba } = peekFixtures();
     {
       const missing: Promise<void>[] = [];
       if (sdbFootball.length === 0) {
@@ -349,6 +362,13 @@ export async function GET(req: Request) {
         missing.push(
           getNFLFixtures().then((nfl) => {
             sdbNFL = nfl;
+          }).catch(() => {})
+        );
+      }
+      if (sdbNba.length === 0) {
+        missing.push(
+          getNBAFixtures().then((nba) => {
+            sdbNba = nba;
           }).catch(() => {})
         );
       }
@@ -392,7 +412,7 @@ export async function GET(req: Request) {
       }
     });
 
-    const bigMerged = mergeFixtures([...bigLive, ...bigMatches], sdbFootball).slice(0, 28);
+    const bigMerged = mergeFixtures(mergeFixtures([...bigLive, ...bigMatches], sdbFootball), sdbNba).slice(0, 28);
     const amFbMerged = mergeFixtures(
       americanFootball.map((m) => ({ ...m, status: m.status as 'live' | 'upcoming' })),
       sdbNFL.filter((f) => f.startTime > now)
