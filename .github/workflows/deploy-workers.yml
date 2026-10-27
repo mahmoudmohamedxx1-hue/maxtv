@@ -40,6 +40,10 @@ jobs:
           node-version: 24
           cache: npm
 
+      # OpenNext runs the Next.js build with bun when bun.lock is present
+      - uses: oven-sh/setup-bun@v2
+        if: steps.secrets.outputs.skip == 'false'
+
       - name: Install
         if: steps.secrets.outputs.skip == 'false'
         run: npm ci
