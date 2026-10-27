@@ -16,7 +16,7 @@ export interface BigFixture {
   id: string;
   title: string;
   league: string;
-  category: 'football' | 'american_football';
+  category: 'football' | 'american_football' | 'basketball';
   startTime: number;
   timeStr: string;
   status: 'upcoming';
@@ -42,6 +42,13 @@ export const FOOTBALL_LEAGUES: { path: string; pretty: string }[] = [
 ];
 
 export const NFL_PATH = 'football/nfl';
+
+/** NBA — same ESPN scoreboard API, different sport path. NBA tips at
+ *  01:00-04:30 Cairo time, so DaddyLive's today/tomorrow window leaves long
+ *  evening stretches with no NBA visible anywhere on the SPORTS tab (every
+ *  prominent rail is live-only or big-league-only). The fixture calendar
+ *  keeps the big-matches rail carrying NBA ahead of tip-off. */
+export const NBA_PATH = 'basketball/nba';
 
 // ─── caches with stale-serve (expired data still beats no data) ─────────────
 interface CacheBox<T> {
@@ -139,7 +146,7 @@ function monthsAhead(): string[] {
 async function leagueFixtures(
   path: string,
   pretty: string,
-  category: 'football' | 'american_football'
+  category: 'football' | 'american_football' | 'basketball'
 ): Promise<BigFixture[]> {
   const key = `espn:next:${path}`;
   const hit = peekCache<BigFixture[]>(key);
@@ -223,6 +230,12 @@ export async function getNFLFixtures(cap = 30): Promise<BigFixture[]> {
   return fx.slice(0, cap);
 }
 
+/** upcoming NBA fixtures (merged into the big-matches rail, not a zone) */
+export async function getNBAFixtures(cap = 12): Promise<BigFixture[]> {
+  const fx = await leagueFixtures(NBA_PATH, 'NBA', 'basketball');
+  return fx.slice(0, cap);
+}
+
 /** dedupe helper: same two teams playing on the same UTC day = same fixture */
 export function fixtureKey(team1: string, team2: string, ts: number): string {
   const day = new Date(ts).toISOString().slice(0, 10);
@@ -233,7 +246,7 @@ export function fixtureKey(team1: string, team2: string, ts: number): string {
 // ─── non-blocking reads (never let a cold cache stall the schedule API) ─────
 
 /** cached fixtures without any network activity — empty until warmed */
-export function peekFixtures(perLeagueCap = 3): { football: BigFixture[]; nfl: BigFixture[] } {
+export function peekFixtures(perLeagueCap = 3): { football: BigFixture[]; nfl: BigFixture[]; nba: BigFixture[] } {
   const all = FOOTBALL_LEAGUES.flatMap((l) => peekCache<BigFixture[]>(`espn:next:${l.path}`) ?? []).sort(
     (a, b) => a.startTime - b.startTime
   );
@@ -245,11 +258,16 @@ export function peekFixtures(perLeagueCap = 3): { football: BigFixture[]; nfl: B
     perLeague.set(f.league, n + 1);
     capped.push(f);
   }
-  return { football: capped, nfl: (peekCache<BigFixture[]>(`espn:next:${NFL_PATH}`) ?? []).slice(0, 30) };
+  return {
+    football: capped,
+    nfl: (peekCache<BigFixture[]>(`espn:next:${NFL_PATH}`) ?? []).slice(0, 30),
+    nba: (peekCache<BigFixture[]>(`espn:next:${NBA_PATH}`) ?? []).slice(0, 12),
+  };
 }
 
 /** kick off background refresh (no-op when fresh) — call from warmups/routes */
 export function warmBigLeagues(): void {
   void getBigLeagueFixtures().catch(() => {});
   void getNFLFixtures().catch(() => {});
+  void getNBAFixtures().catch(() => {});
 }
