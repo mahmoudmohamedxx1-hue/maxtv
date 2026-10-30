@@ -135,7 +135,7 @@ const en = {
   'player.autoNote':
     'Picks the most stable quality for your connection — starts safe, climbs when the link proves it can hold more, drops instantly on stalls.',
   'player.singleQualityNote':
-    "This channel's provider serves a single quality. When another source carries it with a real ladder, its rungs appear here automatically.",
+    "This channel's provider serves a single encoded quality — a lower label here couldn't reduce data, the bytes arrive as-encoded. When another source carries the same channel with a real ladder, its data-saving rungs appear here automatically.",
   'player.moreQualitiesVia': 'More qualities · via {source}',
   'player.altRungNote': 'Same channel on {source}, with a real quality ladder — picking a rung switches there and pins your choice.',
   'player.dataSaverSection': 'Quality ladder · Data saver',
@@ -147,6 +147,7 @@ const en = {
   'player.backToNative': '← back to the native feed',
   'player.choiceSaved': 'Your choice is saved and applied to every channel.',
   'player.dsChip': 'Data saver',
+  'player.dsAltToast': 'Data saver: switched to {h}p via {source} — ≈{mb} MB/min',
   'player.rung.ultraLow': 'ultra low',
   'player.rung.hd': 'HD',
   'player.rung.fullHd': 'Full HD',
@@ -456,7 +457,7 @@ const ar: Record<Exclude<TKey, never>, string> = {
   'player.autoNote':
     'يختار الجودة الأكثر استقرارًا لاتصالك — يبدأ بحذر، ويرتفع عندما يثبت الاتصال قدرته، وينخفض فورًا عند التعثر.',
   'player.singleQualityNote':
-    'مزوّد هذه القناة يقدم جودة واحدة. عندما يحمل مصدر آخر القناة نفسها بسلم جودة حقيقي، تظهر درجاته هنا تلقائيًا.',
+    'مزوّد هذه القناة يبث بجودة واحدة مُرمَّزة — لا يمكن لأي درجة أدنى هنا تقليل البيانات لأنها تصل كما رُمِّزت. عندما يحمل مصدر آخر نفس القناة بسلم جودة حقيقي، تظهر درجاته الموفِّرة للبيانات هنا تلقائيًا.',
   'player.moreQualitiesVia': 'جودات إضافية · عبر {source}',
   'player.altRungNote': 'القناة نفسها على {source} بسلم جودة حقيقي — اختيار درجة ينقلك إليها ويثبّت اختيارك.',
   'player.dataSaverSection': 'سلم الجودة · موفّر البيانات',
@@ -466,6 +467,7 @@ const ar: Record<Exclude<TKey, never>, string> = {
   'player.backToNative': '→ العودة إلى البث الأصلي',
   'player.choiceSaved': 'اختيارك محفوظ ويُطبّق على كل القنوات.',
   'player.dsChip': 'موفّر البيانات',
+  'player.dsAltToast': 'موفّر البيانات: تم التحويل إلى {h}p عبر {source} — ≈{mb} م.ب/د',
   'player.rung.ultraLow': 'منخفضة جدًا',
   'player.rung.hd': 'HD',
   'player.rung.fullHd': 'Full HD',

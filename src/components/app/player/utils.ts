@@ -93,3 +93,36 @@ export function rungHint(h: number, t: (key: string) => string): string | undefi
   if (h === 1080) return t('player.rung.fullHd');
   return undefined;
 }
+
+/** Approximate data rate per rung height, for the menu's data-saver labels.
+ *  Standard ABR ladder bitrates (these pools are Amagi/CloudFront/Akamai
+ *  FAST playouts — their rung bitrates are the industry-standard encodes);
+ *  Mbps → MB/min = ×7.5. These are honest APPROXIMATIONS for menu display,
+ *  not measurements of the exact stream. */
+const RUNG_MBPS: Array<[height: number, mbps: number]> = [
+  [144, 0.2],
+  [240, 0.35],
+  [360, 0.7],
+  [432, 0.9],
+  [480, 1.2],
+  [540, 1.6],
+  [576, 1.8],
+  [720, 2.5],
+  [1080, 4.5],
+];
+
+/** ≈MB/min downloaded when playing a rung of this height (nearest standard
+ *  rung; null only for nonsense heights). This is the number that makes the
+ *  data-saver promise CONCRETE: 240p ≈ 3 MB/min vs Source 1080p ≈ 34 MB/min
+ *  is a 10x saving the user can see and verify. */
+export function rungMBPerMin(h: number): number | null {
+  if (!h || h <= 0) return null;
+  let best: [number, number] | null = null;
+  for (const r of RUNG_MBPS) {
+    if (best === null || Math.abs(r[0] - h) < Math.abs(best[0] - h)) best = r;
+  }
+  if (!best) return null;
+  // round to a clean 1-2 significant figure value for the menu
+  const mb = best[1] * 7.5;
+  return mb >= 10 ? Math.round(mb) : Math.round(mb);
+}

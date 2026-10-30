@@ -42,6 +42,65 @@ const MIN_SAMPLES = 2;
 const SLOW_MS = 2_500;
 /** evidence older than this is stale (shards recover; channel mix changes) */
 const DECAY_MS = 5 * 60_000;
+/** slow-shard knowledge persists across sessions for this long (field report
+ *  2026-10-30: "streams are still laggy especially beIN" — every NEW session
+ *  re-paid the 2-samples-before-engagement window, ~15s of stalls right after
+ *  opening the channel, even though the previous session KNEW the shard was
+ *  slow. Persisting the slow set makes session 2+ engage on the FIRST slow
+ *  segment instead of the third. 10 min: long enough to cover channel-hop
+ *  sessions, short enough that a recovered shard isn't haunted by old
+ *  evidence — and the first 2-3 fast fetches pull the EWMA back down.) */
+const PERSIST_TTL_MS = 10 * 60_000;
+const STORE_KEY = 'maxtv:host-health:v1';
+/** localStorage writes are throttled — no need to hit storage on every fetch */
+const PERSIST_WRITE_MS = 15_000;
+
+/** seed the evidence map from a previous session's slow set (lazy, once) */
+let seeded = false;
+function seedFromStorage(): void {
+  if (seeded) return;
+  seeded = true;
+  if (typeof window === 'undefined') return;
+  try {
+    const raw = window.localStorage.getItem(STORE_KEY);
+    if (!raw) return;
+    const data = JSON.parse(raw) as { at?: number; hosts?: Record<string, { ewmaMs?: number }> };
+    if (!data?.hosts || typeof data.at !== 'number') return;
+    if (Date.now() - data.at > PERSIST_TTL_MS) return;
+    for (const [h, v] of Object.entries(data.hosts)) {
+      if (typeof v?.ewmaMs === 'number' && v.ewmaMs > SLOW_MS) {
+        hosts.set(h, { ewmaMs: v.ewmaMs, fails: 0, samples: MIN_SAMPLES, lastAt: Date.now() });
+      }
+    }
+  } catch {
+    /* corrupted/unavailable storage — persistence is best-effort */
+  }
+}
+
+/** persist the current slow set. Writes are throttled CONTENT-aware: the
+ *  first record of a session writes an (empty) baseline and must not consume
+ *  the throttle window — the slow set is written the moment it CHANGES
+ *  (host turns slow / recovers), and identical sets re-write at most once
+ *  per window to refresh the `at` heartbeat. */
+let lastWriteAt = 0;
+let lastWrittenHosts = '';
+function persistSlowSet(): void {
+  if (typeof window === 'undefined') return;
+  const now = Date.now();
+  try {
+    const slow: Record<string, { ewmaMs: number }> = {};
+    for (const [h, st] of hosts) {
+      if (st.samples >= MIN_SAMPLES && st.ewmaMs > SLOW_MS) slow[h] = { ewmaMs: Math.round(st.ewmaMs) };
+    }
+    const hostsJson = JSON.stringify(slow);
+    if (hostsJson === lastWrittenHosts && now - lastWriteAt < PERSIST_WRITE_MS) return;
+    lastWriteAt = now;
+    lastWrittenHosts = hostsJson;
+    window.localStorage.setItem(STORE_KEY, JSON.stringify({ at: now, hosts: slow }));
+  } catch {
+    /* storage full/blocked — best-effort */
+  }
+}
 /** how many server-route fetches per rolling minute, PER POOL. Each one is a
  *  Workers invocation on the free plan's 100k/day meter, so both pools are
  *  bounded — but they are SEPARATE on purpose (A/B soak 2026-10-26: a shared
@@ -110,12 +169,14 @@ function prune(): void {
 export function recordHostFetch(url: string, ms: number, ok: boolean): void {
   const h = hostOf(url);
   if (!h) return;
+  seedFromStorage();
   recordLog.push({ host: h, ms: Math.round(ms), ok, at: Date.now() });
   if (recordLog.length > 48) recordLog.shift();
   const now = Date.now();
   const cur = hosts.get(h);
   if (!cur) {
     hosts.set(h, { ewmaMs: ok ? ms : 0, fails: ok ? 0 : 1, samples: ok ? 1 : 0, lastAt: now });
+    persistSlowSet();
     return;
   }
   cur.lastAt = now;
@@ -126,6 +187,7 @@ export function recordHostFetch(url: string, ms: number, ok: boolean): void {
   } else {
     cur.fails++;
   }
+  persistSlowSet();
 }
 
 /** Is this segment's host measured-slow? (≥MIN_SAMPLES successes with a
@@ -133,6 +195,7 @@ export function recordHostFetch(url: string, ms: number, ok: boolean): void {
 export function isSlowHost(url: string): boolean {
   const h = hostOf(url);
   if (!h) return false;
+  seedFromStorage();
   prune();
   const s = hosts.get(h);
   if (!s) return false;
@@ -142,6 +205,7 @@ export function isSlowHost(url: string): boolean {
 
 /** Any slow host seen recently? (drives the deeper ride posture) */
 export function anySlowHost(): boolean {
+  seedFromStorage();
   prune();
   for (const s of hosts.values()) {
     if ((s.samples >= MIN_SAMPLES && s.ewmaMs > SLOW_MS) || s.fails >= 3) return true;
@@ -167,9 +231,17 @@ export function hostHealthSnapshot(): Record<
   return out;
 }
 
-/** test/E2E hook — wipe the evidence */
+/** test/E2E hook — wipe the evidence (memory + persisted store) */
 export function resetHostHealth(): void {
   hosts.clear();
   criticalLog.length = 0;
   rescueLog.length = 0;
+  seeded = true; // do not re-seed from storage after an explicit reset
+  if (typeof window !== 'undefined') {
+    try {
+      window.localStorage.removeItem(STORE_KEY);
+    } catch {
+      /* best-effort */
+    }
+  }
 }

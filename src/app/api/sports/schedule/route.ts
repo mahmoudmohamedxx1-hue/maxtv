@@ -1,6 +1,7 @@
 import { NextResponse, after } from 'next/server';
 import { getSchedule } from '@/lib/sports/daddylive';
 import { sportName } from '@/lib/sports/categories';
+import { MINOR_LEAGUE_RE } from '@/lib/sports/categories';
 import { extractTeamsFromTitle, findTeamLogo, findCachedTeamLogo, getLeagueLogo, getChannelLogo, extractTennisPlayers, findPlayerLogo, extractFighters } from '@/lib/media/logos';
 import { getBigLeagueFixtures, getNFLFixtures, getNBAFixtures, fixtureKey, peekFixtures, warmBigLeagues, type BigFixture } from '@/lib/sports/bigleagues';
 import type { SportsMatch } from '@/lib/types';
@@ -217,6 +218,11 @@ const BIG_LEAGUE_TESTS: ((league: string, title: string) => boolean)[] = [
 
 function isBigLeague(m: SportsMatch): boolean {
   if (m.category === 'handball' || m.category === 'motorsport') return false;
+  // reserve / youth / development / second-tier variants of the big names
+  // never carry headline weight (field report 2026-10-30: "Man United vs
+  // Monaco in Premier League" — it was Premier League 2, the U21 league,
+  // promoted by the substring test /premier league/i below)
+  if (MINOR_LEAGUE_RE.test(m.league)) return false;
   // basketball: ONLY the NBA carries headline weight (ACB/Euroleague/college
   // stay off the rail); every other test below is league-specific anyway
   if (m.category === 'basketball' && !/^\s*nba\b/i.test(m.league)) return false;

@@ -53,6 +53,7 @@ import {
   encodePlayable,
   fmtAgo,
   probeTcCap,
+  rungMBPerMin,
 } from './player/utils';
 import { createNetWatcher } from './player/createNetWatcher';
 import { UncloakDirectLoader, directPathHealthy } from './player/uncloak-loader';
@@ -2087,11 +2088,12 @@ export function PlayerOverlay() {
 
   /** quality-menu pick of an alternate-source rung ("1080p · via beIN XTRA") */
   const pickAltRung = useCallback(
-    (alt: AltServer, h: number) => {
+    (alt: AltServer, h: number, opts?: { auto?: boolean }) => {
       const cur = playerRef.current;
       if (!cur) return;
       setShowQualityMenu(false);
-      updatePrefs({ quality: h, autoPicked: false });
+      // manual picks persist; auto (Data Saver) picks are one-shot per channel
+      if (!opts?.auto) updatePrefs({ quality: h, autoPicked: false });
       pinHeightRef.current = h;
       setAltUrl(alt.url);
       if (cur.kind === 'daddylive') setActiveServer('');
@@ -2249,6 +2251,33 @@ export function PlayerOverlay() {
     );
   }, [alternates]);
   const ladderRungs: number[] = ladderAlt?.ladder || [];
+
+  /* ── Data Saver auto-run on alternate-provider ladders ────────────────────
+   * Field report 2026-10-30: "the quality ladder doesn't affect data usage —
+   * that is its main purpose". On the Workers plane the transcode ladder
+   * can't exist (no CPU), so for OS-level Data Saver / very slow links the
+   * honest data saver is the LOWEST rung of an alternate provider carrying
+   * the SAME channel with a real ladder (240p ≈ 3 MB/min vs Source ≈ 34).
+   * Fires once per channel, only without an explicit user pick, never
+   * re-triggers after the user returns to the live servers. */
+  const dsAutoAltRef = useRef('');
+  useEffect(() => {
+    if (!playerOpen || !player || !ladderAlt || ladderRungs.length === 0) return;
+    if (altUrl) return; // already on an alternate
+    const budget = connectionBudget(); // saveData → 400 kbps
+    const ds = dataSaverForBudget(budget);
+    if (!ds) return; // link isn't in data-saver territory
+    const p = loadPrefs();
+    if (p.quality >= 0 && !p.autoPicked) return; // explicit user pick — respect it
+    if (dsAutoAltRef.current === player.id) return; // once per channel
+    const lowest = ladderRungs[0];
+    if (!lowest || lowest >= ds - 60) return; // lowest rung isn't actually low-data
+    dsAutoAltRef.current = player.id;
+    pickAltRung(ladderAlt, lowest, { auto: true });
+    showToast(
+      t('player.dsAltToast', { h: lowest, source: ladderAlt.sourceName, mb: rungMBPerMin(lowest) ?? '?' })
+    );
+  }, [playerOpen, player, ladderAlt, ladderRungs, altUrl, pickAltRung, showToast, t]);
 
   if (!playerOpen || !player) return null;
 

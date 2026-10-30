@@ -8,7 +8,7 @@
 import { cn } from '@/lib/utils';
 import type { Translator } from '@/lib/locale';
 import type { AltServer } from './constants';
-import { rungHint } from './utils';
+import { rungHint, rungMBPerMin } from './utils';
 
 export interface QualityMenuProps {
   t: Translator['t'];
@@ -105,6 +105,11 @@ export function QualityMenu({
                 <span>
                   {h}p
                   {rungHint(h, t) && <span className="ms-1.5 text-[9px] font-bold text-zilla-dim">{rungHint(h, t)}</span>}
+                  {rungMBPerMin(h) !== null && (
+                    <span className="ms-1.5 text-[9px] font-bold text-emerald-400/80">
+                      ≈{rungMBPerMin(h)} MB/min
+                    </span>
+                  )}
                 </span>
                 <span className="text-[9px] font-bold text-zilla-dim">{ladderAlt.sourceName}</span>
               </button>
@@ -178,6 +183,11 @@ export function QualityMenu({
               <span>
                 {h}p
                 {rungHint(h, t) && <span className="ms-1.5 text-[9px] font-bold text-zilla-dim">{rungHint(h, t)}</span>}
+                {rungMBPerMin(h) !== null && (
+                  <span className="ms-1.5 text-[9px] font-bold text-emerald-400/80">
+                    ≈{rungMBPerMin(h)} MB/min
+                  </span>
+                )}
               </span>
               {tcHeight === h && <span>✓</span>}
             </button>

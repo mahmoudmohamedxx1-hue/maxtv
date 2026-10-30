@@ -155,3 +155,35 @@ export function sportName(id: string): string {
   if (id === 'other') return 'More Sports';
   return SPORT_DEFS.find((s) => s.id === id)?.name ?? id;
 }
+
+// ─── Reserve / youth / development-league detection ─────────────────────────
+// Field report 2026-10-30: "how man utd meets monaco in premier league that is
+// really shit" — the fixture was REAL but it was Premier League 2, the U21
+// reserve competition (DaddyLive lists it on MUTV): the headline-rail test
+// matched /premier league/i as a substring, and the card's CSS truncation cut
+// exactly the "2", so an academy fixture was billed with first-team crests as
+// a Premier League match. Development variants of the big names never carry
+// headline weight, and their tier must never be the truncated part of a label.
+export const MINOR_LEAGUE_RE =
+  /premier league 2|premier league international|la liga 2|hypermot|smartbank|2\.?\s*bundesliga|bundesliga 2|under-?\d+|\bu1[6-9]\b|\bu2[0-3]\b|\bsub-?\d+\b|youth|academy|reserve|\bg league\b|femen|women/i;
+
+/** Is this a development / reserve / youth competition? (drives the
+ *  "U21/Reserve" chip on match cards + exclusion from headline rails) */
+export function isMinorLeague(league: string): boolean {
+  return MINOR_LEAGUE_RE.test(league);
+}
+
+/** Compact league label for card headers. Long names are shortened by
+ *  dropping the COUNTRY prefix ("England - Premier League 2" →
+ *  "Premier League 2") — never the league name itself, because the tier
+ *  digit is the difference between a first-team fixture and a reserve one
+ *  and must never be the part CSS truncation eats. */
+export function leagueDisplayName(league: string): string {
+  if (league.length <= 22) return league;
+  const parts = league.split(' - ');
+  if (parts.length > 1) {
+    const tail = parts[parts.length - 1].trim();
+    if (tail && tail.length >= 6) return tail;
+  }
+  return league;
+}

@@ -2,6 +2,7 @@
 
 import { useState } from 'react';
 import { cn } from '@/lib/utils';
+import { isMinorLeague, leagueDisplayName } from '@/lib/sports/categories';
 import { logoSrc } from './ChannelCard';
 import { prefetchStream } from '@/lib/prefetch';
 
@@ -162,8 +163,16 @@ export function MatchCard({
               className="h-4 w-4 rounded-sm object-contain"
             />
           )}
-          <span className="truncate text-[11px] font-bold uppercase tracking-wide text-zilla-yellow">
-            {match.league}
+          {isMinorLeague(match.league) && (
+            <span className="shrink-0 rounded-md bg-zilla-line px-1.5 py-0.5 text-[9px] font-black uppercase tracking-wide text-zilla-dim">
+              U21/Reserve
+            </span>
+          )}
+          <span
+            className="truncate text-[11px] font-bold uppercase tracking-wide text-zilla-yellow"
+            title={match.league}
+          >
+            {leagueDisplayName(match.league)}
           </span>
         </span>
       </div>

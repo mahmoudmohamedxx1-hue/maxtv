@@ -4,6 +4,7 @@ import { useEffect, useState } from 'react';
 import { cn } from '@/lib/utils';
 import { logoSrc } from './ChannelCard';
 import { WomensBadge, type MatchCardData } from './MatchCard';
+import { isMinorLeague, leagueDisplayName } from '@/lib/sports/categories';
 
 /** shared 30s clock so every countdown updates together without spamming renders */
 function useTick(ms = 30_000) {
@@ -98,9 +99,17 @@ export function BigMatchCard({
           ) : (
             <span className="text-sm">⭐</span>
           )}
-          <span className="truncate text-[12px] font-black uppercase tracking-wider text-zilla-yellow">
-            {match.league}
+          <span
+            className="truncate text-[12px] font-black uppercase tracking-wider text-zilla-yellow"
+            title={match.league}
+          >
+            {leagueDisplayName(match.league)}
           </span>
+          {isMinorLeague(match.league) && (
+            <span className="shrink-0 rounded-md bg-zilla-line px-1.5 py-0.5 text-[9px] font-black uppercase tracking-wide text-zilla-dim">
+              U21/Reserve
+            </span>
+          )}
           {match.women && <WomensBadge />}
         </span>
         {isLive ? (
