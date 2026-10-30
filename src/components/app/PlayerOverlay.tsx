@@ -326,6 +326,7 @@ export function PlayerOverlay() {
         netRef,
         tcHeightRef,
         dataSaverRef,
+        ladderMasterRef,
         nativeHeightRef,
         tcCapRef,
         tcSrcRef,
@@ -842,9 +843,28 @@ export function PlayerOverlay() {
               // runway instead of draining the playhead; the prefetcher's
               // slow-host priority + server-route rescue fill that runway.
               const slow = anySlowHost();
+              // Data Saver on a healthy rungless master: tight posture (no
+              // encoder to protect). Turbo rungs / dead path / slow shards
+              // keep the engine's deep ride — stability first, toggle or not.
+              const dsTight =
+                dataSaverRef.current &&
+                !turboRung &&
+                !dead &&
+                !slow &&
+                (hls.levels || []).every(
+                  (l) => (l.height || 0) === 0 || /raw=1/.test((l.url || []).join(''))
+                );
               const cfg = hls.config as { liveSyncDurationCount?: number; maxBufferLength?: number };
-              cfg.liveSyncDurationCount = turboRung ? 5 : dead || slow ? 5 : 3;
-              cfg.maxBufferLength = turboRung ? 45 : dead ? 45 : slow ? 60 : 30;
+              cfg.liveSyncDurationCount = dsTight ? 2 : turboRung ? 5 : dead || slow ? 5 : 3;
+              cfg.maxBufferLength = dsTight
+                ? DATA_SAVER_HLS_CONFIG.maxBufferLength
+                : turboRung
+                  ? 45
+                  : dead
+                    ? 45
+                    : slow
+                      ? 60
+                      : 30;
             }
             // refresh labels — some CDNs only report resolution once fragments load
             const lvl = hls.levels?.[d.level];
@@ -1198,7 +1218,10 @@ export function PlayerOverlay() {
       if (patch && patch.quality === undefined) return;
       const hls = hlsRef.current;
       if (p.quality === -1) {
-        if (hls && hls.levels?.length && tcHeightRef.current === null) hls.nextLevel = -1;
+        if (hls && hls.levels?.length && tcHeightRef.current === null) {
+          hls.nextLevel = -1;
+          hls.autoLevelCapping = -1; // back to fully adaptive — no stale ceiling
+        }
         setCurrentQuality(-1);
         if (tcHeightRef.current !== null && !p.autoPicked) void exitDataSaverRef.current?.();
         return;
@@ -1237,6 +1260,7 @@ export function PlayerOverlay() {
       }
       if (idx >= 0 && tcHeightRef.current === null) {
         hls.nextLevel = idx; // smooth switch at the next segment boundary
+        hls.autoLevelCapping = idx; // and it STICKS (see warmBandSwitch)
         setCurrentQuality(idx);
       } else if ((DATA_SAVER_HEIGHTS as readonly number[]).includes(p.quality)) {
         // guard: never re-enter a rung that is ALREADY active
@@ -1253,15 +1277,22 @@ export function PlayerOverlay() {
     if (!was && !dataSaver) return; // never on — default config is already correct
     const hls = hlsRef.current;
     if (!hls) return;
-    // transcode / ladder sources keep their tuned deep buffers — the on-demand
-    // encoders NEED the runway; there the rung choice itself is the saving
-    const ladderLike = ladderMasterRef.current || tcHeight !== null;
+    // Only a source with REAL transcode rungs keeps the deep buffer — the
+    // on-demand encoders need the runway, and their rung choice already is
+    // the saving. A RUNGLESS ladder master (every DaddyLive channel on the
+    // Workers plane: single Source level, no transcoder) is just a native
+    // single-variant feed and gets the tight Data Saver buffer.
+    const levels = hls.levels || [];
+    const hasTurboRungs = levels.some(
+      (l) => (l.height || 0) > 0 && !/raw=1/.test((l.url || []).join(''))
+    );
+    const encoderRunway = (ladderMasterRef.current && hasTurboRungs) || tcHeight !== null;
     const cfg = hls.config as {
       maxBufferLength?: number;
       maxMaxBufferLength?: number;
       backBufferLength?: number;
     };
-    if (dataSaver && !ladderLike) {
+    if (dataSaver && !encoderRunway) {
       cfg.maxBufferLength = DATA_SAVER_HLS_CONFIG.maxBufferLength;
       cfg.maxMaxBufferLength = DATA_SAVER_HLS_CONFIG.maxMaxBufferLength;
       cfg.backBufferLength = DATA_SAVER_HLS_CONFIG.backBufferLength;
@@ -1285,7 +1316,9 @@ export function PlayerOverlay() {
       cfg.backBufferLength = base.backBufferLength;
       if (!ladderMasterRef.current) hls.autoLevelCapping = -1; // sticky-cap re-engages
     }
-  }, [dataSaver, tcHeight]);
+    // re-run when a stream attaches (master/phase flip) so the treatment
+    // reaches instances created before this effect ever saw an hls — idempotent
+  }, [dataSaver, tcHeight, ladderMaster, phase]);
 
   /* ── content-mismatch guard (the football→F1 fix, layer 3) ───────────── */
   useEffect(() => {
@@ -1689,9 +1722,26 @@ export function PlayerOverlay() {
           const turboRung = !!lvl && (lvl.height || 0) > 0 && !/raw=1/.test((lvl.url || []).join(''));
           const dead = !directPathHealthy();
           const slow = anySlowHost();
+          // Data Saver on a healthy rungless master: tight posture (see load())
+          const dsTight =
+            dataSaverRef.current &&
+            !turboRung &&
+            !dead &&
+            !slow &&
+            (hls.levels || []).every(
+              (l) => (l.height || 0) === 0 || /raw=1/.test((l.url || []).join(''))
+            );
           const cfg = hls.config as { liveSyncDurationCount?: number; maxBufferLength?: number };
-          cfg.liveSyncDurationCount = turboRung ? 5 : dead || slow ? 5 : 3;
-          cfg.maxBufferLength = turboRung ? 45 : dead ? 45 : slow ? 60 : 30;
+          cfg.liveSyncDurationCount = dsTight ? 2 : turboRung ? 5 : dead || slow ? 5 : 3;
+          cfg.maxBufferLength = dsTight
+            ? DATA_SAVER_HLS_CONFIG.maxBufferLength
+            : turboRung
+              ? 45
+              : dead
+                ? 45
+                : slow
+                  ? 60
+                  : 30;
         });
         hls.on(Hls.Events.MANIFEST_PARSED, () => {
           if (typeof level === 'number' && level >= 0 && hls.levels?.[level]) {
@@ -1775,6 +1825,14 @@ export function PlayerOverlay() {
       } else {
         hlsL.nextLevel = level; // shallow — seamless boundary switch
       }
+      // ⚠ a picked rung must STICK: nextLevel alone is one-shot and ABR
+      // climbs back to the heaviest variant on the next fragment (the root
+      // cause of the 2026-10-30 "quality ladder doesn't affect data usage"
+      // report — reproduced live: pick 244p, back on the 4.5 Mbps Source
+      // rung within seconds). Cap ABR at the picked rung: the seamless
+      // boundary switch is preserved, and a starved link may still adapt
+      // BELOW the pick — exactly what a data-saver promise wants.
+      hlsL.autoLevelCapping = level;
     },
     []
   );
@@ -2092,6 +2150,8 @@ export function PlayerOverlay() {
         if (level >= 0 && ahead > 20) hls.currentLevel = level;
         else hls.nextLevel = level;
       }
+      // picked rung = ABR ceiling (see warmBandSwitch); Auto clears it
+      hls.autoLevelCapping = level >= 0 ? level : -1;
       setCurrentQuality(level);
       showToast(level === -1 ? t('player.qualityAutoToast') : t('player.qualityToast', { label }));
     },
@@ -2335,24 +2395,13 @@ export function PlayerOverlay() {
     );
   }, [playerOpen, player, ladderAlt, ladderRungs, altUrl, pickAltRung, showToast, t, dataSaver]);
 
-  /* ── Data Saver toggle ON + NO alternate ladder but a transcode ladder ────
-   * (ffmpeg-capable hosting): enter the re-encoded 244p rung — ≈3 MB/min vs
-   * ≈20-34 MB/min native. Once per channel, respects explicit picks. */
-  useEffect(() => {
-    if (!dataSaver || !playerOpen || !player) return;
-    if (ladderAlt && ladderRungs.length > 0) return; // alternate rungs cover it
-    if (altUrl || tcHeight !== null) return; // already on a rung
-    if (player.kind !== 'daddylive' || !tcCap || !tcSeg) return;
-    if (phase !== 'playing') return; // let the native feed attach first
-    const p = loadPrefs();
-    if (p.quality >= 0 && !p.autoPicked) return; // explicit user pick — respect it
-    if (dsAutoAltRef.current === player.id) return; // once per channel
-    dsAutoAltRef.current = player.id;
-    selectDataSaver(244, { auto: true });
-    showToast(t('player.dsSegToast', { h: 244, mb: rungMBPerMin(244) ?? 3 }));
-  }, [dataSaver, playerOpen, player, ladderAlt, ladderRungs, altUrl, tcHeight, tcCap, tcSeg, phase, selectDataSaver, showToast, t]);
-
-  /** the Data Saver master switch — one handler for menu + settings row */
+  /** the Data Saver master switch — one handler for menu + settings row.
+   *  ⚠ NO auto-enter of transcode rungs from the toggle: the re-encoded
+   *  rungs are served by a live ffmpeg session of the SAME upstream, and
+   *  when that upstream stalls (DaddyLive edge rotations) a forced rung is
+   *  a minute of retries before the fatal bounce (reproduced locally,
+   *  2026-10-31). The evidence-gated starvation-hopper in netWatcher and
+   *  MANUAL rung picks keep working exactly as before. */
   const toggleDataSaver = useCallback(() => {
     const next = !loadPrefs().dataSaver;
     updatePrefs({ dataSaver: next });
@@ -2589,7 +2638,11 @@ export function PlayerOverlay() {
                     dataSaver={dataSaver}
                     onToggleDataSaver={toggleDataSaver}
                     dsChannelEffect={
-                      ladderAlt && ladderRungs.length > 0 ? 'alt' : canDataSaver ? 'transcode' : 'buffer'
+                      ladderAlt && ladderRungs.length > 0
+                        ? 'alt'
+                        : canDataSaver || ladderMaster
+                          ? 'transcode'
+                          : 'buffer'
                     }
                     quality={quality}
                     currentQuality={currentQuality}

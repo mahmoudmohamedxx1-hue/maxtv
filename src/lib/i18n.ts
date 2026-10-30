@@ -154,12 +154,11 @@ const en = {
   'player.dsToggleNote':
     'For slow connections: uses the lowest quality rung available and stops over-buffering — softer picture, a fraction of the data.',
   'player.dsEffectAlt': 'On this channel: switches to the alternate source\'s lowest rung — the biggest saving.',
-  'player.dsEffectTc': 'On this channel: opens the re-encoded 244p rung — built for slow links.',
+  'player.dsEffectTc': 'On this channel: pick a re-encoded rung below — 244p ≈3 MB/min, built for slow links.',
   'player.dsEffectBuffer':
     'This channel has a single quality — Data Saver trims the pre-buffer so you only download what you watch.',
   'player.dsOnToast': 'Data saver on — lowest rung, minimal buffering',
   'player.dsOffToast': 'Data saver off',
-  'player.dsSegToast': 'Data saver: re-encoded {h}p rung — ≈{mb} MB/min',
   'player.rung.ultraLow': 'ultra low',
   'player.rung.hd': 'HD',
   'player.rung.fullHd': 'Full HD',
@@ -486,12 +485,11 @@ const ar: Record<Exclude<TKey, never>, string> = {
   'player.dsToggleNote':
     'للاتصالات البطيئة: يستخدم أدنى درجة جودة متاحة ويوقف التحميل المسبق الزائد — صورة أخفّ وبيانات أقل بكثير.',
   'player.dsEffectAlt': 'على هذه القناة: ينتقل إلى أدنى درجة من المصدر البديل — أكبر توفير للبيانات.',
-  'player.dsEffectTc': 'على هذه القناة: يفتح درجة 244p المعاد ترميزها — مصممة للاتصالات البطيئة.',
+  'player.dsEffectTc': 'على هذه القناة: اختر درجة معاد ترميزها أدناه — 244p ≈3 م.ب/د، مصممة للاتصالات البطيئة.',
   'player.dsEffectBuffer':
     'هذه القناة بجودة واحدة — يقلّص موفّر البيانات التحميل المسبق لتنزّل ما تشاهده فقط.',
   'player.dsOnToast': 'موفّر البيانات مفعّل — أدنى درجة جودة وتحميل مسبق محدود',
   'player.dsOffToast': 'موفّر البيانات متوقف',
-  'player.dsSegToast': 'موفّر البيانات: درجة {h}p معاد ترميزها — ≈{mb} م.ب/د',
   'player.rung.ultraLow': 'منخفضة جدًا',
   'player.rung.hd': 'HD',
   'player.rung.fullHd': 'Full HD',

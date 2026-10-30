@@ -29,6 +29,9 @@ export interface NetWatcherDeps {
   tcHeightRef: React.RefObject<number | null>;
   /** Data Saver toggle — pins ABR at the lowest variant while on */
   dataSaverRef: React.RefObject<boolean>;
+  /** ladder-master source — its low "variants" are server transcodes of the
+   *  same upstream; a Data Saver ceiling must never force them in Auto mode */
+  ladderMasterRef: React.RefObject<boolean>;
   /** best known height of the native feed (the ladder never encodes up) */
   nativeHeightRef: React.RefObject<number>;
   /** can this deployment transcode at all */
@@ -47,7 +50,7 @@ export interface NetWatcherDeps {
 
 /** attach the connectivity engine to a fresh hls instance */
 export function createNetWatcher(deps: NetWatcherDeps) {
-  const { netRef, tcHeightRef, dataSaverRef, nativeHeightRef, tcCapRef, tcSrcRef, playerRef, showToast, t, selectDataSaverRef, exitDataSaverRef } = deps;
+  const { netRef, tcHeightRef, dataSaverRef, ladderMasterRef, nativeHeightRef, tcCapRef, tcSrcRef, playerRef, showToast, t, selectDataSaverRef, exitDataSaverRef } = deps;
 
   return function attachNetWatcher(hls: Hls): void {
     let seen = 0; // per-instance fragment count — skip the EWMA warm-up window
@@ -153,7 +156,9 @@ export function createNetWatcher(deps: NetWatcherDeps) {
       // the adaptive raise rule must never lift it while the toggle is on.
       if ((hls.levels || []).length > 1 && hls.autoLevelEnabled) {
         const sorted = levelsByRate();
-        if (dataSaverRef.current && sorted.length) {
+        if (dataSaverRef.current && !ladderMasterRef.current && sorted.length) {
+          // REAL variants only — on ladder masters the low entries are
+          // transcodes and a ceiling would force them (see deps comment)
           applyCap(sorted[0].i);
         } else if (sorted.length > 1) {
           let target = sorted[0].i;
