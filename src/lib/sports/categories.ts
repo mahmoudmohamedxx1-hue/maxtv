@@ -165,7 +165,7 @@ export function sportName(id: string): string {
 // a Premier League match. Development variants of the big names never carry
 // headline weight, and their tier must never be the truncated part of a label.
 export const MINOR_LEAGUE_RE =
-  /premier league 2|premier league international|la liga 2|hypermot|smartbank|2\.?\s*bundesliga|bundesliga 2|under-?\d+|\bu1[6-9]\b|\bu2[0-3]\b|\bsub-?\d+\b|youth|academy|reserve|\bg league\b|femen|women/i;
+  /premier league 2|premier league international|la liga 2|hypermot|smartbank|2\.?\s*bundesliga|bundesliga 2|\bliga [23]\b|under-?\d+|\bu1[6-9]\b|\bu2[0-3]\b|\bsub-?\d+\b|youth|academy|reserve|\bg league\b|femen|women/i;
 
 /** Is this a development / reserve / youth competition? (drives the
  *  "U21/Reserve" chip on match cards + exclusion from headline rails) */
