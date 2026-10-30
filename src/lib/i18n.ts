@@ -53,6 +53,8 @@ const en = {
   'settings.dsUnavailable':
     "Not available on this deployment — the server can't re-encode streams. Picks fall back to the nearest native quality.",
   'settings.dsNote': 'Any height, re-encoded in real time to save bandwidth — even heights the provider does not offer.',
+  'settings.dsToggle': 'Data Saver mode',
+  'settings.dsToggleDesc': 'Slow or metered connection? Lowest quality rung everywhere + minimal pre-buffering.',
   'settings.perfTitle': 'Streaming performance',
   'settings.perfFast': '⚡ Fast start',
   'settings.perfFastDesc':
@@ -148,6 +150,16 @@ const en = {
   'player.choiceSaved': 'Your choice is saved and applied to every channel.',
   'player.dsChip': 'Data saver',
   'player.dsAltToast': 'Data saver: switched to {h}p via {source} — ≈{mb} MB/min',
+  'player.dsToggle': 'Data Saver',
+  'player.dsToggleNote':
+    'For slow connections: uses the lowest quality rung available and stops over-buffering — softer picture, a fraction of the data.',
+  'player.dsEffectAlt': 'On this channel: switches to the alternate source\'s lowest rung — the biggest saving.',
+  'player.dsEffectTc': 'On this channel: opens the re-encoded 244p rung — built for slow links.',
+  'player.dsEffectBuffer':
+    'This channel has a single quality — Data Saver trims the pre-buffer so you only download what you watch.',
+  'player.dsOnToast': 'Data saver on — lowest rung, minimal buffering',
+  'player.dsOffToast': 'Data saver off',
+  'player.dsSegToast': 'Data saver: re-encoded {h}p rung — ≈{mb} MB/min',
   'player.rung.ultraLow': 'ultra low',
   'player.rung.hd': 'HD',
   'player.rung.fullHd': 'Full HD',
@@ -375,6 +387,8 @@ const ar: Record<Exclude<TKey, never>, string> = {
   'settings.dsUnavailable':
     'غير متاح على هذا الخادم — لا يمكن إعادة ترميز البث. تعود الاختيارات إلى أقرب جودة أصلية.',
   'settings.dsNote': 'أي دقة تُعاد ترميزها لحظيًا لتوفير البيانات — حتى الدقات التي لا يوفرها المصدر.',
+  'settings.dsToggle': 'وضع موفّر البيانات',
+  'settings.dsToggleDesc': 'اتصال بطيء أو محدود؟ أدنى درجة جودة في كل مكان مع تحميل مسبق محدود.',
   'settings.perfTitle': 'أداء البث',
   'settings.perfFast': '⚡ بداية سريعة',
   'settings.perfFastDesc': 'ينضم إلى حافة البث أسرع ويخزّن أقل — أسرع تشغيل وأقل تأخير. الأنسب للاتصالات العادية.',
@@ -468,6 +482,16 @@ const ar: Record<Exclude<TKey, never>, string> = {
   'player.choiceSaved': 'اختيارك محفوظ ويُطبّق على كل القنوات.',
   'player.dsChip': 'موفّر البيانات',
   'player.dsAltToast': 'موفّر البيانات: تم التحويل إلى {h}p عبر {source} — ≈{mb} م.ب/د',
+  'player.dsToggle': 'موفّر البيانات',
+  'player.dsToggleNote':
+    'للاتصالات البطيئة: يستخدم أدنى درجة جودة متاحة ويوقف التحميل المسبق الزائد — صورة أخفّ وبيانات أقل بكثير.',
+  'player.dsEffectAlt': 'على هذه القناة: ينتقل إلى أدنى درجة من المصدر البديل — أكبر توفير للبيانات.',
+  'player.dsEffectTc': 'على هذه القناة: يفتح درجة 244p المعاد ترميزها — مصممة للاتصالات البطيئة.',
+  'player.dsEffectBuffer':
+    'هذه القناة بجودة واحدة — يقلّص موفّر البيانات التحميل المسبق لتنزّل ما تشاهده فقط.',
+  'player.dsOnToast': 'موفّر البيانات مفعّل — أدنى درجة جودة وتحميل مسبق محدود',
+  'player.dsOffToast': 'موفّر البيانات متوقف',
+  'player.dsSegToast': 'موفّر البيانات: درجة {h}p معاد ترميزها — ≈{mb} م.ب/د',
   'player.rung.ultraLow': 'منخفضة جدًا',
   'player.rung.hd': 'HD',
   'player.rung.fullHd': 'Full HD',

@@ -310,6 +310,34 @@ export function TopNav({
               <p className="border-t border-zilla-line/60 px-4 py-2 text-[9px] font-black uppercase tracking-widest text-zilla-dim">
                 {t('settings.dataSaver')}
               </p>
+              {/* Data Saver master toggle (2026-10-31) — one switch for slow
+                  networks: lowest rung + lowest-variant ABR + tight buffer */}
+              <button
+                onClick={() => updatePrefs({ dataSaver: !(prefs?.dataSaver ?? false) })}
+                className="flex w-full items-center justify-between gap-2.5 px-4 py-2.5 text-start transition-colors hover:bg-white/5"
+              >
+                <span className="min-w-0 flex-1">
+                  <span className={cn('block text-xs font-bold', prefs?.dataSaver ? 'text-emerald-300' : 'text-zilla-text')}>
+                    {t('settings.dsToggle')}
+                  </span>
+                  <span className="mt-0.5 block text-[10px] font-medium leading-snug text-zilla-dim">
+                    {t('settings.dsToggleDesc')}
+                  </span>
+                </span>
+                <span
+                  className={cn(
+                    'relative h-5 w-9 shrink-0 rounded-full transition-colors',
+                    prefs?.dataSaver ? 'bg-emerald-500' : 'bg-white/15'
+                  )}
+                >
+                  <span
+                    className={cn(
+                      'absolute top-0.5 h-4 w-4 rounded-full bg-black transition-all',
+                      prefs?.dataSaver ? 'start-[1.15rem]' : 'start-0.5'
+                    )}
+                  />
+                </span>
+              </button>
               {!tcCap && (
                 <p className="px-4 pb-1.5 pt-1 text-[10px] font-medium leading-snug text-zilla-yellow/80">
                   {t('settings.dsUnavailable')}

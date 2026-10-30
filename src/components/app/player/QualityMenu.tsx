@@ -32,6 +32,12 @@ export interface QualityMenuProps {
   onPickAltRung: (alt: AltServer, height: number) => void;
   onPickLocalTurbo: (height: number) => void;
   onExitLocalTurbo: () => void;
+  /** Data Saver master toggle (2026-10-31) — state, handler and what it
+   *  does on THIS channel: 'alt' = lowest alternate rung, 'transcode' =
+   *  re-encoded rung, 'buffer' = buffering trim only (single rendition) */
+  dataSaver: boolean;
+  onToggleDataSaver: () => void;
+  dsChannelEffect: 'alt' | 'transcode' | 'buffer';
 }
 
 export function QualityMenu({
@@ -54,9 +60,50 @@ export function QualityMenu({
   onPickAltRung,
   onPickLocalTurbo,
   onExitLocalTurbo,
+  dataSaver,
+  onToggleDataSaver,
+  dsChannelEffect,
 }: QualityMenuProps) {
   return (
     <div className="styled-scrollbar absolute end-0 top-11 z-30 max-h-[70vh] w-48 overflow-y-auto rounded-xl border border-zilla-line bg-zilla-bg/95 shadow-2xl backdrop-blur">
+      <button
+        onClick={onToggleDataSaver}
+        className={cn(
+          'flex w-full items-center justify-between gap-2.5 border-b border-zilla-line/60 px-3.5 py-2.5 text-start transition-colors hover:bg-white/10',
+          dataSaver ? 'text-emerald-300' : 'text-zilla-text'
+        )}
+      >
+        <span className="min-w-0 flex-1">
+          <span className="block text-xs font-black">{t('player.dsToggle')}</span>
+          <span className="mt-0.5 block text-[10px] font-medium leading-snug text-zilla-dim">
+            {t('player.dsToggleNote')}
+          </span>
+        </span>
+        <span
+          className={cn(
+            'relative h-5 w-9 shrink-0 rounded-full transition-colors',
+            dataSaver ? 'bg-emerald-500' : 'bg-white/15'
+          )}
+        >
+          <span
+            className={cn(
+              'absolute top-0.5 h-4 w-4 rounded-full bg-black transition-all',
+              dataSaver ? 'start-[1.15rem]' : 'start-0.5'
+            )}
+          />
+        </span>
+      </button>
+      {dataSaver && (
+        <p className="border-b border-zilla-line/60 bg-emerald-500/5 px-3.5 py-1.5 text-[10px] font-medium leading-snug text-emerald-300/90">
+          {t(
+            dsChannelEffect === 'alt'
+              ? 'player.dsEffectAlt'
+              : dsChannelEffect === 'transcode'
+                ? 'player.dsEffectTc'
+                : 'player.dsEffectBuffer'
+          )}
+        </p>
+      )}
       <p className="border-b border-zilla-line/60 px-3.5 py-2 text-[9px] font-black uppercase tracking-widest text-zilla-dim">
         {t('player.streamQuality')}
       </p>

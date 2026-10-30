@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 import { getSchedule, get247Channels, freshAliveIds } from '@/lib/sports/daddylive';
-import { DEAD_DL_CHANNEL_IDS } from '@/lib/sports/categories';
+import { DEAD_DL_CHANNEL_IDS, isYouthLeague } from '@/lib/sports/categories';
 import { getCatalog } from '@/lib/iptv/catalog';
 import { getChannelLogo } from '@/lib/media/logos';
 
@@ -20,6 +20,9 @@ export async function GET(req: Request) {
   const [matches, ch247, catalog] = await Promise.all([getSchedule(), get247Channels(), getCatalog()]);
 
   const matchHits = matches
+    // academy/reserve/youth events read as fake fixtures (2026-10-31) —
+    // never surfaced as search results either
+    .filter((m) => !isYouthLeague(m.league))
     .filter((m) => `${m.title} ${m.league}`.toLowerCase().includes(q))
     .slice(0, 12)
     .map((m) => ({

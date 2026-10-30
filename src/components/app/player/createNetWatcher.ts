@@ -27,6 +27,8 @@ export interface NetWatcherDeps {
   netRef: React.RefObject<{ lows: number; highs: number }>;
   /** active data-saver height (null = native feed) */
   tcHeightRef: React.RefObject<number | null>;
+  /** Data Saver toggle — pins ABR at the lowest variant while on */
+  dataSaverRef: React.RefObject<boolean>;
   /** best known height of the native feed (the ladder never encodes up) */
   nativeHeightRef: React.RefObject<number>;
   /** can this deployment transcode at all */
@@ -45,7 +47,7 @@ export interface NetWatcherDeps {
 
 /** attach the connectivity engine to a fresh hls instance */
 export function createNetWatcher(deps: NetWatcherDeps) {
-  const { netRef, tcHeightRef, nativeHeightRef, tcCapRef, tcSrcRef, playerRef, showToast, t, selectDataSaverRef, exitDataSaverRef } = deps;
+  const { netRef, tcHeightRef, dataSaverRef, nativeHeightRef, tcCapRef, tcSrcRef, playerRef, showToast, t, selectDataSaverRef, exitDataSaverRef } = deps;
 
   return function attachNetWatcher(hls: Hls): void {
     let seen = 0; // per-instance fragment count — skip the EWMA warm-up window
@@ -107,7 +109,8 @@ export function createNetWatcher(deps: NetWatcherDeps) {
 
       if (tcHeightRef.current !== null) {
         // inside the data-saver ladder: recover up, or drop a rung further down
-        if (net.highs >= 8 && loadPrefs().autoPicked) {
+        // Data Saver on: the user asked for low data — never auto-exit
+        if (net.highs >= 8 && loadPrefs().autoPicked && !dataSaverRef.current) {
           showToast(t('player.improved'));
           net.highs = 0;
           updatePrefs({ autoPicked: false });
@@ -145,10 +148,14 @@ export function createNetWatcher(deps: NetWatcherDeps) {
       }
 
       // native mode, real ladder: the sticky ABR cap. Target = the highest
-      // rung the measured link holds with ~30% headroom.
+      // rung the measured link holds with ~30% headroom. Data Saver ON pins
+      // the LOWEST variant instead — that is the toggle's whole promise, and
+      // the adaptive raise rule must never lift it while the toggle is on.
       if ((hls.levels || []).length > 1 && hls.autoLevelEnabled) {
         const sorted = levelsByRate();
-        if (sorted.length > 1) {
+        if (dataSaverRef.current && sorted.length) {
+          applyCap(sorted[0].i);
+        } else if (sorted.length > 1) {
           let target = sorted[0].i;
           for (const s of sorted) if (s.b <= est * 0.7) target = s.i;
           const curCap = capIdx === -1 ? Number.MAX_SAFE_INTEGER : capIdx;

@@ -1,7 +1,7 @@
 import { NextResponse, after } from 'next/server';
 import { getSchedule } from '@/lib/sports/daddylive';
 import { sportName } from '@/lib/sports/categories';
-import { MINOR_LEAGUE_RE } from '@/lib/sports/categories';
+import { MINOR_LEAGUE_RE, isYouthLeague } from '@/lib/sports/categories';
 import { extractTeamsFromTitle, findTeamLogo, findCachedTeamLogo, getLeagueLogo, getChannelLogo, extractTennisPlayers, findPlayerLogo, extractFighters } from '@/lib/media/logos';
 import { getBigLeagueFixtures, getNFLFixtures, getNBAFixtures, fixtureKey, peekFixtures, warmBigLeagues, type BigFixture } from '@/lib/sports/bigleagues';
 import type { SportsMatch } from '@/lib/types';
@@ -291,7 +291,11 @@ export async function GET(req: Request) {
   // use the public alias (bypasses Vercel's deployment-URL SSO redirect).
   setProxyOriginFromRequest(req);
   try {
-    const matches = await getSchedule();
+    // academy / reserve / youth competitions (PL2, PL International Cup,
+    // U-xx, youth/academy/reserve) never reach the fixture lists — they are
+    // real events billed impossibly and read as fake (2026-10-31 field
+    // report). Real pro second tiers and women's competitions stay.
+    const matches = (await getSchedule()).filter((m) => !isYouthLeague(m.league));
     const now = Date.now();
 
     // Live row — top-5-league matches first (Europe's "big five" drive the

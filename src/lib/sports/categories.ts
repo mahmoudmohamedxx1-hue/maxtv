@@ -173,6 +173,29 @@ export function isMinorLeague(league: string): boolean {
   return MINOR_LEAGUE_RE.test(league);
 }
 
+// ─── Youth / reserve / academy competitions — out of the fixture lists ──────
+// Field report 2026-10-31: "there is no Premier League 2 — that match is fake
+// as well". The "Man United vs Monaco" fixture is REAL, but it is the U21
+// Premier League International Cup (MUTV, Leigh Sports Village, 2026-10-30) —
+// DaddyLive bills it "England - Premier League 2", so the app presented an
+// academy cup with first-team crests and an impossible Premier League
+// billing. Users correctly read these as fake fixtures, so development
+// competitions no longer reach the user-facing fixture lists (schedule
+// arrays + search) at all — the event stays playable from its channel's own
+// EPG, where it belongs.
+// ⚠ NARROWER than MINOR_LEAGUE_RE on purpose: professional second tiers
+// (2. Bundesliga, Ligue 2, LaLiga Hypermotion…) are real leagues with real
+// fixtures and STAY; so do women's competitions. Only the academy /
+// reserve / youth class is removed.
+export const YOUTH_LEAGUE_RE =
+  /premier league 2|premier league international|professional development|under-?\d+|\bu1[6-9]\b|\bu2[0-3]\b|\bsub-?\d+\b|youth|academy|reserve|development squad/i;
+
+/** Is this an academy / reserve / youth competition? (excluded from the
+ *  user-facing fixture lists — they read as fake first-team fixtures) */
+export function isYouthLeague(league: string): boolean {
+  return YOUTH_LEAGUE_RE.test(league);
+}
+
 /** Compact league label for card headers. Long names are shortened by
  *  dropping the COUNTRY prefix ("England - Premier League 2" →
  *  "Premier League 2") — never the league name itself, because the tier

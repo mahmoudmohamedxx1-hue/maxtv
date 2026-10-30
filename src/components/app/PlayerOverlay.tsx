@@ -30,6 +30,7 @@ import {
   connectionBudget,
   dataSaverForBudget,
   hlsPerfConfig,
+  DATA_SAVER_HLS_CONFIG,
 } from '@/lib/player-settings';
 import { useT } from '@/lib/locale';
 import {
@@ -89,6 +90,12 @@ export function PlayerOverlay() {
   const [currentQuality, setCurrentQuality] = useState(-1); // -1 = auto
   const [activeHeight, setActiveHeight] = useState(0); // detected playing height
   const [showQualityMenu, setShowQualityMenu] = useState(false);
+  /* Data Saver (2026-10-31): one opt-in toggle for low network speeds —
+   * lowest real rung + lowest-variant ABR cap + tight buffering. Ref feeds
+   * the hls configs (stable identity, no stream re-attach on toggle); state
+   * drives the UI. Default OFF: the default path is byte-identical. */
+  const [dataSaver, setDataSaver] = useState(() => !!loadPrefs().dataSaver);
+  const dataSaverRef = useRef(false);
   /** active data-saver (transcoded) height — null = native stream */
   const [tcHeight, setTcHeight] = useState<number | null>(null);
   /* ── Local Turbo (Tier 3 client pipeline) ── turboHeight = active render
@@ -318,6 +325,7 @@ export function PlayerOverlay() {
       createNetWatcher({
         netRef,
         tcHeightRef,
+        dataSaverRef,
         nativeHeightRef,
         tcCapRef,
         tcSrcRef,
@@ -589,7 +597,9 @@ export function PlayerOverlay() {
             startFragPrefetch: true,
             ...(isLadderSrc
               ? LADDER_MASTER_HLS_CONFIG
-              : hlsPerfConfig(loadPrefs().perfMode)),
+              : dataSaverRef.current
+                ? DATA_SAVER_HLS_CONFIG
+                : hlsPerfConfig(loadPrefs().perfMode)),
             ...RESILIENT_LOAD_POLICIES,
             ...(budget > 0 ? { abrEwmaDefaultEstimate: Math.max(400_000, budget * 0.75) } : {}),
           });
@@ -1181,6 +1191,8 @@ export function PlayerOverlay() {
   /* ── Settings-menu sync — apply quality changes made while playing ───────── */
   useEffect(() => {
     return onPrefsChange((p, patch) => {
+      // Data Saver toggle (2026-10-31) — react to toggle-only patches too
+      if (!patch || patch.dataSaver !== undefined) setDataSaver(!!p.dataSaver);
       // Only react to actual QUALITY changes (incidental patches used to
       // re-enter selectDataSaver/exitDataSaver and mutually recurse).
       if (patch && patch.quality === undefined) return;
@@ -1234,6 +1246,46 @@ export function PlayerOverlay() {
       }
     });
   }, []);
+
+  useEffect(() => {
+    const was = dataSaverRef.current;
+    dataSaverRef.current = dataSaver;
+    if (!was && !dataSaver) return; // never on — default config is already correct
+    const hls = hlsRef.current;
+    if (!hls) return;
+    // transcode / ladder sources keep their tuned deep buffers — the on-demand
+    // encoders NEED the runway; there the rung choice itself is the saving
+    const ladderLike = ladderMasterRef.current || tcHeight !== null;
+    const cfg = hls.config as {
+      maxBufferLength?: number;
+      maxMaxBufferLength?: number;
+      backBufferLength?: number;
+    };
+    if (dataSaver && !ladderLike) {
+      cfg.maxBufferLength = DATA_SAVER_HLS_CONFIG.maxBufferLength;
+      cfg.maxMaxBufferLength = DATA_SAVER_HLS_CONFIG.maxMaxBufferLength;
+      cfg.backBufferLength = DATA_SAVER_HLS_CONFIG.backBufferLength;
+      // Auto mode on a multi-rendition feed: cap at the LOWEST variant now
+      // (the netWatcher keeps it pinned per fragment afterwards)
+      if (loadPrefs().quality === -1 && (hls.levels?.length || 0) > 1) {
+        const sorted = (hls.levels || [])
+          .map((l, i) => ({ i, b: l.bitrate || 0 }))
+          .filter((x) => x.b > 0)
+          .sort((a, b) => a.b - b.b);
+        if (sorted.length) hls.autoLevelCapping = sorted[0].i;
+      }
+    } else if (!dataSaver) {
+      const base = ladderMasterRef.current
+        ? LADDER_MASTER_HLS_CONFIG
+        : tcHeight !== null
+          ? LADDER_HLS_CONFIG
+          : hlsPerfConfig(loadPrefs().perfMode);
+      cfg.maxBufferLength = base.maxBufferLength;
+      cfg.maxMaxBufferLength = base.maxMaxBufferLength;
+      cfg.backBufferLength = base.backBufferLength;
+      if (!ladderMasterRef.current) hls.autoLevelCapping = -1; // sticky-cap re-engages
+    }
+  }, [dataSaver, tcHeight]);
 
   /* ── content-mismatch guard (the football→F1 fix, layer 3) ───────────── */
   useEffect(() => {
@@ -1610,7 +1662,9 @@ export function PlayerOverlay() {
             ? LADDER_MASTER_HLS_CONFIG
             : ladderSeg
               ? LADDER_HLS_CONFIG
-              : hlsPerfConfig(loadPrefs().perfMode)),
+              : dataSaverRef.current
+                ? DATA_SAVER_HLS_CONFIG
+                : hlsPerfConfig(loadPrefs().perfMode)),
           ...RESILIENT_LOAD_POLICIES,
         });
         hlsRef.current = hls;
@@ -2265,9 +2319,11 @@ export function PlayerOverlay() {
     if (!playerOpen || !player || !ladderAlt || ladderRungs.length === 0) return;
     if (altUrl) return; // already on an alternate
     const budget = connectionBudget(); // saveData → 400 kbps
-    const ds = dataSaverForBudget(budget);
-    if (!ds) return; // link isn't in data-saver territory
     const p = loadPrefs();
+    // toggle ON → always the lowest rung; OS Data Saver / very slow link
+    // (no toggle) → the rung the measured budget fits
+    const ds = p.dataSaver ? 144 : dataSaverForBudget(budget);
+    if (!ds) return; // link isn't in data-saver territory and toggle is off
     if (p.quality >= 0 && !p.autoPicked) return; // explicit user pick — respect it
     if (dsAutoAltRef.current === player.id) return; // once per channel
     const lowest = ladderRungs[0];
@@ -2277,7 +2333,31 @@ export function PlayerOverlay() {
     showToast(
       t('player.dsAltToast', { h: lowest, source: ladderAlt.sourceName, mb: rungMBPerMin(lowest) ?? '?' })
     );
-  }, [playerOpen, player, ladderAlt, ladderRungs, altUrl, pickAltRung, showToast, t]);
+  }, [playerOpen, player, ladderAlt, ladderRungs, altUrl, pickAltRung, showToast, t, dataSaver]);
+
+  /* ── Data Saver toggle ON + NO alternate ladder but a transcode ladder ────
+   * (ffmpeg-capable hosting): enter the re-encoded 244p rung — ≈3 MB/min vs
+   * ≈20-34 MB/min native. Once per channel, respects explicit picks. */
+  useEffect(() => {
+    if (!dataSaver || !playerOpen || !player) return;
+    if (ladderAlt && ladderRungs.length > 0) return; // alternate rungs cover it
+    if (altUrl || tcHeight !== null) return; // already on a rung
+    if (player.kind !== 'daddylive' || !tcCap || !tcSeg) return;
+    if (phase !== 'playing') return; // let the native feed attach first
+    const p = loadPrefs();
+    if (p.quality >= 0 && !p.autoPicked) return; // explicit user pick — respect it
+    if (dsAutoAltRef.current === player.id) return; // once per channel
+    dsAutoAltRef.current = player.id;
+    selectDataSaver(244, { auto: true });
+    showToast(t('player.dsSegToast', { h: 244, mb: rungMBPerMin(244) ?? 3 }));
+  }, [dataSaver, playerOpen, player, ladderAlt, ladderRungs, altUrl, tcHeight, tcCap, tcSeg, phase, selectDataSaver, showToast, t]);
+
+  /** the Data Saver master switch — one handler for menu + settings row */
+  const toggleDataSaver = useCallback(() => {
+    const next = !loadPrefs().dataSaver;
+    updatePrefs({ dataSaver: next });
+    showToast(next ? t('player.dsOnToast') : t('player.dsOffToast'));
+  }, [showToast, t]);
 
   if (!playerOpen || !player) return null;
 
@@ -2497,10 +2577,20 @@ export function PlayerOverlay() {
                   aria-label={t('player.quality')}
                 >
                   {qualityLabel}
+                  {dataSaver && (
+                    <span className="ms-1.5 rounded bg-emerald-500/20 px-1.5 py-0.5 text-[9px] font-black uppercase tracking-wide text-emerald-300">
+                      {t('player.dsChip')}
+                    </span>
+                  )}
                 </button>
                 {showQualityMenu && (
                   <QualityMenu
                     t={t}
+                    dataSaver={dataSaver}
+                    onToggleDataSaver={toggleDataSaver}
+                    dsChannelEffect={
+                      ladderAlt && ladderRungs.length > 0 ? 'alt' : canDataSaver ? 'transcode' : 'buffer'
+                    }
                     quality={quality}
                     currentQuality={currentQuality}
                     tcHeight={tcHeight}

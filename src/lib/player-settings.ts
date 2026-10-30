@@ -17,6 +17,13 @@ export interface PlayerPrefs {
    *  unstable connections. Applies to every channel; takes effect on the next
    *  stream switch. */
   perfMode: 'fast' | 'steady';
+  /** Data Saver mode (2026-10-31 field report: "make a data-saver option for
+   *  users with low network speeds"). OFF by default — the default playback
+   *  path is never altered. When ON: lowest real rung available (alternate
+   *  ladder / transcode rung), ABR capped at the lowest variant on
+   *  multi-rendition feeds, and a tight buffer so channel-zapping stops
+   *  pre-downloading video the user never watches. */
+  dataSaver: boolean;
   /** chosen by the connectivity engine (not the user) — shows in the UI */
   autoPicked?: boolean;
   /** prefs schema version — bumped when a migration resets stored choices */
@@ -38,7 +45,7 @@ export interface PlayerPrefs {
  *  stored globally. */
 const PREFS_VERSION = 4;
 
-const DEFAULTS: PlayerPrefs = { volume: 0.9, muted: true, quality: -1, autoAdvance: true, perfMode: 'fast', v: PREFS_VERSION };
+const DEFAULTS: PlayerPrefs = { volume: 0.9, muted: true, quality: -1, autoAdvance: true, perfMode: 'fast', dataSaver: false, v: PREFS_VERSION };
 
 const EVT = 'maxtv-prefs';
 
@@ -170,6 +177,19 @@ export function dataSaverForBudget(bps: number): number | null {
  *          CDN flap drained it straight into a stall. 2 keeps the window's
  *          tail as absorb room instead.)
  *  steady: join 3 segments behind, buffer ~60s → rides out flaky links */
+/** Data Saver buffering — applied ONLY when the user turns the toggle on,
+ *  and only to NATIVE feeds (transcode/ladder sources keep their tuned deep
+ *  buffers: their on-demand encoders need the runway, and their rung choice
+ *  already IS the saving). 12s of forward buffer ≈ 4x less speculative
+ *  download than the fast profile when zapping channels. */
+export const DATA_SAVER_HLS_CONFIG = {
+  liveSyncDurationCount: 2,
+  maxBufferLength: 12,
+  maxMaxBufferLength: 24,
+  maxLiveSyncPlaybackRate: 1, // playback stays 1x, always
+  backBufferLength: 30,
+} as const;
+
 export function hlsPerfConfig(perf: 'fast' | 'steady'): {
   liveSyncDurationCount: number;
   maxBufferLength: number;
