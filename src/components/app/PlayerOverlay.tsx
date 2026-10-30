@@ -2640,7 +2640,10 @@ export function PlayerOverlay() {
                     dsChannelEffect={
                       ladderAlt && ladderRungs.length > 0
                         ? 'alt'
-                        : canDataSaver || ladderMaster
+                        : // a RUNGLESS master (every DaddyLive channel on the
+                          // Workers plane) has no re-encoded rungs to pick —
+                          // its honest Data Saver effect is the buffer trim
+                          canDataSaver || (ladderMaster && quality.length > 1)
                           ? 'transcode'
                           : 'buffer'
                     }
